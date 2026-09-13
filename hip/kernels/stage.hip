@@ -117,18 +117,38 @@ __global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim
     const uint q0 = blockIdx.x * 16u, head = blockIdx.y;
     const uint stride = 3u * dim;
     __shared__ u8 qtile[16 * 32], ktile[16 * 32], values[32 * 32];
-    __shared__ u8 probabilities[16 * 640];
-    __shared__ float ex[16 * 32], denom[16];
-    for (uint i = threadIdx.x; i < 512; i += blockDim.x)
-        qtile[i] = e4m3_byte(qkv[(q0 + i / 32) * stride + head * 32 + i % 32]);
+    // Row strides are padded so the 16 query rows do not alias one LDS bank
+    // set (640/4 = 160 words = 0 mod 32 caused 8-way conflicts on every store).
+    __shared__ u8 probabilities[16 * 656];
+    __shared__ float ex[16 * 33], denom[16];
+    // 16B vector staging: same bytes as the scalar path, fewer LSU round trips.
+    {
+        const uint col = (threadIdx.x % 8u) * 4u;
+        for (uint r = threadIdx.x / 8u; r < 16; r += 4) {
+            const float4 v = *reinterpret_cast<const float4*>(
+                qkv + (q0 + r) * stride + head * 32u + col);
+            *reinterpret_cast<u32*>(qtile + r * 32u + col) =
+                u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+        }
+    }
     if (threadIdx.x < 16) denom[threadIdx.x] = 0.f;
     __syncthreads();
     A8 q = A8::Load(qtile, 0, 32);
     for (uint k0 = 0; k0 < tokens; k0 += 32) {
         for (uint half = 0; half < 2; ++half) {
-            for (uint i = threadIdx.x; i < 512; i += blockDim.x) {
-                uint k = k0 + half * 16 + i / 32;
-                ktile[i] = k < tokens ? e4m3_byte(qkv[k * stride + dim + head * 32 + i % 32]) : 0;
+            {
+                const uint col = (threadIdx.x % 8u) * 4u;
+                for (uint r = threadIdx.x / 8u; r < 16; r += 4) {
+                    uint k = k0 + half * 16u + r;
+                    const float4 v = k < tokens
+                        ? *reinterpret_cast<const float4*>(
+                              qkv + k * stride + dim + head * 32u + col)
+                        : make_float4(0.f, 0.f, 0.f, 0.f);
+                    *reinterpret_cast<u32*>(ktile + r * 32u + col) =
+                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                        u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                }
             }
             __syncthreads();
             B8 k = B8::LoadCol(ktile, 0, 32);
@@ -140,23 +160,32 @@ __global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim
                 uint bits = __half_as_ushort(__float2half_rn(affine));
                 float e = k0 + half * 16 + rc.y < tokens
                     ? __half2float(__ushort_as_half(uint16_t((bits << 4) + 0x4000u))) : 0.f;
-                ex[rc.x * 32 + half * 16 + rc.y] = e;
-                probabilities[rc.x * 640 + k0 + half * 16 + rc.y] = e4m3_byte(e);
+                ex[rc.x * 33 + half * 16 + rc.y] = e;
+                probabilities[rc.x * 656 + k0 + half * 16 + rc.y] = e4m3_byte(e);
             }
             __syncthreads();
         }
         if (threadIdx.x < 16)
-            for (uint j = 0; j < 32; ++j) denom[threadIdx.x] += ex[threadIdx.x * 32 + j];
+            for (uint j = 0; j < 32; ++j) denom[threadIdx.x] += ex[threadIdx.x * 33 + j];
         __syncthreads();
     }
     C32 acc0 = C32::Splat(0.f), acc1 = C32::Splat(0.f);
     for (uint k0 = 0; k0 < tokens; k0 += 32) {
-        for (uint i = threadIdx.x; i < 1024; i += blockDim.x) {
-            uint k = k0 + i / 32;
-            values[i] = k < tokens ? e4m3_byte(qkv[k * stride + 2 * dim + head * 32 + i % 32]) : 0;
+        {
+            const uint col = (threadIdx.x % 8u) * 4u;
+            for (uint r = threadIdx.x / 8u; r < 32; r += 4) {
+                uint k = k0 + r;
+                const float4 v = k < tokens
+                    ? *reinterpret_cast<const float4*>(
+                          qkv + k * stride + 2u * dim + head * 32u + col)
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
+                *reinterpret_cast<u32*>(values + r * 32u + col) =
+                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
         }
         __syncthreads();
-        A8 p = A8::Load(probabilities, k0, 640);
+        A8 p = A8::Load(probabilities, k0, 656);
         B8 v0 = B8::LoadRow(values, 0, 32), v1 = B8::LoadRow(values, 16, 32);
         acc0.MultiplyAccumulate(p, v0);
         acc1.MultiplyAccumulate(p, v1);

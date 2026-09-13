@@ -110,9 +110,14 @@ __global__ void k_f32_to_f8(const float* src, u8* dst, uint n) {
 }
 
 __global__ void k_f8_to_f32(const u8* src, float* dst, uint n) {
-    uint i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n)
-        dst[i] = from_e4m3(src[i]);
+    uint i = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (i + 4u <= n) {
+        u32 b = *reinterpret_cast<const u32*>(src + i);
+        *reinterpret_cast<float4*>(dst + i) =
+            float4(from_e4m3(u8(b & 255u)), from_e4m3(u8((b >> 8) & 255u)),
+                   from_e4m3(u8((b >> 16) & 255u)), from_e4m3(u8(b >> 24)));
+    } else for (uint j = i; j < n; ++j)
+        dst[j] = from_e4m3(src[j]);
 }
 
 __global__ void k_head_rgb(const u8* feat, const float* w, const float* color, float* rgb,

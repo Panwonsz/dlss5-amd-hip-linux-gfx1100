@@ -41,14 +41,14 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
                           uint tokens, uint c, float qgain, bool half_squares) {
     if (!tokens || !c || c % 32 || !scales) throw std::runtime_error("QKV extent/scales");
     uint count = tokens * (c / 32) * 3;
-    LAUNCH(k_normalize_qkv, (count + 63) / 64, 64, in, scales, out, tokens, c, qgain, half_squares);
+    LAUNCH(k_normalize_qkv, (count + 255) / 256, 256, in, scales, out, tokens, c, qgain, half_squares);
 }
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
                         uint px, uint py, uint c, int crop, int quantize) {
     if (!w || !h || sw % 8 || sh % 8 || w + px > sw || h + py > sh || src == dst)
         throw std::runtime_error("reframe extent/alias");
     uint count = (crop ? w * h : sw * sh) * c;
-    LAUNCH(k_reframe_f32, (count + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c, crop, quantize);
+    LAUNCH(k_reframe_f32, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c, crop, quantize);
 }
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh) {
     if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || src == dst)
@@ -179,7 +179,7 @@ void launch_f32_to_f8(const float* s, u8* d, uint n) {
     LAUNCH(k_f32_to_f8, (n + 255) / 256, 256, s, d, n);
 }
 void launch_f8_to_f32(const u8* s, float* d, uint n) {
-    LAUNCH(k_f8_to_f32, (n + 255) / 256, 256, s, d, n);
+    LAUNCH(k_f8_to_f32, (n / 4 + 255) / 256, 256, s, d, n);
 }
 void launch_pool2x2(const u8* s, float* d, uint w, uint h, uint c) {
     uint n = (w / 2) * (h / 2) * c;

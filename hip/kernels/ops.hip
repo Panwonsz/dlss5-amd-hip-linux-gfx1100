@@ -25,9 +25,15 @@ __global__ void k_linear_f32(const float* input, const u8* weights, float* outpu
         }
     C32 partition = C32::Splat(0.f);
     for (uint g = 0; g < k / 32; ++g) {
-        for (uint i = threadIdx.x; i < 512; i += blockDim.x) {
-            const uint row = first + i / 32;
-            tile[i] = row < m ? e4m3_byte(input[row * k + g * 32 + i % 32]) : 0;
+        {
+            const uint col = (threadIdx.x % 8u) * 4u;
+            const uint row = first + threadIdx.x / 8u;
+            const float4 v = row < m
+                ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + col)
+                : make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
+                u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
         }
         __syncthreads();
         A8 a = A8::Load(tile, 0, 32);
@@ -107,52 +113,69 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     }
 }
 
+// One thread per 32-channel item: 8 aligned float4 loads, the original serial
+// FP32 sum (a tree reduction changes FP8 rounding), packed 2x float4 stores.
 __global__ void k_normalize_qkv(const float* input, const float* scales, u8* output,
-                               uint tokens, uint c, float qgain, bool half_squares = true) {
-    // Transpose coalesced global rows to one head per thread in LDS. Keep
-    // the original serial FP32 sum (a tree reduction changes FP8 rounding).
-    __shared__ float values[32][65];
-    __shared__ u8 packed[32][65];
+                                uint tokens, uint c, float qgain, bool half_squares = true) {
     const uint count = tokens * (c / 32) * 3;
-    const uint first = blockIdx.x * 64;
-    for (uint i = threadIdx.x; i < 64 * 32; i += 64) {
-        uint row = i / 32, ch = i % 32;
-        values[ch][row] = first + row < count ? input[(first + row) * 32 + ch] : 0.f;
-    }
-    __syncthreads();
-    uint item = first + threadIdx.x;
+    const uint item = blockIdx.x * 256u + threadIdx.x;
+    if (item >= count)
+        return;
+    const float4* row = reinterpret_cast<const float4*>(input + item * 32u);
+    float4 v0 = row[0], v1 = row[1], v2 = row[2], v3 = row[3];
+    float4 v4 = row[4], v5 = row[5], v6 = row[6], v7 = row[7];
+    float vals[32];
+    vals[0] = v0.x; vals[1] = v0.y; vals[2] = v0.z; vals[3] = v0.w;
+    vals[4] = v1.x; vals[5] = v1.y; vals[6] = v1.z; vals[7] = v1.w;
+    vals[8] = v2.x; vals[9] = v2.y; vals[10] = v2.z; vals[11] = v2.w;
+    vals[12] = v3.x; vals[13] = v3.y; vals[14] = v3.z; vals[15] = v3.w;
+    vals[16] = v4.x; vals[17] = v4.y; vals[18] = v4.z; vals[19] = v4.w;
+    vals[20] = v5.x; vals[21] = v5.y; vals[22] = v5.z; vals[23] = v5.w;
+    vals[24] = v6.x; vals[25] = v6.y; vals[26] = v6.z; vals[27] = v6.w;
+    vals[28] = v7.x; vals[29] = v7.y; vals[30] = v7.z; vals[31] = v7.w;
     uint head = item % (c / 32), part = (item / (c / 32)) % 3;
     float sum = 0.f;
     if (part < 2)
-        for (uint ch = 0; ch < 32; ++ch) { float v = values[ch][threadIdx.x];
-            volatile float square = half_squares ? H(v * v) : v * v;
-            sum += square; }
+        for (uint ch = 0; ch < 32; ++ch) {
+            volatile float square = half_squares ? H(vals[ch] * vals[ch]) : vals[ch] * vals[ch];
+            sum += square;
+        }
     float inv = part == 2 ? 1.f : rsqrtf(fmaxf(sum, 6.198883056640625e-5f)) *
                 (part == 0 ? scales[head] * qgain : 1.f);
-    for (uint ch = 0; ch < 32; ++ch) packed[ch][threadIdx.x] = e4m3_byte(values[ch][threadIdx.x] * inv);
-    __syncthreads();
-    for (uint i = threadIdx.x; i < 64 * 32; i += 64) {
-        uint row = i / 32, ch = i % 32;
-        if (first + row < count) output[(first + row) * 32 + ch] = packed[ch][row];
-    }
+    u8 b[32];
+    for (uint ch = 0; ch < 32; ch++)
+        b[ch] = e4m3_byte(vals[ch] * inv);
+    u8* out = output + item * 32u;
+    for (uint k = 0; k < 8; k++)
+        *reinterpret_cast<u32*>(out + k * 4u) =
+            u32(b[k * 4]) | u32(b[k * 4 + 1]) << 8 | u32(b[k * 4 + 2]) << 16 |
+            u32(b[k * 4 + 3]) << 24;
 }
 
+// Four channels per thread: the 4 lanes are contiguous, so win/tok are shared
+// and both ends are 16B vector accesses.
 __global__ void k_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
-                             uint px, uint py, uint c, int crop, int quantize) {
-    uint i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= (crop ? w * h : sw * sh) * c) return;
-    uint ch = i % c, t = i / c;
+                              uint px, uint py, uint c, int crop, int quantize) {
+    uint i4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (i4 + 4u > (crop ? w * h : sw * sh) * c) return;
+    uint ch = i4 % c, t = i4 / c;
     uint x = t % (crop ? w : sw), y = t / (crop ? w : sw);
     uint wx = crop ? x + px : x, wy = crop ? y + py : y;
     uint win = (wy / 8) * (sw / 8) + wx / 8, tok = (wy % 8) * 8 + wx % 8;
-    if (crop) {
-        float v = src[(win * 64 + tok) * c + ch];
-        dst[i] = quantize ? from_e4m3(e4m3_byte(v)) : v;
-    } else {
-        float v = x >= px && y >= py && x < w + px && y < h + py
-                    ? src[((y - py) * w + x - px) * c + ch] : 0.f;
-        dst[(win * 64 + tok) * c + ch] = quantize ? from_e4m3(e4m3_byte(v)) : v;
-    }
+    float4 v;
+    if (crop)
+        v = *reinterpret_cast<const float4*>(src + (win * 64u + tok) * c + ch);
+    else
+        v = x >= px && y >= py && x < w + px && y < h + py
+            ? *reinterpret_cast<const float4*>(src + ((y - py) * w + x - px) * c + ch)
+            : make_float4(0.f, 0.f, 0.f, 0.f);
+    if (quantize)
+        v = float4(from_e4m3(e4m3_byte(v.x)), from_e4m3(e4m3_byte(v.y)),
+                   from_e4m3(e4m3_byte(v.z)), from_e4m3(e4m3_byte(v.w)));
+    if (crop)
+        *reinterpret_cast<float4*>(dst + i4) = v;
+    else
+        *reinterpret_cast<float4*>(dst + (win * 64u + tok) * c + ch) = v;
 }
 
 __global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh) {
@@ -175,11 +198,21 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
  uint first=blockIdx.x*16,col=blockIdx.y*16;
  __shared__ __half tile[512];
  C32 total=C32::Splat(0.f);
- for(uint part=0;part<partitions;++part){
-  C32 acc=C32::Splat(0.f);
-  for(uint g=part*(k/32/partitions);g<(part+1)*(k/32/partitions);++g){
-   for(uint i=threadIdx.x;i<512;i+=32){uint row=first+i/32;tile[i]=__float2half(row<m?input[row*k+g*32+i%32]:0.f);}
-   __syncthreads();
+   for(uint part=0;part<partitions;++part){
+   C32 acc=C32::Splat(0.f);
+   for(uint g=part*(k/32/partitions);g<(part+1)*(k/32/partitions);++g){
+    {
+     const uint col=(threadIdx.x%8u)*4u;
+     for(uint r=threadIdx.x/8u;r<16;r+=4){
+      const uint row=first+r;
+      const float4 v=row<m?*reinterpret_cast<const float4*>(input+row*k+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
+      const __half h0=__float2half(v.x),h1=__float2half(v.y),h2=__float2half(v.z),h3=__float2half(v.w);
+      *reinterpret_cast<uint2*>(tile+r*32u+col)=
+       uint2(u32(__half_as_ushort(h0))|u32(__half_as_ushort(h1))<<16,
+             u32(__half_as_ushort(h2))|u32(__half_as_ushort(h3))<<16);
+     }
+    }
+    __syncthreads();
    A16 a=A16::Load(tile,0,64);B16 b=B16::LoadRow(weights,((col/16)*(k/32)+g)*1024,32);
    if(ordered){C32 p=Multiply(a,b);for(uint i=0;i<acc.Length();++i)acc.Set(i,H(acc.Get(i)+p.Get(i)));}
    else acc.MultiplyAccumulate(a,b);
@@ -196,10 +229,15 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
  using namespace linalg;
  uint first=blockIdx.x*16,group=blockIdx.y,wave=threadIdx.x/32;
  __shared__ u8 tile[512],mix[16*64],hid[16*256];
- C32 a=C32::Splat(0.f);
- for(uint g=0;g<16;++g){
-  for(uint i=threadIdx.x;i<512;i+=128)tile[i]=first+i/32<tokens?e4m3_byte(in[(first+i/32)*512+g*32+i%32]):0;
-  __syncthreads();
+  C32 a=C32::Splat(0.f);
+  for(uint g=0;g<16;++g){
+   {
+    const uint col=(threadIdx.x%8u)*4u, row=first+threadIdx.x/8u;
+    const float4 v=row<tokens?*reinterpret_cast<const float4*>(in+row*512u+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
+    *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col)=
+     u32(e4m3_byte(v.x))|u32(e4m3_byte(v.y))<<8|u32(e4m3_byte(v.z))<<16|u32(e4m3_byte(v.w))<<24;
+   }
+   __syncthreads();
   a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRow(pre,((group*4+wave)*16+g)*512,16));__syncthreads();
  }
  for(uint i=0;i<a.Length();++i)a.Set(i,H(a.Get(i)));a.StoreF8(mix,wave*16,64);__syncthreads();
