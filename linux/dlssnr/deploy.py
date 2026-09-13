@@ -1,0 +1,566 @@
+"""Copy an lmxxf user package into a game directory and write a Proton wrapper."""
+from __future__ import annotations
+
+from contextlib import contextmanager
+import fcntl
+import configparser
+import io
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import stat
+import tempfile
+
+from . import package
+
+STORE = '.dlssnr-linux'
+SCHEMA = 2
+NOTES = [
+    'D3D path: this deploys the ReShade add-on and package shaders without native HIP.',
+    'SM 6.10 wave-matrix requires the Agility SDK and driver support; successful installation does not verify rendering under vkd3d-proton.',
+    'Remove the wrapper from your launcher after uninstall.',
+]
+HIP_NOTES = [
+    'HIP proof of concept: slow, experimental and in need of substantial optimization; not ready for normal gameplay.',
+    'The modified vkd3d submission worker waits for HIP. Live history resets each frame; gameplay and NVIDIA equivalence remain unverified.',
+    'Weights stay in DLSS5-AMD/native-game-tiled-assets/. Remove the wrapper from your launcher after uninstall.',
+]
+
+
+def _safe(path, *, directory=False, missing=False):
+    path = Path(os.path.abspath(path))
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            if missing:
+                return path
+            raise RuntimeError(f'Missing path: {current}') from None
+        wanted_dir = current != path or directory
+        if stat.S_ISLNK(info.st_mode) or not (stat.S_ISDIR(info.st_mode) if wanted_dir else stat.S_ISREG(info.st_mode)):
+            raise RuntimeError(f'Unsafe symlink or wrong path type: {current}')
+    return path
+
+
+def _exe(exe):
+    path = _safe(exe)
+    if path.suffix.lower() != '.exe':
+        raise RuntimeError('Expected a game .exe')
+    return path.parent.resolve() / path.name
+
+
+def _digest(path):
+    return package.sha256(_safe(path))
+
+
+def _sync(path):
+    fd = os.open(_safe(path, directory=True), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _lock(directory):
+    fd = os.open(_safe(directory, directory=True), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError('Another deployment transaction is running') from None
+        yield
+    finally:
+        os.close(fd)
+
+
+def running_game(exe):
+    basename = Path(exe).name.casefold()
+    for proc in Path('/proc').iterdir():
+        if not proc.name.isdecimal() or int(proc.name) == os.getpid():
+            continue
+        try:
+            args = (proc / 'cmdline').read_bytes().decode('utf-8', 'surrogateescape').rstrip('\0').split('\0')
+        except (OSError, ValueError):
+            continue
+        if args and Path(args[0].replace('\\', '/')).name.casefold() == basename:
+            return True
+        if len(args) > 1 and Path(args[0]).name.lower().startswith('wine') and Path(args[1].replace('\\', '/')).name.casefold() == basename:
+            return True
+    return False
+
+
+def wrapper_bytes(exe, *, magpie=False, gpu_name=None, hip=False, hip_so=None):
+    store = exe.parent / STORE
+    overrides = 'dxgi=n,b;d3d12=n,b;d3d12core=n,b' if magpie else 'd3d12=n,b;d3d12core=n,b'
+    if hip:
+        overrides = 'version=b;dlss5_hip=n;' + overrides
+    q = shlex.quote
+    weights = exe.parent / 'DLSS5-AMD' / 'native-game-tiled-assets'
+    so = hip_so or (store / 'lib' / 'libdlss5_hip.so')
+    lines = [
+        '#!/bin/bash',
+        'set -euo pipefail',
+        '# Generated Proton prefix for lmxxf DLSS5-AMD (' + ('HIP diagnostic' if hip else 'D3D backend') + ').',
+        'if (( $# == 0 )); then',
+        '  printf "%s\\n" "Usage: launch.sh RUNNER [ARGUMENTS...] (Steam: launch.sh %command%)." >&2',
+        '  exit 2',
+        'fi',
+        'addon=' + q(str(exe.parent / package.ADDON)),
+        'if [[ ! -f "$addon" ]]; then',
+        '  printf "DLSS5: missing add-on: %s\\n" "$addon" >&2',
+        '  exit 1',
+        'fi',
+        'kept=()',
+        'IFS=";" read -r -a entries <<< "${WINEDLLOVERRIDES-}"',
+        'for entry in "${entries[@]}"; do',
+        '  [[ "$entry" == *=* ]] || continue',
+        '  names=${entry%%=*}; value=${entry#*=}',
+        '  IFS="," read -r -a names_array <<< "$names"',
+        '  for name in "${names_array[@]}"; do',
+        '    clean=${name//[[:space:]]/}; clean=${clean,,}; clean=${clean#\\*}; clean=${clean%.dll}',
+        '    case "$clean" in d3d12|d3d12core|dxgi|dlss5_hip' + ('|version' if hip else '') + ') ;;',
+        '      *) kept+=("$name=$value") ;;',
+        '    esac',
+        '  done',
+        'done',
+        'saved=$(IFS=";"; printf "%s" "${kept[*]}")',
+        f'export WINEDLLOVERRIDES="${{saved:+$saved;}}{overrides}"',
+        'export STEAM_COMPAT_MOUNTS="${STEAM_COMPAT_MOUNTS:+$STEAM_COMPAT_MOUNTS:}"' + q(str(exe.parent)),
+    ]
+    if hip:
+        lines += [
+            'so=' + q(str(so)),
+            'if [[ ! -f "$so" ]]; then',
+            '  printf "DLSS5: missing HIP library: %s\\n" "$so" >&2',
+            '  exit 1',
+            'fi',
+            'export LD_PRELOAD="$so${LD_PRELOAD:+:$LD_PRELOAD}"',
+            'export DLSS5_HIP=1',
+            'export DLSS5_HIP_WEIGHTS=' + q(str(weights)),
+        ]
+    if gpu_name:
+        lines += [
+            'export DXVK_FILTER_DEVICE_NAME=' + q(gpu_name),
+            'export VKD3D_FILTER_DEVICE_NAME=' + q(gpu_name),
+        ]
+    lines += [
+        'export VKD3D_DEBUG="${VKD3D_DEBUG:-info}"',
+        'export VKD3D_LOG_FILE=' + q('Z:' + str(store / 'logs/vkd3d.log')),
+        'exec "$@"',
+        '',
+    ]
+    return '\n'.join(lines).encode()
+
+
+def _atomic_copy(source, target, expected=None, mode=None):
+    target = _safe(target, missing=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix='.copy-', dir=str(target.parent))
+    temporary = Path(temporary)
+    try:
+        with _safe(source).open('rb') as src, os.fdopen(fd, 'wb') as dst:
+            fd = -1
+            digest = hashlib.sha256()
+            for block in iter(lambda: src.read(1024 * 1024), b''):
+                digest.update(block)
+                dst.write(block)
+            if expected is not None and digest.hexdigest() != expected:
+                raise RuntimeError(f'Hash changed during copy: {source}')
+            os.fchmod(dst.fileno(), mode if mode is not None else 0o644)
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(temporary, target)
+        _sync(target.parent)
+    finally:
+        if fd != -1:
+            os.close(fd)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _atomic_bytes(target, data, mode=0o600):
+    target = _safe(target, missing=True)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.write-', dir=str(target.parent))
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            os.fchmod(stream.fileno(), mode)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(name, target)
+        _sync(target.parent)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def _journal(store, data):
+    _atomic_bytes(store / 'manifest.json', json.dumps(data, sort_keys=True, indent=2).encode() + b'\n')
+
+
+def _load(exe):
+    store = _safe(exe.parent / STORE, directory=True)
+    data = json.loads(_safe(store / 'manifest.json').read_text())
+    if type(data) is not dict or data.get('schema') != SCHEMA or data.get('kind') != 'lmxxf':
+        raise RuntimeError('Not an lmxxf Linux deployment journal; refusing mutation')
+    if data.get('exe') != str(exe):
+        raise RuntimeError('Deployment journal exe mismatch')
+    if type(data.get('files')) is not dict:
+        raise RuntimeError('Invalid deployment journal files')
+    if data.get('state') == 'removed' and data['files']:
+        raise RuntimeError('Removed deployment journal must not own files')
+    for name, item in data['files'].items():
+        parts = name.split('/')
+        if (not name or name.startswith('/') or any(p in {'', '.', '..'} for p in parts)
+                or '\\' in name or ':' in name or name == STORE + '/manifest.json'
+                or name.startswith(STORE + '/backups/')):
+            raise RuntimeError(f'Invalid deployment journal path: {name}')
+        if (type(item) is not dict or not isinstance(item.get('sha256'), str)
+                or len(item['sha256']) != 64
+                or any(c not in '0123456789abcdef' for c in item['sha256'])):
+            raise RuntimeError(f'Invalid deployment journal digest: {name}')
+        original = item.get('original')
+        if original is not None and (not isinstance(original, str) or len(original) != 64
+                                    or any(c not in '0123456789abcdef' for c in original)):
+            raise RuntimeError(f'Invalid deployment original digest: {name}')
+    return data
+
+
+def prefix_paths(exe):
+    store = exe.parent / STORE
+    launch = store / 'launch.sh'
+    return {
+        'command_prefix': shlex.quote(str(launch)),
+        'launch_options': shlex.quote(str(launch)) + ' %command%',
+    }
+
+
+def status_game(exe):
+    exe = _exe(exe)
+    store = exe.parent / STORE
+    if not store.exists():
+        return {'installed': False, 'valid': False, 'pending': False, 'notes': []}
+    try:
+        data = _load(exe)
+        if data.get('state') == 'removed':
+            return {'installed': False, 'valid': False, 'pending': False, 'notes': []}
+        if data.get('state') != 'installed':
+            return {'installed': True, 'valid': False, 'pending': True,
+                    'notes': ['Incomplete deployment journal; preserve backups and recover before launch.']}
+        missing = [name for name in data['files'] if not (exe.parent / name).is_file()]
+        if missing:
+            return {'installed': True, 'valid': False, 'pending': True,
+                    'notes': ['Missing deployed files: ' + ', '.join(missing[:8])]}
+        changed = [name for name, item in data['files'].items() if _digest(exe.parent / name) != item['sha256']]
+        if changed:
+            return {'installed': True, 'valid': False, 'pending': True,
+                    'notes': ['Changed deployed files: ' + ', '.join(changed[:8])]}
+        return dict({'installed': True, 'valid': True, 'pending': False,
+                     'hip': data.get('hip', False),
+                     'notes': list(HIP_NOTES if data.get('hip', False) else NOTES),
+                     'mode': data.get('mode'), 'package': data.get('package')}, **prefix_paths(exe))
+    except (RuntimeError, OSError, ValueError) as exc:
+        return {'installed': True, 'valid': False, 'pending': True, 'notes': [str(exc)]}
+
+
+def _first_file(*candidates):
+    for path in candidates:
+        if path.is_file():
+            return path
+    return candidates[0]
+
+
+def hip_paths():
+    installer = Path(__file__).resolve().parents[1]
+    repo = installer.parent
+    return {
+        'so': _first_file(installer / 'bin' / 'libdlss5_hip.so', repo / 'hip' / 'libdlss5_hip.so'),
+        'dll': _first_file(installer / 'bin' / 'dlss5_hip.dll', repo / 'hip' / 'dlss5_hip.dll'),
+        'addon': _first_file(installer / 'bin' / 'dlss5-amd.addon64', installer / 'build' / 'dlss5-amd.addon64'),
+        'vkd3d': _first_file(installer / 'bin' / 'lmxxf-d3d12.dll', installer / 'build/live/build-vkd3d/libs/d3d12/d3d12.dll'),
+        'vkd3dcore': _first_file(installer / 'bin' / 'd3d12core.dll', installer / 'build/live/build-vkd3d/libs/d3d12core/d3d12core.dll'),
+        'reshade': _first_file(
+            installer / 'bin' / 'ReShade64.dll',
+            installer / 'vendor' / 'reshade' / 'ReShade64.dll',
+            installer / 'bin' / 'd3d12.dll',
+        ),
+        'flags': _first_file(installer / 'flags' / 'native-game-flags.txt', repo / 'scripts' / 'game-flags.txt'),
+    }
+
+
+def ensure_hip_artifacts():
+    paths = hip_paths()
+    needed = ('so', 'dll', 'addon', 'reshade', 'vkd3d', 'vkd3dcore')
+    missing = [str(paths[name]) for name in needed if not paths[name].is_file()]
+    if missing:
+        raise RuntimeError(
+            'HIP game artifacts missing: ' + ', '.join(missing)
+            + '. From the repo: make -C hip game && linux/install.sh build-addon')
+    return paths
+
+
+def _backup_original(exe, relative, files, store):
+    target = exe.parent / relative
+    _safe(target, missing=True)
+    if relative in files:
+        original = files[relative].get('original')
+        if original is not None:
+            backup = store / 'backups' / relative.replace('/', '__')
+            if _digest(backup) != original:
+                raise RuntimeError(f'Backup missing or changed: {relative}')
+        return original
+    original = _digest(target) if target.is_file() else None
+    if original is not None:
+        backup = store / 'backups' / relative.replace('/', '__')
+        backup.parent.mkdir(parents=True, exist_ok=True)
+        if not backup.exists():
+            _atomic_copy(target, backup, original)
+        elif _digest(backup) != original:
+            raise RuntimeError(f'Backup collision: {relative}')
+    return original
+
+
+def _record_write(exe, relative, digest, original, files, store):
+    target = exe.parent / relative
+    previous = _digest(target) if target.is_file() else None
+    files[relative] = {'sha256': digest, 'original': original, 'previous_sha256': previous}
+    data = _load(exe)
+    data['files'] = files
+    _journal(store, data)  # Write-ahead record survives failure before/after rename.
+
+
+def _overlay(exe, relative, source, files, store):
+    target = exe.parent / relative
+    original = _backup_original(exe, relative, files, store)
+    digest = package.sha256(source)
+    _record_write(exe, relative, digest, original, files, store)
+    _atomic_copy(source, target, digest)
+
+
+def _overlay_bytes(exe, relative, content, files, store, mode=0o644):
+    original = _backup_original(exe, relative, files, store)
+    _record_write(exe, relative, hashlib.sha256(content).hexdigest(), original, files, store)
+    _atomic_bytes(exe.parent / relative, content, mode)
+
+
+def _begin_install(exe, *, hip, mode, **metadata):
+    store = exe.parent / STORE
+    files = {}
+    if store.exists():
+        previous = _load(exe)
+        if previous.get('state') != 'removed':
+            if previous.get('state') != 'installed' or not status_game(exe)['valid']:
+                raise RuntimeError('Incomplete or changed deployment; preserve backups and uninstall/recover before reinstalling')
+            if previous.get('hip', False) != hip or previous.get('mode') != mode:
+                raise RuntimeError('Uninstall before switching deployment backend or loader mode')
+            files = dict(previous['files'])
+    store.mkdir(mode=0o700, exist_ok=True)
+    data = dict(schema=SCHEMA, kind='lmxxf', exe=str(exe), state='installing',
+                hip=hip, mode=mode, files=files, **metadata)
+    _journal(store, data)
+    return data
+
+
+def install_hip(exe, weights_root, *, magpie=False, replace_existing=False,
+                acknowledge_risk=False, dry_run=False, gpu_name=None, allow_derived_layouts=False):
+    if not acknowledge_risk:
+        raise RuntimeError('Explicit --accept-risk is required; this injects a ReShade add-on into the game directory')
+    exe = _exe(exe)
+    weights = (Path(package.inspect_weights(weights_root, allow_derived_layouts=allow_derived_layouts).get('weights_dir', weights_root))
+               if dry_run else package.find_weights(weights_root, allow_derived_layouts=allow_derived_layouts))
+    hip_files = ensure_hip_artifacts() if not dry_run else hip_paths()
+    live_pair = 'vkd3d' in hip_files or 'vkd3dcore' in hip_files
+    if live_pair and not all(name in hip_files and hip_files[name].is_file() for name in ('vkd3d', 'vkd3dcore')):
+        raise RuntimeError('The matching modified vkd3d DLL pair is required')
+    if live_pair and magpie:
+        raise RuntimeError('The HIP proof of concept currently supports the in-game FSR hook, not Magpie')
+    loader_name = package.LOADER_MAGPIE if magpie else package.LOADER_GAME
+    with _lock(exe.parent):
+        if running_game(exe):
+            raise RuntimeError('Close the game before installation')
+        store = exe.parent / STORE
+        for name in ('continuous-every-frame.txt', 'continuous-reset-preview.txt',
+                     'neural-frame-request.txt'):
+            marker = exe.parent / 'DLSS5-AMD' / name
+            if marker.exists() or marker.is_symlink():
+                raise RuntimeError(f'Existing activation marker must be removed manually before HIP staging: {marker}')
+        collisions = []
+        targets = [package.ADDON, loader_name, 'dlss5_hip.dll']
+        if live_pair:
+            targets += ['lmxxf-d3d12.dll', 'd3d12core.dll', 'ReShade.ini']
+        for relative in targets:
+            if (exe.parent / relative).exists():
+                collisions.append(relative)
+        previous = _load(exe) if store.exists() else {}
+        managed = previous.get('files', {}) if previous.get('state') == 'installed' else {}
+        unmanaged = [name for name in collisions if name not in managed]
+        if unmanaged and not replace_existing:
+            raise RuntimeError('Existing files need --replace-existing: ' + ', '.join(unmanaged[:12]))
+        proxy_ini = None
+        if live_pair:
+            ini = configparser.RawConfigParser(strict=True)
+            ini.optionxform = lambda optionstr: optionstr
+            ini_path = exe.parent / 'ReShade.ini'
+            if ini_path.exists():
+                ini.read_string(_safe(ini_path).read_text(encoding='utf-8-sig'))
+            if not ini.has_section('PROXY'):
+                ini.add_section('PROXY')
+            ini.set('PROXY', 'EnableProxyLibrary', '1')
+            ini.set('PROXY', 'ProxyLibrary', '.\\lmxxf-d3d12.dll')
+            text = io.StringIO()
+            ini.write(text, space_around_delimiters=False)
+            proxy_ini = text.getvalue().encode()
+        wrapper = wrapper_bytes(exe, magpie=magpie, gpu_name=gpu_name, hip=True,
+                                hip_so=store / 'lib' / 'libdlss5_hip.so')
+        result = dict({'installed': False, 'valid': False, 'dry_run': dry_run, 'notes': list(HIP_NOTES),
+                       'mode': 'magpie' if magpie else 'game', 'hip': True,
+                       'weights': str(weights)}, **prefix_paths(exe))
+        if dry_run:
+            result['collisions'] = collisions
+            return result
+        data = _begin_install(exe, hip=True, mode='magpie' if magpie else 'game', weights=str(weights))
+        for name in ('backups', 'logs', 'lib'):
+            (store / name).mkdir(mode=0o700, exist_ok=True)
+        files = data['files']
+        dest_assets = exe.parent / 'DLSS5-AMD' / 'native-game-tiled-assets'
+        dest_assets.mkdir(parents=True, exist_ok=True)
+        for entry in sorted(weights.iterdir()):
+            if entry.is_symlink() or not entry.is_file():
+                continue
+            if (entry.suffix.lower() not in {'.f32', '.f16', '.i32', '.hlsl', '.hlsli', '.cso'}
+                    and entry.name not in {'manifest.json', 'full-network.ok'}):
+                continue
+            rel = 'DLSS5-AMD/native-game-tiled-assets/' + entry.name
+            _overlay(exe, rel, entry, files, store)
+        _overlay(exe, package.ADDON, hip_files['addon'], files, store)
+        _overlay(exe, loader_name, hip_files['reshade'], files, store)
+        _overlay(exe, 'dlss5_hip.dll', hip_files['dll'], files, store)
+        if live_pair:
+            _overlay(exe, 'lmxxf-d3d12.dll', hip_files['vkd3d'], files, store)
+            _overlay(exe, 'd3d12core.dll', hip_files['vkd3dcore'], files, store)
+            _overlay_bytes(exe, 'ReShade.ini', proxy_ini, files, store)
+        _overlay(exe, STORE + '/lib/libdlss5_hip.so', hip_files['so'], files, store)
+        flags_src = hip_files.get('flags')
+        flags_text = flags_src.read_text() if flags_src.is_file() else ''
+        if 'DLSS5_HIP=' not in flags_text:
+            flags_text += ('\n' if flags_text and not flags_text.endswith('\n') else '') + 'DLSS5_HIP=1\n'
+        if 'DLSS5_SNAPSHOT_FRAME=' not in flags_text:
+            flags_text += 'DLSS5_SNAPSHOT_FRAME=60\n'
+        _overlay_bytes(exe, 'DLSS5-AMD/native-game-flags.txt', flags_text.encode(), files, store)
+        # Staging is not permission to arm the existing synchronous game path.
+        # Motion history is available through the host API, not this add-on.
+        (exe.parent / 'DLSS5-AMD' / 'logs').mkdir(mode=0o755, exist_ok=True)
+        _overlay_bytes(exe, STORE + '/launch.sh', wrapper, files, store, 0o700)
+        data['state'] = 'installed'
+        _journal(store, data)
+        return dict(status_game(exe), installed=True, dry_run=False, hip=True)
+
+
+def install_package(exe, package_root, *, magpie=False, replace_existing=False,
+                    acknowledge_risk=False, dry_run=False, gpu_name=None, hip=False, allow_derived_layouts=False):
+    if hip:
+        return install_hip(exe, package_root, magpie=magpie, replace_existing=replace_existing,
+                           acknowledge_risk=acknowledge_risk, dry_run=dry_run, gpu_name=gpu_name,
+                           allow_derived_layouts=allow_derived_layouts)
+    if not acknowledge_risk:
+        raise RuntimeError('Explicit --accept-risk is required; this injects a ReShade add-on into the game directory')
+    exe = _exe(exe)
+    info = package.validate(package_root, magpie=magpie)
+    root = Path(info['root'])
+    with _lock(exe.parent):
+        if running_game(exe):
+            raise RuntimeError('Close the game before installation')
+        store = exe.parent / STORE
+        collisions = []
+        planned = []
+        for relative in info['files']:
+            target = exe.parent / relative
+            planned.append(relative)
+            if target.exists():
+                collisions.append(relative)
+        previous = _load(exe) if store.exists() else {}
+        managed = previous.get('files', {}) if previous.get('state') == 'installed' else {}
+        unmanaged = [name for name in collisions if name not in managed]
+        if unmanaged and not replace_existing:
+            raise RuntimeError('Existing files need --replace-existing: ' + ', '.join(unmanaged[:12]))
+        wrapper = wrapper_bytes(exe, magpie=magpie, gpu_name=gpu_name, hip=False)
+        result = dict({'installed': False, 'valid': False, 'dry_run': dry_run, 'notes': list(NOTES),
+                       'mode': info['mode'], 'file_count': info['file_count'],
+                       'agility_sdk': info['agility_sdk'], 'hip': False}, **prefix_paths(exe))
+        if dry_run:
+            result['collisions'] = collisions
+            return result
+        data = _begin_install(exe, hip=False, mode=info['mode'], package=info['root'])
+        for name in ('backups', 'logs'):
+            (store / name).mkdir(mode=0o700, exist_ok=True)
+        files = data['files']
+        for relative in planned:
+            source = root / relative
+            _overlay(exe, relative, source, files, store)
+        _overlay_bytes(exe, STORE + '/launch.sh', wrapper, files, store, 0o700)
+        data['state'] = 'installed'
+        _journal(store, data)
+        return dict(status_game(exe), installed=True, dry_run=False, hip=False)
+
+
+def uninstall_game(exe, *, yes=False):
+    if not yes:
+        raise RuntimeError('Pass --yes to restore backups and remove the lmxxf files')
+    exe = _exe(exe)
+    with _lock(exe.parent):
+        if running_game(exe):
+            raise RuntimeError('Close the game before uninstall')
+        data = _load(exe)
+        store = exe.parent / STORE
+        # Preflight every path before the first restore/delete. A changed late
+        # entry must not leave the earlier half of the installation removed.
+        backups = []
+        for relative, item in data['files'].items():
+            target = _safe(exe.parent / relative, missing=True)
+            original = item.get('original')
+            if original:
+                backup = store / 'backups' / relative.replace('/', '__')
+                if _digest(backup) != original:
+                    raise RuntimeError(f'Backup missing or changed: {relative}')
+                backups.append(backup)
+            if target.is_file():
+                allowed = {item['sha256']}
+                if data.get('state') in {'installing', 'uninstalling'}:
+                    allowed.update((original, item.get('previous_sha256')))
+                if _digest(target) not in allowed:
+                    raise RuntimeError(f'Refusing to remove a changed deployed file: {relative}')
+        data['state'] = 'uninstalling'
+        _journal(store, data)
+        for relative, item in data['files'].items():
+            target = exe.parent / relative
+            original = item.get('original')
+            if original:
+                backup = store / 'backups' / relative.replace('/', '__')
+                if not backup.is_file() or package.sha256(backup) != original:
+                    raise RuntimeError(f'Backup missing or changed: {relative}')
+                _atomic_copy(backup, target, original)
+            elif target.is_file():
+                target.unlink()
+                parent = target.parent
+                while parent != exe.parent and parent.is_dir() and not any(parent.iterdir()):
+                    parent.rmdir()
+                    parent = parent.parent
+        for backup in backups:
+            backup.unlink()
+        data['state'] = 'removed'
+        data['files'] = {}
+        _journal(store, data)
+        journal = store / 'manifest.json'
+        for leftover in sorted(store.rglob('*'), reverse=True):
+            if leftover.is_dir() and not leftover.is_symlink() and not any(leftover.iterdir()):
+                leftover.rmdir()
+        if set(store.iterdir()) == {journal}:
+            journal.unlink()
+            store.rmdir()
+        return {'installed': False, 'removed': True, 'notes': ['Remove the wrapper from your launcher settings.']}

@@ -1,0 +1,3 @@
+# Offline image CLI only; the HIP runtime and converter use no Python packages.
+numpy>=1.24
+Pillow>=9

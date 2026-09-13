@@ -1,0 +1,152 @@
+// Numerics matching shaders/native_wave_*.hlsl (fast chain).
+// H() = f16 RNE, F() = E4M3FN RNE (OCP, bias 7, max 448).
+#pragma once
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <hip/hip_fp8.h>
+#include <cstdint>
+#include <cstddef>
+#include <cmath>
+#ifndef __HIP_DEVICE_COMPILE__
+#include <cstring>
+#endif
+
+namespace dlss5 {
+
+using u32 = uint32_t;
+using u8  = uint8_t;
+
+__host__ __device__ inline u32 as_u32(float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __float_as_uint(v);
+#else
+    u32 u;
+    std::memcpy(&u, &v, 4);
+    return u;
+#endif
+}
+__host__ __device__ inline float as_f32(u32 u) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __uint_as_float(u);
+#else
+    float v;
+    std::memcpy(&v, &u, 4);
+    return v;
+#endif
+}
+
+// Software f16 RNE (HLSL bit recipe, used when NATIVE_HW_H=0).
+__host__ __device__ inline float H_sw(float v) {
+    u32 b = as_u32(v), sg = b & 0x80000000u, a = b & 0x7fffffffu;
+    if (a >= 0x7f800000u)
+        return v;
+    if (a < 0x38800000u) {
+        float q = nearbyintf(fabsf(v) * 16777216.0f) * 5.9604644775390625e-8f;
+        return sg ? -q : q;
+    }
+    u32 r = (a + 0xfffu + ((a >> 13) & 1u)) & 0xffffe000u;
+    return as_f32(sg | (r >= 0x47800000u ? 0x7f800000u : r));
+}
+
+// Software E4M3FN RNE (HLSL Ffast / NativeFastFp8).
+__host__ __device__ inline float F_sw(float v) {
+    u32 bits = as_u32(v), a = bits & 0x7fffffffu;
+    if (a >= 0x7f800000u)
+        return v;
+    float sg = v < 0 ? -1.f : 1.f;
+    if (a < 0x3c800000u)
+        return copysignf(nearbyintf(fabsf(v) * 512.f) / 512.f, v);
+    if (a >= 0x43e00000u)
+        return sg * 448.f;
+    u32 r = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
+    float m = as_f32(r);
+    return sg * (m > 448.f ? 448.f : m);
+}
+
+__host__ __device__ inline float H_hw(float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return __half2float(__float2half_rn(v));
+#else
+    return H_sw(v);
+#endif
+}
+__host__ __device__ inline float F_hw(float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    return float(__hip_fp8_e4m3(v));
+#else
+    return F_sw(v);
+#endif
+}
+
+#ifndef DLSS5_HW_H
+#define DLSS5_HW_H 1
+#endif
+#if DLSS5_HW_H
+#define H H_hw
+#define F F_hw
+#else
+#define H H_sw
+#define F F_sw
+#endif
+
+__host__ __device__ inline float ActivatePoly(float v) {
+    float g = fminf(fmaxf(v, -4.f), 4.f);
+    return v * (g * (fabsf(g) * (-0.055908203125f) + 0.447265625f) + 0.89453125f);
+}
+__host__ __device__ inline float Activate(float v) { return F(ActivatePoly(v)); }
+
+// native_c32_ffn_fused.hlsli precise q/p: no multiply-add contraction.
+// Keep the legacy polynomial for other shader families and public operators.
+__host__ __device__ inline float ActivatePolyC32(float v) {
+    float g = fminf(fmaxf(v, -4.f), 4.f);
+    volatile float qmul = fabsf(g) * (-0.055908203125f);
+    volatile float q = qmul + 0.447265625f;
+    volatile float pmul = g * q;
+    volatile float p = pmul + 0.89453125f;
+    return v * p;
+}
+
+// Saturating E4M3FN round-to-nearest-even, including exponent carries.
+// Preserve NaNs instead of silently treating corrupt data as a finite value.
+__host__ __device__ inline u8 e4m3_byte(float v) {
+    u32 b = as_u32(v), a = b & 0x7fffffffu;
+    u8 sg = u8((b >> 24) & 0x80u);
+    if (a > 0x7f800000u)
+        return u8(sg | 0x7f);
+    if (a >= 0x43e00000u)
+        return u8(sg | 0x7e);
+    if (a < 0x3c800000u)
+        return u8(sg | u8(nearbyintf(fabsf(v) * 512.f)));
+    u32 rounded = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
+    u32 code = ((rounded >> 23) - 120u) * 8u + ((rounded >> 20) & 7u);
+    return u8(sg | (code > 126u ? 126u : code));
+}
+
+__host__ __device__ inline float from_e4m3(u8 b) {
+    u32 e = (b >> 3) & 15u, m = b & 7u;
+    if (e == 15u && m == 7u)
+        return as_f32(0x7fc00000u | (u32(b & 0x80u) << 24));
+    float v = e ? as_f32(((e + 120u) << 23) | (m << 20)) : float(m) * 0.001953125f;
+    return (b & 0x80u) ? -v : v;
+}
+
+__host__ __device__ inline u32 pcg(u32 s) {
+    u32 w = ((s >> ((s >> 28) + 4)) ^ s) * 0x108ef2d9u;
+    return (w >> 22) ^ w;
+}
+__host__ __device__ inline float uniform24(u32 s) {
+    u32 w = ((s >> ((s >> 28) + 4)) ^ s) * 0x108ef2d9u;
+    return float(((w >> 30) ^ (w >> 8)) + 1) * 5.9604644775390625e-8f;
+}
+
+// 512-byte B-tile packing: [K=32][N=16] row-major from row-major [N][K].
+inline void pack_tiled_e4m3(u8* dst, const float* src, size_t N, size_t K) {
+    for (size_t t = 0; t < N / 16; t++)
+        for (size_t g = 0; g < K / 32; g++)
+            for (size_t k = 0; k < 32; k++)
+                for (size_t j = 0; j < 16; j++)
+                    dst[(t * (K / 32) + g) * 512 + k * 16 + j] =
+                        e4m3_byte(src[(t * 16 + j) * K + g * 32 + k]);
+}
+
+} // namespace dlss5

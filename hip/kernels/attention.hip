@@ -1,0 +1,89 @@
+// HIP port of shaders/native_wave_attention_direct.hlsl (fast path).
+// 8×8 windows, 32-channel heads, FP8 QKV in window-major [token][3C].
+#pragma once
+#include "dlss5_linalg.hpp"
+
+namespace dlss5 {
+
+__device__ inline float fast_exp_raw(float x) {
+    float a = fminf(fmaxf(fmaf(x, 0.044921875f, 1.30078125f), 1.03125f), 1.5693359375f);
+    unsigned short h = __half_as_ushort(__float2half_rn(a));
+    unsigned short e = (unsigned short)(((unsigned(h) << 5) + 0x8000u) & 65535u);
+    return __half2float(__ushort_as_half(e));
+}
+
+__device__ inline uint window_pixel(uint window, uint token, uint width) {
+    return ((window / (width / 8)) * 8 + token / 8) * width + (window % (width / 8)) * 8 + token % 8;
+}
+
+// block = (window, head). 128 threads: 4 waves × 16 query tokens.
+template <int C>
+__global__ void k_window_attention(const u8* qkv, const float* bias, u8* output, uint width,
+                                   uint height, uint packed, bool direct_f8 = false) {
+    using namespace linalg;
+    constexpr int HEADS = C / 32;
+    constexpr int STRIDE = 3 * C;
+    const uint head = blockIdx.y;
+    if (head >= uint(HEADS))
+        return;
+    const uint nwin = (width / 8) * (height / 8);
+    const uint wave = threadIdx.x / 32u;
+    const uint qtok = wave * 16u;
+    __shared__ __half scores[64 * 64];
+    __shared__ u8 p8[64 * 32];
+    for (uint window = blockIdx.x; window < nwin; window += gridDim.x) {
+
+    A8 q = A8::Load(qkv, (window * 64u + qtok) * uint(STRIDE) + head * 32u, uint(STRIDE));
+    for (uint k0 = 0; k0 < 64; k0 += 16) {
+        B8 k = B8::LoadCol(qkv, (window * 64u + k0) * uint(STRIDE) + uint(C) + head * 32u,
+                           uint(STRIDE));
+        C32 s = Multiply(q, k);
+        for (uint i = 0; i < s.Length(); i++) {
+            uint2 rc = s.GetCoordinate(i);
+            uint qi = qtok + rc.x, kj = k0 + rc.y;
+            scores[qi * 64 + kj] = __float2half_rn(
+                fast_exp_raw(s.Get(i) + bias[head * 4096u + qi * 64u + kj]));
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.x < 64) {
+        uint qi = threadIdx.x;
+        float sum = 0.f;
+        for (int j = 0; j < 64; j++)
+            sum += __half2float(scores[qi * 64 + j]);
+        float inv = 1.f / fmaxf(sum, 1e-20f);
+        for (int j = 0; j < 64; j++)
+            scores[qi * 64 + j] =
+                __float2half_rn(from_e4m3(e4m3_byte(__half2float(scores[qi * 64 + j]) * inv)));
+    }
+    __syncthreads();
+
+    C32 av0 = C32::Splat(0.f);
+    C32 av1 = C32::Splat(0.f);
+    for (uint k0 = 0; k0 < 64; k0 += 32) {
+        if (threadIdx.x < 64)
+            for (int j = 0; j < 32; j++)
+                p8[threadIdx.x * 32 + j] =
+                    e4m3_byte(__half2float(scores[threadIdx.x * 64 + k0 + j]));
+        __syncthreads();
+        A8 p = A8::Load(p8, qtok * 32u, 32);
+        const uint vbase = (window * 64u + k0) * uint(STRIDE) + 2u * uint(C) + head * 32u;
+        B8 v0 = B8::LoadRow(qkv, vbase, uint(STRIDE));
+        B8 v1 = B8::LoadRow(qkv, vbase + 16u, uint(STRIDE));
+        av0.MultiplyAccumulate(p, v0);
+        av1.MultiplyAccumulate(p, v1);
+        __syncthreads();
+    }
+    for (uint i = 0; i < av0.Length(); i++) {
+        uint2 rc = av0.GetCoordinate(i);
+        uint dst = packed ? (window * 64u + qtok + rc.x)
+                          : window_pixel(window, qtok + rc.x, width);
+        output[dst * uint(C) + head * 32u + rc.y] = e4m3_byte(direct_f8 ? av0.Get(i) : H(av0.Get(i)));
+        output[dst * uint(C) + head * 32u + 16u + rc.y] = e4m3_byte(direct_f8 ? av1.Get(i) : H(av1.Get(i)));
+    }
+    __syncthreads();
+    }
+}
+
+} // namespace dlss5

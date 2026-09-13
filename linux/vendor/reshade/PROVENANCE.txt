@@ -1,0 +1,7 @@
+ReShade 6.8.0 with full add-on support
+Source: https://reshade.me/downloads/ReShade_Setup_6.8.0_Addon.exe
+SHA256 setup.exe: afe4c8f13048306307983b8b3d41d5bf00a86820440b0e57dea10950e1176445
+SHA256 ReShade64.dll: 0cee63f9c9f13f3ac909c5b4903f4dbb4b719a7ab3b4f13b0deaf83c814b94f7
+License: BSD-3-Clause (LICENSE.md). Copyright 2014 Patrick Mours.
+The ReShade website asks visitors not to share binaries and to link reshade.me instead.
+This tree still ships the official add-on build so a Proton install does not need a separate Windows ReShade setup.
