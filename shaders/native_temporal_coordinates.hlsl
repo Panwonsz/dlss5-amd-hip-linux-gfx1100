@@ -7,6 +7,9 @@ cbuffer Geometry : register(b0) {
     uint motion_width; uint motion_height; float motion_offset_x; float motion_offset_y;
     float motion_extent_x; float motion_extent_y; float motion_uv_scale_x; float motion_uv_scale_y;
     float valid_inverse_width; float valid_inverse_height; float motion_inverse_width; float motion_inverse_height;
+#if NATIVE_INPUT_VIEWPORT
+    float4 input_viewport;
+#endif
 }
 #ifndef NATIVE_FAST_TEMPORAL
 #define NATIVE_FAST_TEMPORAL 0
@@ -52,6 +55,9 @@ void main(uint3 id:SV_DispatchThreadID) {
     precise float2 motion_reciprocal=float2(motion_inverse_width,motion_inverse_height);
     sample_uv=sample_uv*motion_reciprocal;
     float2 vectors=fetch_motion(sample_uv);
+#if NATIVE_INPUT_VIEWPORT
+    if(any(float2(p)<input_viewport.xy)||any(float2(p)>=input_viewport.xy+input_viewport.zw))vectors=0;
+#endif
 #if NATIVE_FAST_TEMPORAL
     float2 previous_uv=mad(vectors,float2(motion_uv_scale_x,motion_uv_scale_y),uv);
 #else

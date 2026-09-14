@@ -2,6 +2,7 @@
 #include "dlss5_launch.hpp"
 #include "../kernels/ffn_fused.hip"
 #include "../kernels/qkv.hip"
+#include "../kernels/qkv_norm.hip"
 #include "../kernels/project.hip"
 #include "../kernels/prefix.hip"
 #include "../kernels/attention.hip"
@@ -42,6 +43,36 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
     if (!tokens || !c || c % 32 || !scales) throw std::runtime_error("QKV extent/scales");
     uint count = tokens * (c / 32) * 3;
     LAUNCH(k_normalize_qkv, (count + 255) / 256, 256, in, scales, out, tokens, c, qgain, half_squares);
+}
+
+// GEMM + normalize + quantize in one launch (bit-identical to the split pair).
+void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
+                         const float* scales, float qgain, bool half_squares) {
+    if (!m || !c || c % 32 || !scales) throw std::runtime_error("QKV norm extent/scales");
+    switch (c) {
+    case 32:
+        LAUNCH((k_qkv_norm_f32<32, 1>), dim3((m + 15) / 16, 3u), 64, in, w, out, m, c, scales,
+               qgain, half_squares);
+        break;
+    case 64:
+        LAUNCH((k_qkv_norm_f32<64, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
+               scales, qgain, half_squares);
+        break;
+    case 128:
+        LAUNCH((k_qkv_norm_f32<128, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
+               scales, qgain, half_squares);
+        break;
+    case 256:
+        LAUNCH((k_qkv_norm_f32<256, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
+               scales, qgain, half_squares);
+        break;
+    case 512:
+        LAUNCH((k_qkv_norm_f32<512, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
+               scales, qgain, half_squares);
+        break;
+    default:
+        throw std::runtime_error("QKV norm channels");
+    }
 }
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
                         uint px, uint py, uint c, int crop, int quantize) {

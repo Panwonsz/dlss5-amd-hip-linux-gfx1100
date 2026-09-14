@@ -17,6 +17,10 @@ __device__ inline uint window_pixel(uint window, uint token, uint width) {
 }
 
 // block = (window, head). 128 threads: 4 waves × 16 query tokens.
+// scores rows are padded to 68 (8B-aligned): the row sum and the byte write hit
+// 2-way bank conflicts instead of 32-way. Phase 2 writes the E4M3 bytes directly
+// (e4m3_byte is the identity on E4M3-grid values, so the separate re-quant pass
+// is numerically redundant) as 16B stores; phase 3 is pure MMAs.
 template <int C>
 __global__ void k_window_attention(const u8* qkv, const float* bias, u8* output, uint width,
                                    uint height, uint packed, bool direct_f8 = false) {
@@ -29,8 +33,8 @@ __global__ void k_window_attention(const u8* qkv, const float* bias, u8* output,
     const uint nwin = (width / 8) * (height / 8);
     const uint wave = threadIdx.x / 32u;
     const uint qtok = wave * 16u;
-    __shared__ __half scores[64 * 64];
-    __shared__ u8 p8[64 * 32];
+    __shared__ __half scores[64 * 68];
+    __shared__ u8 p8[64 * 64];
     for (uint window = blockIdx.x; window < nwin; window += gridDim.x) {
 
     A8 q = A8::Load(qkv, (window * 64u + qtok) * uint(STRIDE) + head * 32u, uint(STRIDE));
@@ -41,7 +45,7 @@ __global__ void k_window_attention(const u8* qkv, const float* bias, u8* output,
         for (uint i = 0; i < s.Length(); i++) {
             uint2 rc = s.GetCoordinate(i);
             uint qi = qtok + rc.x, kj = k0 + rc.y;
-            scores[qi * 64 + kj] = __float2half_rn(
+            scores[qi * 68 + kj] = __float2half_rn(
                 fast_exp_raw(s.Get(i) + bias[head * 4096u + qi * 64u + kj]));
         }
     }
@@ -50,30 +54,39 @@ __global__ void k_window_attention(const u8* qkv, const float* bias, u8* output,
     if (threadIdx.x < 64) {
         uint qi = threadIdx.x;
         float sum = 0.f;
-        for (int j = 0; j < 64; j++)
-            sum += __half2float(scores[qi * 64 + j]);
+        // 16 x 8B loads (4 f16 each); 136B row stride keeps 8B alignment and the
+        // per-step banks 2-way. Serial f32 order 0..63 is preserved.
+        for (int j = 0; j < 16; j++) {
+            uint2 v = *reinterpret_cast<const uint2*>(&scores[qi * 68 + j * 4]);
+            const __half2* h = reinterpret_cast<const __half2*>(&v);
+            sum += __half2float(__low2half(h[0]));
+            sum += __half2float(__high2half(h[0]));
+            sum += __half2float(__low2half(h[1]));
+            sum += __half2float(__high2half(h[1]));
+        }
         float inv = 1.f / fmaxf(sum, 1e-20f);
-        for (int j = 0; j < 64; j++)
-            scores[qi * 64 + j] =
-                __float2half_rn(from_e4m3(e4m3_byte(__half2float(scores[qi * 64 + j]) * inv)));
+        // 4 x 16B stores per row (16 E4M3 bytes): rows are 16B-aligned, banks
+        // 8-way instead of 32-way.
+        uint4* row = reinterpret_cast<uint4*>(p8 + qi * 64);
+        for (int q4 = 0; q4 < 4; q4++) {
+            uint4 v;
+            u8* b = reinterpret_cast<u8*>(&v);
+            for (int t = 0; t < 16; t++)
+                b[t] = e4m3_byte(__half2float(scores[qi * 68 + q4 * 16 + t]) * inv);
+            row[q4] = v;
+        }
     }
     __syncthreads();
 
     C32 av0 = C32::Splat(0.f);
     C32 av1 = C32::Splat(0.f);
     for (uint k0 = 0; k0 < 64; k0 += 32) {
-        if (threadIdx.x < 64)
-            for (int j = 0; j < 32; j++)
-                p8[threadIdx.x * 32 + j] =
-                    e4m3_byte(__half2float(scores[threadIdx.x * 64 + k0 + j]));
-        __syncthreads();
-        A8 p = A8::Load(p8, qtok * 32u, 32);
+        A8 p = A8::Load(p8, qtok * 64u + k0, 64);
         const uint vbase = (window * 64u + k0) * uint(STRIDE) + 2u * uint(C) + head * 32u;
         B8 v0 = B8::LoadRow(qkv, vbase, uint(STRIDE));
         B8 v1 = B8::LoadRow(qkv, vbase + 16u, uint(STRIDE));
         av0.MultiplyAccumulate(p, v0);
         av1.MultiplyAccumulate(p, v1);
-        __syncthreads();
     }
     for (uint i = 0; i < av0.Length(); i++) {
         uint2 rc = av0.GetCoordinate(i);

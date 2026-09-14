@@ -6,7 +6,7 @@ A Linux HIP/rocWMMA port of [lmxxf's DLSS5-AMD work](https://github.com/lmxxf/dl
 
 ## Download and install
 
-**[Download the prebuilt .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.1.0-poc/dlss5-amd-hip-linux.tar.gz)** · [Release, checksums and corresponding source](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.1.0-poc)
+**[Download the prebuilt .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/releases/download/v0.2.0/dlss5-amd-hip-linux.tar.gz)** · [Release, checksums and corresponding source](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.0)
 
 1. Close the game. Extract the archive inside its directory, keeping the `dlss5-amd-hip-linux` subfolder.
 2. Put your legitimately obtained `nvngx_dlssnr.dll` **310.8.0.0** beside the game executable or in the game root (or select it in the wizard).
@@ -24,7 +24,16 @@ The archive contains the prebuilt HIP library, Windows bridge, add-on, ReShade l
 - The prototype uses CPU readback/upload and HIP execution at a split vkd3d submission boundary. **The game still waits for neural rendering.** It is not an asynchronous performance fix.
 - General gameplay stability, HDR behavior and broad game compatibility are not certified. F6 toggles the live path's bypass when the hook is active; it cannot fix a missing hook or failed initialization.
 
-A local release-preparation run on an RX 9070 XT (`gfx1201`), with a fixed 1080p input and real weights, measured **210–216 ms GPU time per inference** over three runs. That is network-only timing, **not in-game FPS**. Optimizing kernels, data transfers and memory use remains necessary.
+The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~122 ms GPU time per inference** on the current build — the `0.1.0-poc` build measured 210–216 ms. That is network-only timing, **not in-game FPS**. Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
+
+## Changelog
+
+Unless a scenario is specified, timings are the offline bench (network only, fixed 1920×1080 input, real converted weights, RX 9070 XT `gfx1201`); "bit-exact" means the output did not change by a single bit against the reference 71-block network, which stays the judge.
+
+| Version | Date | What changed | Result |
+|---|---|---|---|
+| `0.1.0-poc` | 09-05 | First complete Linux port: all 71 blocks as HIP/rocWMMA wave-matrix kernels on `gfx1201`; weights converted from the user's own `nvngx_dlssnr.dll` 310.8.0.0 (225 tables, resident in VRAM, no NVIDIA DLL at inference time); Win64→SysV trampoline + ReShade add-on + modified vkd3d-proton submission boundary for the in-game hook (synchronous, motion history reset per frame); offline `hip-network70` bench and `infer_image.py` | bench 210–216 ms, in-game staging only |
+| `0.2.0` | 09-14 | lmxxf upstream sync 0.12 → 0.15 (≤1920×1080 window fit with aspect preservation, on-screen notice + bitmap font, FPS-display refresh, Windows-Update driver trap) and the Linux installer retargeted at the lmxxf ReShade add-on (wizard, managed backups, consent-based ROCm fallback, per-file sha256 manifest, install/trampoline/weights-safety test suites). GPU kernel optimization, all bit-exact (0 mismatches on every operator and graph test): fused QKV+LayerNorm+quant kernel (one dispatch per row group instead of GEMM → normalize → quant; the `ROWS_PER_THREAD` fix also removed 4× redundant row loads and out-of-bounds aliased stores); window-attention rewrite (padded score matrix kills the 32-way LDS bank conflict, softmax writes E4M3 bytes straight into the P·V operand with 16-byte stores, the provable-identity re-quantization stage is gone, 4 → 2 barriers); exact squares through opaque inline asm (`v_fma_mixlo_f16` / `v_mul_f32_e32`) instead of 32 volatile SCOPE_SYS private-memory round-trips per row-head | bench 175 → 167 → 131 → 122 ms (−30 % vs the pre-optimization build), bit-identical output; in-game verification in progress |
 
 ## Troubleshooting and removal
 

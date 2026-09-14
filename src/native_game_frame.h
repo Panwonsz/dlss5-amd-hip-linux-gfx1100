@@ -150,10 +150,12 @@ private:
  NativeHipClient hip;ID3D12CommandQueue*hip_queue{};bool hip_on{};
 public:
  NativeGameFrame()=default;NativeGameFrame(const NativeGameFrame&)=delete;
- ~NativeGameFrame(){
-  if(hip_queue)hip_queue->Release();
-  if(!failed)delete resources;
- }
+  ~NativeGameFrame(){
+   if(hip_queue)hip_queue->Release();
+   // Failure may mean an unfinished GPU submission. Retain the entire graph,
+   // not just the command allocator, until process exit rather than risk UAF.
+   if(!failed&&resources){try{resources->submit.Flush();if(resources->overlap)resources->compute.Flush();}catch(...){return;}delete resources;}
+  }
  void Create(ID3D12CommandQueue*queue,ID3D12Resource*source,
              const std::vector<float>&noise,const std::wstring&directory,ID3D12Resource*temporal_rgb=nullptr,const TemporalConfig*temporal_config=nullptr){
   std::lock_guard<std::mutex>guard(mutex);
@@ -175,19 +177,23 @@ public:
      if(FAILED(NativeCreateCommittedResource(d,&hp,D3D12_HEAP_FLAG_NONE,&cd,D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,nullptr,IID_PPV_ARGS(&resources->original_copy))))throw std::runtime_error("overlap original copy");
      NativeGameFrameStep("overlap",d);
     }}
-   NativeGameFrameStep("encode",d);resources->encode.Create(d,{source},directory);
-   resources->original=source;
-   NativeGameFrameStep("input",d);resources->input.Create(d,resources->encode.Output(),directory);
+    NativeGameFrameStep("encode",d);resources->encode.Create(d,{source},directory);
+    resources->original=source;
+    {const auto&g=resources->encode.Geometry();char info[160];snprintf(info,sizeof info,"input=%ux%u network=1920x1080 viewport=%u,%u,%u,%u output=%ux%u",g.width,g.height,g.x,g.y,g.fit_width,g.fit_height,g.width,g.height);NativeGameFrameStep(info,d);}
+    NativeGameFrameStep("input",d);resources->input.Create(d,resources->encode.Output(),directory);
    if(temporal_config&&!temporal_rgb){
     // Motion vectors arrive in UV units of the render grid; the coordinate pass uses the captured
     // NGX contract (subrect 0,0..render extent over the motion texture; displacement scale 1/1920,1/1080).
     auto&t=*temporal_config;auto&r=*resources;
     /* raster motion -> pixels of the 1080p output: value * mvscale = render-grid pixels (FFX contract), * 1920/render_w = output pixels. Stellar Blade declares
        mvscale = render size (UV units) -> 1920 exactly as before; Magpie declares (1,1) with a 1920 render grid (pixel units) -> 1. No declaration (XeSS): UV units. */
-    const float*mvs=NativeMotionVectorScale();const float sx=(mvs[0]!=0.f&&t.render_width)?mvs[0]*1920.f/float(t.render_width):1920.f,sy=(mvs[1]!=0.f&&t.render_height)?mvs[1]*1080.f/float(t.render_height):1080.f;
-    r.feed.Create(d,t.motion_width,t.motion_height,sx*NativeMotionSign(),sy*NativeMotionSign(),directory);r.motion_w=t.motion_width;r.motion_h=t.motion_height;
-    const float transform[6]={0,0,float(t.render_width),float(t.render_height),1.f/1920.f,1.f/1080.f};
-    r.coordinates.Create(d,r.feed.Motion(),1920,1080,1920,1152,t.motion_width,t.motion_height,transform,directory,true);
+     const auto fit=resources->encode.Geometry();
+     const float*mvs=NativeMotionVectorScale();const float sx=(mvs[0]!=0.f&&t.render_width)?mvs[0]*float(fit.fit_width)/float(t.render_width):float(fit.fit_width),sy=(mvs[1]!=0.f&&t.render_height)?mvs[1]*float(fit.fit_height)/float(t.render_height):float(fit.fit_height);
+     r.feed.Create(d,t.motion_width,t.motion_height,sx*NativeMotionSign(),sy*NativeMotionSign(),directory);r.motion_w=t.motion_width;r.motion_h=t.motion_height;
+     const float rx=float(t.render_width)/float(fit.fit_width),ry=float(t.render_height)/float(fit.fit_height);
+     const float transform[6]={-float(fit.x)*rx,-float(fit.y)*ry,fit.Adapted()?1920.f*rx:float(t.render_width),fit.Adapted()?1080.f*ry:float(t.render_height),1.f/1920.f,1.f/1080.f};
+     const float viewport[4]={float(fit.x),float(fit.y),float(fit.fit_width),float(fit.fit_height)};
+     r.coordinates.Create(d,r.feed.Motion(),1920,1080,1920,1152,t.motion_width,t.motion_height,transform,directory,true,fit.Adapted()?viewport:nullptr);
     std::ifstream f((directory+L"\\normalized-output.f32").c_str(),std::ios::binary|std::ios::ate);if(!f||f.tellg()!=33554432)throw std::runtime_error("reciprocal table missing");
     std::vector<float>table(8388608);f.seekg(0);if(!f.read(reinterpret_cast<char*>(table.data()),33554432))throw std::runtime_error("reciprocal table read");
     D3D12_HEAP_PROPERTIES hp{};hp.Type=D3D12_HEAP_TYPE_UPLOAD;D3D12_RESOURCE_DESC rd{};rd.Dimension=D3D12_RESOURCE_DIMENSION_BUFFER;rd.Width=33554432;rd.Height=1;rd.DepthOrArraySize=rd.MipLevels=1;rd.SampleDesc.Count=1;rd.Layout=D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
@@ -336,7 +342,7 @@ public:
   }
   if(target==resources->original&&source_state!=target_state)throw std::runtime_error("aliased frame texture states disagree");
   auto desc=target->GetDesc();
-  if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||desc.Width!=1920||desc.Height!=1080||desc.DepthOrArraySize!=1||desc.MipLevels!=1||desc.SampleDesc.Count!=1||!NativeIsGameColor(desc.Format))throw std::runtime_error("frame target must be 1080p FP16/UNORM16/UNORM8");
+  if(desc.Dimension!=D3D12_RESOURCE_DIMENSION_TEXTURE2D||desc.Width!=resources->encode.Geometry().width||desc.Height!=resources->encode.Geometry().height||desc.DepthOrArraySize!=1||desc.MipLevels!=1||desc.SampleDesc.Count!=1||!NativeIsGameColor(desc.Format))throw std::runtime_error("frame target must match the initialized input geometry/format");
   ID3D12Device*owner=nullptr;auto hr=target->GetDevice(IID_PPV_ARGS(&owner));if(FAILED(hr))throw std::runtime_error("frame target device query");bool same=NativeSameDevice(owner,resources->submit.Device());owner->Release();if(!same)throw std::runtime_error("frame target device mismatch");
   try{
    auto&r=*resources;

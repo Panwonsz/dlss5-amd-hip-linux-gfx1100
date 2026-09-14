@@ -1,3 +1,19 @@
+cbuffer CodecConstants : register(b0) {
+ uint2 Size; uint2 SourceSize; uint2 SourceBase; uint2 ProxySize;
+ float PaperWhiteScale; float TransferStrength; float ColorStrength; uint HdrMode;
+ float4 Padding;
+ uint OutputRowPitch; uint3 Reserved;
+};
+#ifndef NATIVE_CODEC_FIT
+#define NATIVE_CODEC_FIT 0
+#endif
+uint ByteOffset(uint2 p,uint bpp) {
+#if NATIVE_CODEC_FIT
+ return p.y*OutputRowPitch+p.x*bpp;
+#else
+ return (p.y*1920+p.x)*bpp;
+#endif
+}
 // Mode1 candidate. Oracle: captured codec-22724-36e36d370.dxbc.
 // Host must reject other modes; GPU comparison required before integration.
 Texture2D<float4> Proxy : register(t1);
@@ -27,25 +43,20 @@ void Store(uint2 p,float4 v){
 #endif
  uint4 q=uint4(round(saturate(v)*255.0));
 #if NATIVE_CODEC_BGRA
- OutputBits.Store((p.y*1920+p.x)*4,q.z|(q.y<<8)|(q.x<<16)|(q.w<<24));
+ OutputBits.Store(ByteOffset(p,4),q.z|(q.y<<8)|(q.x<<16)|(q.w<<24));
 #else
- OutputBits.Store((p.y*1920+p.x)*4,q.x|(q.y<<8)|(q.z<<16)|(q.w<<24));
+ OutputBits.Store(ByteOffset(p,4),q.x|(q.y<<8)|(q.z<<16)|(q.w<<24));
 #endif
 }
 #elif NATIVE_CODEC_UINT_OUT
 // Typeless UNORM16 game textures (Rise of the Ronin): this driver device-removes on any non-float RGBA16 typed UAV, so the
 // UNORM bits go into a raw buffer (row pitch 1920*8) that the frame copies into the game texture with CopyTextureRegion.
 RWByteAddressBuffer OutputBits : register(u0);
-void Store(uint2 p,float4 v){uint4 q=uint4(round(saturate(v)*65535.0));OutputBits.Store2((p.y*1920+p.x)*8,uint2(q.x|(q.y<<16),q.z|(q.w<<16)));}
+void Store(uint2 p,float4 v){uint4 q=uint4(round(saturate(v)*65535.0));OutputBits.Store2(ByteOffset(p,8),uint2(q.x|(q.y<<16),q.z|(q.w<<16)));}
 #else
 RWTexture2D<float4> Output : register(u0);
 void Store(uint2 p,float4 v){Output[p]=v;}
 #endif
-cbuffer CodecConstants : register(b0) {
- uint2 Size; uint2 SourceSize; uint2 SourceBase; uint2 ProxySize;
- float PaperWhiteScale; float TransferStrength; float ColorStrength; uint HdrMode;
- float4 Padding;
-};
 float Luminance(float3 c) { return dot(c,float3(0.212639,0.715169,0.072192)); }
 float3 Decode(float3 c) {
  c=saturate(c);
@@ -86,6 +97,14 @@ float3 Upgrade(float3 original,float3 proxy,float3 neural) {
  }
  return result;
 }
+#if NATIVE_CODEC_FIT
+float3 ReadFitted(Texture2D<float4> image,float2 p) {
+ p=clamp(p,Padding.xy,Padding.xy+Padding.zw-1);
+ uint2 lo=uint2(floor(p)),hi=min(lo+1,uint2(Padding.xy+Padding.zw-1));float2 f=p-lo;
+ return lerp(lerp(image.Load(int3(lo,0)).rgb,image.Load(int3(hi.x,lo.y,0)).rgb,f.x),
+             lerp(image.Load(int3(lo.x,hi.y,0)).rgb,image.Load(int3(hi,0)).rgb,f.x),f.y);
+}
+#endif
 [numthreads(16,16,1)]
 void main(uint3 id:SV_DispatchThreadID) {
  if(any(id.xy>=Size))return;
@@ -99,7 +118,12 @@ void main(uint3 id:SV_DispatchThreadID) {
 #else
  float3 original=max(source.rgb,0)/PaperWhiteScale;
 #endif
+ #if NATIVE_CODEC_FIT
+ float2 network_p=Padding.xy+(float2(id.xy)+.5)*Padding.zw/float2(Size)-.5;
+ float3 upgraded=Upgrade(original,Decode(ReadFitted(Proxy,network_p)),Decode(ReadFitted(Neural,network_p)));
+#else
  float3 upgraded=Upgrade(original,Decode(Proxy.Load(int3(p,0)).rgb),Decode(Neural.Load(int3(id.xy,0)).rgb));
+#endif
  float oy=Luminance(original),uy=Luminance(upgraded);
  float ratio=oy==0?1:clamp(uy/oy,0,4);
  float3 result=lerp(original*ratio,upgraded,ColorStrength);

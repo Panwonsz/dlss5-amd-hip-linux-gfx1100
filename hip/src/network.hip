@@ -66,8 +66,8 @@ struct Block {
   else launch_ffn_f32(c,in,fw.as<u8>(),c==32?fs.as<float>():nullptr,c==32?f:s.d.as<float>(),n,chain,c==32);
   // mapfeature FFN projection: H(scale product); direct store only C64..256.
   if(c!=32)launch_linear_f32(s.d.as<float>(),p0.as<u8>(),f,n,c,c,in,s0.as<float>(),c==512?1:5,0);
-  launch_linear_f32(f,qw.as<u8>(),s.q.as<float>(),n,3*c,c,nullptr,nullptr,3,0);
-  launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),n,c,1.f,c==32);
+  // QKV GEMM + per-head scaling + E4M3 in one launch (no f32 round trip).
+  launch_qkv_norm_f32(c,f,qw.as<u8>(),s.q8.as<u8>(),n,qs.as<float>(),1.f,c==32);
   launch_attention(c,s.q8.as<u8>(),bias.as<float>(),s.att8.as<u8>(),sw,sh,1,true);
   launch_f8_to_f32(s.att8.as<u8>(),s.d.as<float>(),n*c);
   // mapoutput C64..256 uses NATIVE_MATRIX_RESIDUAL even for raw outputs.

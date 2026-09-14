@@ -11,6 +11,8 @@ void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n,
                        bool matrix_residual = false);
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
                           uint tokens, uint c, float qgain, bool half_squares = true);
+void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
+                         const float* scales, float qgain, bool half_squares);
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
                         uint px, uint py, uint c, int crop, int quantize);
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh);

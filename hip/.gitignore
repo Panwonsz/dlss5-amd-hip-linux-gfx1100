@@ -1,0 +1,16 @@
+build/
+__pycache__/
+.rocprofv3/
+dump_asm-*
+test_wmma
+test_stages
+test_quantize
+test_attention
+test_residual
+test_linear
+test_logical_ops
+test_ffn_f32
+hip-network70
+libdlss5_hip.so
+dlss5_hip.dll
+*.o

@@ -1,10 +1,13 @@
-DLSS5-AMD 0.14 · Magpie 版
+DLSS5-AMD 0.15 · Magpie 版（2026-09-13）
 ============================
+整包文件：Magpie-DLSS5-AMD-0.15.zip
 
 把 DLSS 5 的神经网络（DLSSNR）跑在 AMD RX 9070 XT（RDNA4）上，以 Magpie 窗口缩放器为载体：
-任何能开 1920x1080 无边框窗口的游戏都能用，不需要游戏自己支持 FSR 或 DLSS。
-Magpie 抓取游戏窗口 -> Magpie 的 FSR3 效果（含 AMD 光流估运动向量）-> 本插件截下 FSR3 的
-ffxDispatch 调用，换成 DLSS 5 网络 -> Magpie 显示。
+支持宽不超过 1920、高不超过 1080 的普通游戏窗口，不需要游戏自己支持 FSR 或 DLSS。
+窗口比 1080p 少几个像素也能用，小窗口自动按原宽高比适配。
+游戏窗口 -> FSR3（本插件的 DLSS5 入口）-> FSR4 放大到屏幕 -> XeSS 帧生成 -> 显示。
+效果组里名叫 FSR3_SR 的那一项，就是本插件接入 DLSS5 的位置；界面名称仍是 FSR3，
+不用另外添加 DLSS5 滤镜。第一项保持输入尺寸，后面的 FSR4 才负责放大。
 
 本包内容
 --------
@@ -28,32 +31,35 @@ ffxDispatch 调用，换成 DLSS 5 网络 -> Magpie 显示。
       判断：DLSS5-AMD\logs\native-submission-order.txt 里 "sdk721_before_device ... experimental=" 后面不是 00000000 就是它。
       不需要装 SM 6.10 编译器、HIP、任何 SDK：着色器已经编好在包里。
   2. 本包已含 Magpie 实验分支（https://github.com/SAOG0721/Magpie）。
-  3. 显示器分辨率不限，但游戏窗口必须是 1920x1080 无边框，Magpie 缩放选"原始尺寸"（不放大）。
-     网络只认 1920x1080 进、1920x1080 出。尺寸不对时画面左上角会写一行
-     "DLSS5-AMD: INPUT MUST BE 1920X1080 (NOW 2560X1440)" 之类的提示（0.12 起），看到它就去改游戏窗口 / Magpie 缩放模式。
+  3. 游戏选择窗口模式，宽不超过 1920、高不超过 1080；普通窗口和无边框窗口都可以。
+     显示器可以是 2K、4K，包内 FSR4 默认充满屏幕；想保留原宽高比，可改成适应屏幕。
+     若看到 "DLSS5-AMD: INPUT MAX 1920X1080 (NOW WxH)"，请减小游戏窗口，
+     并确认效果组第一站 FSR3 没有提前放大。
 
 安装（整包版：Magpie 本体已经在里面，解压即用）
 ----
-  1. 解压到任意目录（路径别带中文），运行 Magpie.exe。配置是便携模式（config\config.json 随包），已经预设好：
-     效果组 "DLSS5-AMD"（FSR3_SR + XeSS 帧生成 ZeroMV，光流 AMDOF）、缩放"原始尺寸"、重复帧检测已关。
-     0.13 起效果组里挂了 XeSS 帧生成（Intel 的跨厂商 FG，不需要游戏给运动向量）：网络出 28～30 帧，
-     插到 55～60 显示。代价是多一帧延迟、网络本身慢 20% 左右（光流和 FG 抢 GPU）。不想要就在效果组里把
-     XeSS_FrameGeneration_x2_ZeroMV 删掉。Magpie 效能分析器（快捷键见设置）里"帧率（总/真实）"两个数就是插帧后/网络真实。
-     如果你自己改了配置，要保证：效果组里 FSR3 -> FSR3_SR 在第一个、缩放选"原始尺寸"、设置里重复帧检测选"从不"。
-  2. 游戏：显示模式无边框窗口，1920x1080。
-  3. 在游戏里按 Magpie 的缩放热键（默认 Alt+Shift+A）激活。前 3~5 秒是网络初始化（权重在 Magpie 启动时已经预读进内存，
-     着色器编译结果缓存在 DLSS5-AMD\native-game-tiled-assets\shader-cache\，第一次启动会多几秒），这段时间画面是 Magpie 自己的 FSR3，
-     左上角写着 "DLSS5-AMD: INITIALIZING..."；接管后左上角变成 "DLSS5-AMD 37 FPS (26.9 MS)"，就是网络自己的帧率
-     （数字至少间隔 3 秒刷新；字条复用并随网络输出提交；不想看就把 native-game-flags.txt 里的 DLSS5_SHOW_FPS=1 删掉）。
-     如果提示变成 "INIT FAILED - SEE DLSS5-AMD\LOGS"，八成是开发人员模式没开或驱动不对，看上面"需要"一节。
-     再按一次热键停止缩放就是对比。
+  1. 解压到任意目录（路径别带中文），运行 Magpie.exe。便携配置随包，选择效果组 "DLSS5-AMD" 即可。
+     已预设 FSR3_SR -> FSR4_SR -> XeSS_FrameGeneration_x2_ZeroMV。
+     光流默认只在第一项 FSR3（DLSS5）开启 AMDOF；FSR4 和 XeSS 插帧的 Optical Flow Method 均选 None。
+     关掉后两项的额外光流不会关闭放大或插帧。
+     如果自己调整效果组：FSR3 的缩放选相对于输入尺寸、水平/垂直均 1 倍；
+     FSR4 选充满屏幕。不要把 FSR3 设成适应屏幕。
+     不需要插帧时，删掉最后的 XeSS_FrameGeneration_x2_ZeroMV 即可。
+  2. 游戏选择窗口模式，例如 1920x1080、1600x900 或 1280x720；窗口实际尺寸略小也没关系。
+  3. 回到游戏，按 Alt+Shift+A 激活缩放。初始化通常需要 3~5 秒，首次启动可能更久。
+     左上角先显示 "DLSS5-AMD: INITIALIZING..."，接管后显示网络自己的 FPS 和耗时，数字至少每三秒刷新。
+     若显示 "INIT FAILED - SEE DLSS5-AMD\LOGS"，检查开发人员模式和预览驱动。
+     再按一次 Alt+Shift+A 停止缩放，可以对比原图。
+
 
 已知
 ----
-  - 实际帧率随游戏和场景变化；网络一般约 30 fps，启用插帧后显示帧率约为两倍。
+  - 用户实玩《鬼武者》：1080p 窗口放大到 2K，保持约 30 帧；另用测试窗口在 4K 桌面验证，网络约 29 fps。
+    实际帧率随游戏和场景变化。左上角是网络帧率；Magpie 效能分析器的总帧率包含插帧。
+  - 小窗口适配默认开启（DLSS5-AMD\native-game-flags.txt 中 DLSS5_FIT_INPUT=1），FPS 和 XeSS 帧生成也默认开启。
   - 输入是显示用的 8 位 sRGB 图（不是游戏内钩子那种线性 HDR 场景色）；插件按 sRGB 直通处理（DLSS5_CODEC_SRGB=1），
     亮度和原图一致。0.09 里暗部皮肤上偶尔闪的 8 像素方块在 0.10 修掉了（硬件 FP8 转换对超范围值不饱和、出 NaN，现在进矩阵前夹到 ±448）。
-  - 运动向量来自 Magpie 的光流估计（效果参数 Optical Flow Method 选 AMDOF）；光流在平坦暗部会给出几万像素的垃圾向量，
+  - DLSS5（第一项 FSR3）的运动向量来自 Magpie 的光流估计（Optical Flow Method 选 AMDOF）；光流在平坦暗部会给出几万像素的垃圾向量，
     插件把超过 64 像素的向量当静止处理（DLSS5-AMD\native-game-flags.txt 的 DLSS5_MOTION_MAX_PX），否则会出现黑色/粉色的方块闪烁。
   - 强度：DLSS5-AMD\native-game-flags.txt 里加一行 DLSS5_STRENGTH=<细节>,<颜色>（各 0～1，默认 1,1 = 网络结果全用；
     0.5,1 就是细节一半原图一半、颜色修正全用）。这是 NVIDIA 面板里"强度"那个滑杆对应的两个混合系数；改完重启 Magpie 生效。

@@ -1,4 +1,6 @@
 #include "native_text_overlay.h"
+#include "native_input_geometry.h"
+static bool fit_small_input();
 #include <mutex>
 #include <string>
 #include "native_game_submission.h"
@@ -86,9 +88,22 @@ static std::atomic<bool>barrier_install_attempted{};
 static void STDMETHODCALLTYPE native_barriers(ID3D12GraphicsCommandList*c,UINT count,const D3D12_RESOURCE_BARRIER*b){
  original_barriers(c,count,b);
  if(!b)return;auto target=tracked_output.load();if(!target)return;
- for(UINT i=0;i<count;i++){
-  const auto&v=b[i];
-  bool relevant=v.Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION?reinterpret_cast<uint64_t>(v.Transition.pResource)==target:
+  for(UINT i=0;i<count;i++){
+   const auto&v=b[i];
+#ifdef NATIVE_ORDER_SNAPSHOT
+  if(fit_small_input()&&!snapshot_active&&v.Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION&&v.Flags!=D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY){
+   std::lock_guard<std::mutex>g(snapshot_mutex);
+   if(pending_snapshot.list==c&&pending_snapshot.source==v.Transition.pResource&&v.Transition.Subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)
+    pending_snapshot.state=v.Transition.StateAfter;
+  }
+#endif
+#ifdef NATIVE_ORDER_NEURAL
+  if(fit_small_input()&&!snapshot_active&&v.Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION&&v.Flags!=D3D12_RESOURCE_BARRIER_FLAG_BEGIN_ONLY){
+   std::lock_guard<std::mutex>g(notice_mutex);
+   if(notice_frame&&notice_target==v.Transition.pResource&&v.Transition.Subresource==D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES)notice_state=v.Transition.StateAfter;
+  }
+#endif
+   bool relevant=v.Type==D3D12_RESOURCE_BARRIER_TYPE_TRANSITION?reinterpret_cast<uint64_t>(v.Transition.pResource)==target:
    v.Type==D3D12_RESOURCE_BARRIER_TYPE_UAV?(!v.UAV.pResource||reinterpret_cast<uint64_t>(v.UAV.pResource)==target):
    v.Type==D3D12_RESOURCE_BARRIER_TYPE_ALIASING?(reinterpret_cast<uint64_t>(v.Aliasing.pResourceBefore)==target||reinterpret_cast<uint64_t>(v.Aliasing.pResourceAfter)==target):false;
   if(!relevant||events.fetch_add(1)>=8192)continue;
@@ -133,6 +148,17 @@ static void log(const char*kind,void*list,void*queue,unsigned value=0){
   fprintf(f,"pid=%lu thread=%lu tick=%llu kind=%s list=%p queue=%p value=%u observation_only=1\n",GetCurrentProcessId(),GetCurrentThreadId(),GetTickCount64(),kind,list,queue,value);fclose(f);
  }ReleaseSRWLockExclusive(&lock);
 }
+/* Read before initialization: the usual environment flags are applied by the background loader. */
+static bool fit_small_input(){static const bool enabled=[]{unsigned v=0;if(FILE*f=_wfopen(NativeLabPath(L"native-game-flags.txt").c_str(),L"rb")){char line[256];while(fgets(line,sizeof line,f))sscanf(line,"DLSS5_FIT_INPUT=%u",&v);fclose(f);}return v==1;}();return enabled;}
+static bool supported_input(unsigned w,unsigned h){return (w==1920&&h==1080)||(fit_small_input()&&NativeInputGeometry::Supported(w,h));}
+static std::atomic<void**>fit_context{nullptr};
+using DestroyContext=uint32_t(*)(void**,const void*);
+static DestroyContext original_destroy{};
+static uint32_t destroy_context(void**context,const void*allocation_callbacks){
+ auto result=original_destroy(context,allocation_callbacks);
+ if(result==0){auto expected=context;fit_context.compare_exchange_strong(expected,nullptr);}
+ return result;
+}
 static bool neural_output_ok(void*resource,unsigned declared_w,unsigned declared_h,unsigned state){
  D3D12_RESOURCE_STATES mapped{};
  if(!resource||!ffx_state_to_d3d12(state,mapped)||declared_w<16||declared_h<16||declared_w>7680||declared_h>4320)return false;
@@ -148,6 +174,16 @@ static bool neural_desc_ok(const D3D12_RESOURCE_DESC&d){
 }
 static uint32_t dispatch(void**context,const Header*h){
  if(!h||(h->type&0x00ffffffu)!=0x00010001u)return original(context,h);
+ /* Select the first upscaler context until it is destroyed (including its size-error notice). A following FSR4 (even when its output
+    also fits 1080p) must not replace the input stage's motion, pending work or status text. */
+ if(fit_small_input()){
+  auto chosen=fit_context.load();if(chosen&&chosen!=context)return original(context,h);
+  ResourcePayload candidate{};SIZE_T bytes=0;
+  if(context&&ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const char*>(h)+312,&candidate,sizeof candidate,&bytes)&&bytes==sizeof candidate&&candidate.resource){
+   void**expected=nullptr;fit_context.compare_exchange_strong(expected,context);
+   if(fit_context.load()!=context)return original(context,h);
+  }
+ }
  // Existing FFX x64 ABI: commandList follows the16-byte header. Payload only.
  void*list=nullptr;SIZE_T got=0;
  ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const char*>(h)+16,&list,sizeof(list),&got);
@@ -211,8 +247,8 @@ static uint32_t dispatch(void**context,const Header*h){
  if(output_bytes==sizeof(output)&&!state_known){static std::atomic<bool>logged{false};if(!logged.exchange(true))if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-game-oneshot.txt").c_str(),L"ab")){fprintf(f,"pid=%lu tick=%llu event=output_state_unknown detail=the upscaler declares its output in ffx state %u, which the hook cannot map to a D3D12 state; please report this line\n",GetCurrentProcessId(),GetTickCount64(),output.state);fclose(f);}}
  if(notice_mode&&output_bytes==sizeof(output)&&output.resource&&state_known&&list){
   static std::atomic<bool>size_logged{false};char notice[80]{};
-  if(output.width!=1920||output.height!=1080){snprintf(notice,sizeof notice,"DLSS5-AMD: INPUT MUST BE 1920X1080 (NOW %uX%u)",output.width,output.height);
-   if(!size_logged.exchange(true))if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-game-oneshot.txt").c_str(),L"ab")){fprintf(f,"pid=%lu tick=%llu event=input_size_unsupported detail=upscaler runs at %ux%u, the network only supports 1920x1080: set the game window to 1920x1080 (Magpie: scale mode = original size)\n",GetCurrentProcessId(),GetTickCount64(),output.width,output.height);fclose(f);}}
+  if(!supported_input(output.width,output.height)){snprintf(notice,sizeof notice,fit_small_input()?"DLSS5-AMD: INPUT MAX 1920X1080 (NOW %uX%u)":"DLSS5-AMD: INPUT MUST BE 1920X1080 (NOW %uX%u)",output.width,output.height);
+   if(!size_logged.exchange(true))if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-game-oneshot.txt").c_str(),L"ab")){fprintf(f,"pid=%lu tick=%llu event=input_size_unsupported detail=upscaler runs at %ux%u, expected first-stage output within 1920x1080 with DLSS5_FIT_INPUT=1, otherwise exactly 1920x1080 (Magpie: FSR3 scale relative to input = 1)\n",GetCurrentProcessId(),GetTickCount64(),output.width,output.height);fclose(f);}}
   else{const unsigned ph=neural_oneshot.Phase();if(ph==0)text_overlay.Prepare(static_cast<ID3D12Resource*>(output.resource)); /* pipeline built before the initializer thread starts (same frame arms it) */
    if(ph==1&&text_overlay.Ready())snprintf(notice,sizeof notice,"DLSS5-AMD: INITIALIZING...");else if(ph==5)snprintf(notice,sizeof notice,"DLSS5-AMD: INIT FAILED - SEE DLSS5-AMD\\LOGS");
   }
@@ -229,7 +265,7 @@ static uint32_t dispatch(void**context,const Header*h){
  request=neural_oneshot.WantsFrame()||(n>=snapshot_frame&&(neural_oneshot.Phase()==0||neural_oneshot.Phase()==5));
 #endif
  /* any declared output state we can map is taken over (the frame transitions from / back to it); 2 = UAV is what Stellar Blade and Magpie declare */
- if(request&&result==0&&output_bytes==sizeof(output)&&state_known&&neural_output_ok(output.resource,output.width,output.height,output.state)&&list){
+  if(request&&result==0&&output_bytes==sizeof(output)&&output.resource&&supported_input(output.width,output.height)&&neural_output_ok(output.resource,output.width,output.height,output.state)&&state_known&&list){
   ID3D12GraphicsCommandList*native=nullptr;
   if(SUCCEEDED(static_cast<IUnknown*>(list)->QueryInterface(UnwrappedObject,reinterpret_cast<void**>(&native)))&&native){
    std::lock_guard<std::mutex>guard(snapshot_mutex);
@@ -375,7 +411,17 @@ static DWORD WINAPI worker(void*){
  /* No deadline: Magpie loads the FFX dll only when the user starts scaling, which can be any time after launch (the old 10-minute limit gave up before that). */
  HMODULE module=nullptr,xess=nullptr;for(unsigned i=0;!module&&!xess;i++){module=GetModuleHandleW(L"amd_fidelityfx_dx12.dll");if(!module)module=GetModuleHandleW(L"amd_fidelityfx_loader_dx12.dll");if(!wait_ffx)xess=GetModuleHandleW(L"libxess.dll");if(!module&&!xess)Sleep(100);}if(!module&&!xess)return 1;
  auto target=module?GetProcAddress(module,"ffxDispatch"):GetProcAddress(xess,"xessD3D12Execute");if(!target)return 2;
- auto s=MH_Initialize();if(s!=MH_OK&&s!=MH_ERROR_ALREADY_INITIALIZED)return 3;
+  auto s=MH_Initialize();if(s!=MH_OK&&s!=MH_ERROR_ALREADY_INITIALIZED)return 3;
+  if(module&&fit_small_input()){
+   /* Magpie unloads the FFX loader when scaling stops. Hook trampolines must remain executable across restarts. */
+   HMODULE pinned=nullptr;
+   if(!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_PIN,reinterpret_cast<LPCWSTR>(target),&pinned))return 5;
+   auto destroy=GetProcAddress(module,"ffxDestroyContext");
+   auto ds=destroy?MH_CreateHook(reinterpret_cast<void*>(destroy),reinterpret_cast<void*>(&destroy_context),reinterpret_cast<void**>(&original_destroy)):MH_ERROR_NOT_EXECUTABLE;
+   if(ds==MH_OK)ds=MH_EnableHook(reinterpret_cast<void*>(destroy));
+   if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu fit_context_destroy_hook=%u\n",GetCurrentProcessId(),unsigned(ds));fclose(f);}
+   if(ds!=MH_OK)return 5;
+  }
 #ifdef NATIVE_ORDER_NEURAL
  if(!module){NativeMotionSign()=-1.f;cross_thread_submit=true;s=MH_CreateHook(reinterpret_cast<void*>(target),reinterpret_cast<void*>(&xess_execute),reinterpret_cast<void**>(&original_xess));}else
 #endif
