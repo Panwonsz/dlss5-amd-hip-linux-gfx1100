@@ -5,3 +5,4 @@ __pycache__/
 /Development/
 third_party/
 /linux/build/
+hip/bench-ffn32

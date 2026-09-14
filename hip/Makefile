@@ -11,7 +11,11 @@ MINGW_CC ?= $(firstword $(wildcard \
   /home/guentra/dlssnr-linux-hip/toolchain/llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-gcc \
   $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)))
 
-.PHONY: all clean test game test-api
+.PHONY: all clean test game test-api bench-ffn32
+
+bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp
+	$(HIPCC) $(CXXFLAGS) -c tests/bench_ffn32.hip -o $(BUILD)/bench_ffn32.o
+	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_ffn32.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
 all: $(TESTS) hip-network70 libdlss5_hip.so
 

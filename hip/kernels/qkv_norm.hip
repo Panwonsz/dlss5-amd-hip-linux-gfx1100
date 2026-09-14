@@ -40,8 +40,12 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* weights, u8* output
     const uint first = blockIdx.x * 16u;
     const uint head0 = blockIdx.y * NH;
     const uint wave = threadIdx.x / 32u;
-    __shared__ u8 tile[512];
+    // Single LDS buffer: the A-tile staging (512B) aliases the start of the
+    // stage buffer. The tile is only read inside the K loop; stage is only
+    // written after it (with a barrier between), so the aliasing is safe.
+    // Cuts LDS 512+16*COLS*4 -> 16*COLS*4 (e.g. C32/NH1 2560B->2048B).
     __shared__ float stage[16 * COLS];
+    u8* tile = reinterpret_cast<u8*>(stage);
     C32 acc = C32::Splat(0.f);
     const uint col = blockIdx.y * COLS + wave * 16u;
     // blockDim = 2*NH*32, 8 threads per input row (float4), so rows per thread =

@@ -99,11 +99,22 @@ __host__ __device__ inline float Activate(float v) { return F(ActivatePoly(v)); 
 // Keep the legacy polynomial for other shader families and public operators.
 __host__ __device__ inline float ActivatePolyC32(float v) {
     float g = fminf(fmaxf(v, -4.f), 4.f);
+    // Opaque f32 multiplies keep each rounding separate without the volatile
+    // private-memory round-trips that spilled 20 B/lane of scratch on gfx12.
+#if defined(__HIP_DEVICE_COMPILE__)
+    float qmul, pmul;
+    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(qmul) : "v"(fabsf(g)), "v"(-0.055908203125f));
+    float q = qmul + 0.447265625f;
+    asm("v_mul_f32_e32 %0, %1, %2" : "=v"(pmul) : "v"(g), "v"(q));
+    float p = pmul + 0.89453125f;
+    return v * p;
+#else
     volatile float qmul = fabsf(g) * (-0.055908203125f);
     volatile float q = qmul + 0.447265625f;
     volatile float pmul = g * q;
     volatile float p = pmul + 0.89453125f;
     return v * p;
+#endif
 }
 
 // Saturating E4M3FN round-to-nearest-even, including exponent carries.

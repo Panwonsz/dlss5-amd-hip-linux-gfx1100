@@ -71,7 +71,12 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     using namespace linalg;
     constexpr uint hidden_c = 4 * C;
     const uint first = blockIdx.x * 16, wave = threadIdx.x / 32;
-    __shared__ u8 in[16 * C], hidden[16 * hidden_c];
+    // Single LDS buffer: the input staging (16*C bytes) aliases the start of the
+    // hidden buffer (16*hidden_c bytes). The input is only read during the expand
+    // MMA loop and hidden is only written after it, so one barrier makes the
+    // aliasing safe. Cuts LDS 16*C+16*4C -> 16*4C (e.g. C32 2560B->2048B).
+    __shared__ u8 hidden[16 * hidden_c];
+    u8* in = hidden;
     for (uint i = threadIdx.x; i < 16 * C; i += blockDim.x)
         in[i] = first + i / C < tokens ? e4m3_byte(input[first * C + i]) : 0;
     __syncthreads();
@@ -85,6 +90,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             ex[n].MultiplyAccumulate(a, b);
         }
     }
+    __syncthreads();
     for (uint n = 0; n < 4; ++n) {
         for (uint i = 0; i < ex[n].Length(); ++i) ex[n].Set(i,
             C == 32 && precise_c32 ? ActivatePolyC32(ex[n].Get(i)) : ActivatePoly(ex[n].Get(i)));
@@ -137,7 +143,10 @@ __global__ void k_normalize_qkv(const float* input, const float* scales, u8* out
     float sum = 0.f;
     if (part < 2)
         for (uint ch = 0; ch < 32; ++ch) {
-            volatile float square = half_squares ? H(vals[ch] * vals[ch]) : vals[ch] * vals[ch];
+            // Opaque register multiplies (sq_f32/sq_half_f32) block the FMA
+            // contraction of sum += v*v without the volatile scratch round trip
+            // that spilled 40 B/lane on gfx12.
+            float square = half_squares ? sq_half_f32(vals[ch]) : sq_f32(vals[ch]);
             sum += square;
         }
     float inv = part == 2 ? 1.f : rsqrtf(fmaxf(sum, 6.198883056640625e-5f)) *
