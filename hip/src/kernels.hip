@@ -175,6 +175,13 @@ void launch_reframe_f8in_f8out(const u8* src, u8* dst, uint w, uint h, uint sw, 
     uint count = sw * sh * c;
     LAUNCH(k_reframe_f8in_f8out, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c);
 }
+void launch_reframe_f32_to_h(const float* src, __half* dst, uint w, uint h, uint sw, uint sh,
+                             uint px, uint py, uint c) {
+    if (!w || !h || sw % 8 || sh % 8 || c % 4 || w + px > sw || h + py > sh || !src || !dst)
+        throw std::runtime_error("reframe f32->f16 extent/alias");
+    uint count = sw * sh * c;
+    LAUNCH(k_reframe_f32_to_h, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c);
+}
 void launch_reframe_hin_hout(const __half* src, __half* dst, uint w, uint h, uint sw, uint sh,
                              uint px, uint py, uint c) {
     if (!w || !h || sw % 8 || sh % 8 || c % 4 || w + px > sw || h + py > sh || !src || !dst)

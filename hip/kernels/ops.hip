@@ -320,6 +320,23 @@ __global__ void k_reframe_f8in_f8out(const u8* src, u8* dst, uint w, uint h, uin
     *reinterpret_cast<u32*>(dst + (win * 64u + tok) * c + ch) = v;
 }
 
+// Pack a raster f32 input that is already on the f16 grid into window-major f16.
+__global__ void k_reframe_f32_to_h(const float* src, __half* dst, uint w, uint h, uint sw,
+                                   uint sh, uint px, uint py, uint c) {
+    uint i4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
+    if (i4 + 4u > sw * sh * c) return;
+    uint ch = i4 % c, t = i4 / c;
+    uint x = t % sw, y = t / sw;
+    uint win = (y / 8) * (sw / 8) + x / 8, tok = (y % 8) * 8 + x % 8;
+    float4 v = x >= px && y >= py && x < w + px && y < h + py
+                   ? *reinterpret_cast<const float4*>(src + ((y - py) * w + x - px) * c + ch)
+                   : make_float4(0.f, 0.f, 0.f, 0.f);
+    __half2 h0 = __floats2half2_rn(v.x, v.y), h1 = __floats2half2_rn(v.z, v.w);
+    __half2* hp = reinterpret_cast<__half2*>(dst + (win * 64u + tok) * c + ch);
+    hp[0] = h0;
+    hp[1] = h1;
+}
+
 // Pack a raster f16 C32 sibling into the current block's window-major f16 input.
 __global__ void k_reframe_hin_hout(const __half* src, __half* dst, uint w, uint h, uint sw,
                                    uint sh, uint px, uint py, uint c) {

@@ -65,6 +65,8 @@ void launch_reframe_f32_hin(const __half* src_h, float* dst, uint w, uint h, uin
                              uint px, uint py, uint c, int crop, int quantize);
 void launch_reframe_f8in_f8out(const u8* src, u8* dst, uint w, uint h, uint sw, uint sh,
                                uint px, uint py, uint c);
+void launch_reframe_f32_to_h(const float* src, __half* dst, uint w, uint h, uint sw, uint sh,
+                             uint px, uint py, uint c);
 void launch_reframe_hin_hout(const __half* src, __half* dst, uint w, uint h, uint sw, uint sh,
                              uint px, uint py, uint c);
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh);
