@@ -8,11 +8,12 @@ namespace dlss5 {
 // 4 C32 final H(branch + residual*scale) without H(product), 5 direct FP8.
 // ordered: 0 FP32 accumulation, 1 H after each K32, 2 four independent
 // FP32 K partitions combined with H(residual*scale) (fast ViT reduce).
-template <bool F8IN, bool F8OUT = false, bool HRID = false>
+template <bool F8IN, bool F8OUT = false, bool HRID = false, bool HOUT = false>
 __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* weights,
                              float* output, u8* output_f8, uint m, uint n, uint k,
                              const float* residual, const float* scales, int mode, int ordered,
-                             bool matrix_residual = false, const __half* residual_h = nullptr) {
+                             bool matrix_residual = false, const __half* residual_h = nullptr,
+                             __half* output_h = nullptr) {
     using namespace linalg;
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
     __shared__ u8 tile[512];
@@ -82,9 +83,16 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
             if constexpr (F8OUT) qout = q;
         } else if (mode == 0 || mode == 4) v = H(v);
         if (first + rc.x < m && col < n) {
-            output[(first + rc.x) * n + col + rc.y] = v;
-            if constexpr (F8OUT)
-                output_f8[(first + rc.x) * n + col + rc.y] = qout;
+            // HOUT stores the exact H(v) in f16 (mode 4 is already H-rounded), so
+            // the crop reframe can read half the global traffic and still produce
+            // the same f32 raster.
+            if constexpr (HOUT)
+                output_h[(first + rc.x) * n + col + rc.y] = __float2half_rn(v);
+            else {
+                output[(first + rc.x) * n + col + rc.y] = v;
+                if constexpr (F8OUT)
+                    output_f8[(first + rc.x) * n + col + rc.y] = qout;
+            }
         }
     }
 }
@@ -224,8 +232,10 @@ __global__ void k_normalize_qkv(const float* input, const float* scales, u8* out
 
 // Four channels per thread: the 4 lanes are contiguous, so win/tok are shared
 // and both ends are 16B vector accesses.
+template <bool HIN = false>
 __global__ void k_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
-                               uint px, uint py, uint c, int crop, int quantize) {
+                               uint px, uint py, uint c, int crop, int quantize,
+                               const __half* src_h = nullptr) {
     uint i4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
     if (i4 + 4u > (crop ? w * h : sw * sh) * c) return;
     uint ch = i4 % c, t = i4 / c;
@@ -233,7 +243,14 @@ __global__ void k_reframe_f32(const float* src, float* dst, uint w, uint h, uint
     uint wx = crop ? x + px : x, wy = crop ? y + py : y;
     uint win = (wy / 8) * (sw / 8) + wx / 8, tok = (wy % 8) * 8 + wx % 8;
     float4 v;
-    if (crop)
+    if (HIN) {
+        // The C32 p1 output is H(v), exactly representable in f16; reading it as
+        // half halves the crop traffic while producing the same f32 raster.
+        const __half2* hp = reinterpret_cast<const __half2*>(src_h + (win * 64u + tok) * c + ch);
+        __half2 h0 = hp[0], h1 = hp[1];
+        v = make_float4(__half2float(__low2half(h0)), __half2float(__high2half(h0)),
+                        __half2float(__low2half(h1)), __half2float(__high2half(h1)));
+    } else if (crop)
         v = *reinterpret_cast<const float4*>(src + (win * 64u + tok) * c + ch);
     else
         v = x >= px && y >= py && x < w + px && y < h + py

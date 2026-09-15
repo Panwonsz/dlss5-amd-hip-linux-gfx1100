@@ -38,8 +38,8 @@ std::vector<int> map_read(const std::string&p){
 }
 struct StreamScope {hipStream_t old;explicit StreamScope(hipStream_t s):old(get_launch_stream()){set_launch_stream(s);}~StreamScope(){set_launch_stream(old);}};
 struct Scratch {
-  DeviceBuf a,b,bh,d,q,q8,att8,hidden,d8,f8;
-  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);d8.alloc(n);f8.alloc(n);}
+  DeviceBuf a,b,bh,ah,d,q,q8,att8,hidden,d8,f8;
+  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);d8.alloc(n);f8.alloc(n);}
 };
 struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
@@ -79,14 +79,17 @@ struct Block {
     // C512 split shaders retain H(product) and H before FP8 stores.
     // The attention output is already E4M3; e4m3_byte(from_e4m3(x)) is the identity,
     // so the projection consumes the bytes directly (no f8->f32 round trip).
-    if(c==32)launch_linear_f32_f8in_hrid(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,s.bh.as<__half>(),s1.as<float>(),4,0,false);
+    if(c==32)launch_linear_f32_f8in_hrid_hout(s.att8.as<u8>(),p1.as<u8>(),s.ah.as<__half>(),n,c,c,s.bh.as<__half>(),s1.as<float>(),4,0,false);
     else launch_linear_f32_f8in(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512);
  }
- void run(const float* in,float* out,Scratch&s){
-  launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
-  window(s.a.as<float>(),s.a.as<float>(),s);
-  launch_reframe_f32(s.a.as<float>(),out,w,h,sw,sh,px,py,c,1,0);
- }
+  void run(const float* in,float* out,Scratch&s){
+   launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
+   window(s.a.as<float>(),s.a.as<float>(),s);
+   // C32 p1 writes its H(v) output in f16; the crop reframe reads half the
+   // global traffic and still emits the identical f32 raster.
+   if(c==32)launch_reframe_f32_hin(s.ah.as<__half>(),out,w,h,sw,sh,px,py,c,1,0);
+   else launch_reframe_f32(s.a.as<float>(),out,w,h,sw,sh,px,py,c,1,0);
+  }
 };
 struct Vit {
  DeviceBuf ex,ct,cs,qw,qs,pw,ps;
@@ -157,7 +160,8 @@ struct Network70::Impl {
   launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
   launch_prefix(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),seed,W,Ht,host_history?1:0);
   blocks[0].window(s.a.as<float>(),s.a.as<float>(),s);
-  launch_reframe_f32(s.a.as<float>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
+   // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
+   launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
   launch_pool_f32(skip[0].as<float>(),src,W,Ht,32,960,576);
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;

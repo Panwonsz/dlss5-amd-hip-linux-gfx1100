@@ -134,7 +134,16 @@ void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, u
     if (!w || !h || sw % 8 || sh % 8 || w + px > sw || h + py > sh || src == dst)
         throw std::runtime_error("reframe extent/alias");
     uint count = (crop ? w * h : sw * sh) * c;
-    LAUNCH(k_reframe_f32, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c, crop, quantize);
+    LAUNCH((k_reframe_f32<false>), (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c,
+           crop, quantize);
+}
+void launch_reframe_f32_hin(const __half* src_h, float* dst, uint w, uint h, uint sw, uint sh,
+                            uint px, uint py, uint c, int crop, int quantize) {
+    if (!w || !h || sw % 8 || sh % 8 || w + px > sw || h + py > sh || !src_h || !dst)
+        throw std::runtime_error("reframe f16 extent/alias");
+    uint count = (crop ? w * h : sw * sh) * c;
+    LAUNCH((k_reframe_f32<true>), (count / 4 + 255) / 256, 256, nullptr, dst, w, h, sw, sh, px, py,
+           c, crop, quantize, src_h);
 }
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh) {
     if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || src == dst)
@@ -172,6 +181,16 @@ void launch_linear_f32_f8in_hrid(const u8* in, const u8* w, float* out, uint m, 
     LAUNCH((k_linear_f32<true, false, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in,
            w, out, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales, mode,
            ordered, matrix_residual, residual_h);
+}
+void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, uint m, uint n,
+                                      uint k, const __half* residual_h, const float* scales,
+                                      int mode, int ordered, bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 ||
+        (residual_h && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) || !out_h)
+        throw std::runtime_error("linear geometry/alias");
+    LAUNCH((k_linear_f32<true, false, true, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr,
+           in, w, nullptr, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales,
+           mode, ordered, matrix_residual, residual_h, out_h);
 }
 void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                   uint n, uint k, const float* residual, const float* scales,

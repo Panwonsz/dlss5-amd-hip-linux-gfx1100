@@ -15,6 +15,9 @@ void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint 
 void launch_linear_f32_f8in_hrid(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
                                  const __half* residual_h, const float* scales, int mode, int ordered,
                                  bool matrix_residual = false);
+void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, uint m, uint n,
+                                      uint k, const __half* residual_h, const float* scales,
+                                      int mode, int ordered, bool matrix_residual = false);
 void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                   uint n, uint k, const float* residual, const float* scales,
                                   int mode, int ordered, bool matrix_residual = false);
@@ -34,6 +37,8 @@ void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
                          const float* scales, float qgain, bool half_squares);
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
                         uint px, uint py, uint c, int crop, int quantize);
+void launch_reframe_f32_hin(const __half* src_h, float* dst, uint w, uint h, uint sw, uint sh,
+                            uint px, uint py, uint c, int crop, int quantize);
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh);
 void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, float* out, uint tokens,
                     bool chain_residual = false, bool precise_c32 = false);
