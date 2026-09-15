@@ -8,9 +8,11 @@ namespace dlss5 {
 // 4 C32 final H(branch + residual*scale) without H(product), 5 direct FP8.
 // ordered: 0 FP32 accumulation, 1 H after each K32, 2 four independent
 // FP32 K partitions combined with H(residual*scale) (fast ViT reduce).
-__global__ void k_linear_f32(const float* input, const u8* weights, float* output,
-                             uint m, uint n, uint k, const float* residual,
-                             const float* scales, int mode, int ordered, bool matrix_residual = false) {
+template <bool F8IN, bool F8OUT = false>
+__global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* weights,
+                             float* output, u8* output_f8, uint m, uint n, uint k,
+                             const float* residual, const float* scales, int mode, int ordered,
+                             bool matrix_residual = false) {
     using namespace linalg;
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
     __shared__ u8 tile[512];
@@ -28,12 +30,18 @@ __global__ void k_linear_f32(const float* input, const u8* weights, float* outpu
         {
             const uint col = (threadIdx.x % 8u) * 4u;
             const uint row = first + threadIdx.x / 8u;
-            const float4 v = row < m
-                ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + col)
-                : make_float4(0.f, 0.f, 0.f, 0.f);
-            *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
-                u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            if (F8IN) {
+                *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
+                    row < m ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + col)
+                            : 0u;
+            } else {
+                const float4 v = row < m
+                    ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + col)
+                    : make_float4(0.f, 0.f, 0.f, 0.f);
+                *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
+                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
         }
         __syncthreads();
         A8 a = A8::Load(tile, 0, 32);
@@ -57,17 +65,32 @@ __global__ void k_linear_f32(const float* input, const u8* weights, float* outpu
         float v = acc.Get(i);
         if (mode == 4 && residual && first + rc.x < m && col < n)
             v += residual[(first + rc.x) * n + col + rc.y] * scales[col + rc.y];
-        if (mode == 2) v = from_e4m3(e4m3_byte(ActivatePoly(v)));
-        else if (mode == 1) v = from_e4m3(e4m3_byte(H(v)));
-        else if (mode == 5) v = from_e4m3(e4m3_byte(v));
-        else if (mode == 0 || mode == 4) v = H(v);
-        if (first + rc.x < m && col < n) output[(first + rc.x) * n + col + rc.y] = v;
+        u8 qout = 0;
+        if (mode == 2) {
+            u8 q = e4m3_byte(ActivatePoly(v));
+            v = from_e4m3(q);
+            if constexpr (F8OUT) qout = q;
+        } else if (mode == 1) {
+            u8 q = e4m3_byte(H(v));
+            v = from_e4m3(q);
+            if constexpr (F8OUT) qout = q;
+        } else if (mode == 5) {
+            u8 q = e4m3_byte(v);
+            v = from_e4m3(q);
+            if constexpr (F8OUT) qout = q;
+        } else if (mode == 0 || mode == 4) v = H(v);
+        if (first + rc.x < m && col < n) {
+            output[(first + rc.x) * n + col + rc.y] = v;
+            if constexpr (F8OUT)
+                output_f8[(first + rc.x) * n + col + rc.y] = qout;
+        }
     }
 }
 
-template <int C>
+template <int C, bool F8OUT = false>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
-                         float* output, uint tokens, bool chain_residual = false, bool precise_c32 = false) {
+                          float* output, u8* output_f8, uint tokens, bool chain_residual = false,
+                          bool precise_c32 = false) {
     using namespace linalg;
     constexpr uint hidden_c = 4 * C;
     const uint first = blockIdx.x * 16, wave = threadIdx.x / 32;
@@ -113,9 +136,16 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     }
     for (uint i = 0; i < acc.Length(); ++i) {
         uint2 rc = acc.GetCoordinate(i);
-        if (first + rc.x < tokens)
-            output[(first + rc.x) * C + wave * 16 + rc.y] = C == 32 ? H(acc.Get(i))
-                : from_e4m3(e4m3_byte(acc.Get(i)));
+        if (first + rc.x < tokens) {
+            if constexpr (C == 32) {
+                output[(first + rc.x) * C + wave * 16 + rc.y] = H(acc.Get(i));
+            } else {
+                u8 q = e4m3_byte(acc.Get(i));
+                if constexpr (F8OUT)
+                    output_f8[(first + rc.x) * C + wave * 16 + rc.y] = q;
+                output[(first + rc.x) * C + wave * 16 + rc.y] = from_e4m3(q);
+            }
+        }
     }
 }
 
@@ -164,7 +194,7 @@ __global__ void k_normalize_qkv(const float* input, const float* scales, u8* out
 // Four channels per thread: the 4 lanes are contiguous, so win/tok are shared
 // and both ends are 16B vector accesses.
 __global__ void k_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
-                              uint px, uint py, uint c, int crop, int quantize) {
+                               uint px, uint py, uint c, int crop, int quantize) {
     uint i4 = (blockIdx.x * blockDim.x + threadIdx.x) * 4u;
     if (i4 + 4u > (crop ? w * h : sw * sh) * c) return;
     uint ch = i4 % c, t = i4 / c;
@@ -234,7 +264,9 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
 
 // Split FFWD group parallel, logical window-major input/output. No opaque
 // tiled activation format crosses a launch boundary.
-__global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const u8* contract,float* out,uint tokens){
+template <bool F8OUT>
+__global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const u8* contract,
+                            float* out,u8* out_f8,uint tokens){
  using namespace linalg;
  uint first=blockIdx.x*16,group=blockIdx.y,wave=threadIdx.x/32;
  __shared__ u8 tile[512],mix[16*64],hid[16*256];
@@ -256,7 +288,7 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
  }
  __syncthreads();C32 acc=C32::Splat(0.f);
  for(uint g=0;g<8;++g)acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
- for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens)out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(e4m3_byte(H(acc.Get(i))));}
+  for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens){u8 q=e4m3_byte(H(acc.Get(i)));if constexpr(F8OUT)out_f8[(first+rc.x)*512+group*64+wave*16+rc.y]=q;out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(q);}}
 }
 
 __global__ void k_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,uint ow,uint oh){

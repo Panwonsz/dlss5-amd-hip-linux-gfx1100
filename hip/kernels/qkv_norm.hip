@@ -31,9 +31,10 @@ __device__ inline float sq_f32(float v) {
     return t;
 }
 
-template <int C, int NH>
-__global__ void k_qkv_norm_f32(const float* input, const u8* weights, u8* output, uint m,
-                               uint k, const float* scales, float qgain, bool half_squares) {
+template <int C, int NH, bool F8IN = false>
+__global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
+                               u8* output, uint m, uint k, const float* scales, float qgain,
+                               bool half_squares) {
     using namespace linalg;
     constexpr uint HEADS = C / 32u;
     constexpr uint COLS = 32u * NH;
@@ -58,12 +59,19 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* weights, u8* output
             for (uint rr = 0; rr < ROWS_PER_THREAD; ++rr) {
                 const uint rlocal = base * ROWS_PER_THREAD + rr;
                 const uint row = first + rlocal;
-                const float4 v = row < m
-                    ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
-                    : make_float4(0.f, 0.f, 0.f, 0.f);
-                *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
-                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                if (F8IN) {
+                    *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
+                        row < m
+                            ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + c4)
+                            : 0u;
+                } else {
+                    const float4 v = row < m
+                        ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
+                        : make_float4(0.f, 0.f, 0.f, 0.f);
+                    *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
+                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                        u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                }
             }
         }
         __syncthreads();

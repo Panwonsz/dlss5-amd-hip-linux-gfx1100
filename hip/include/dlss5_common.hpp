@@ -119,7 +119,16 @@ __host__ __device__ inline float ActivatePolyC32(float v) {
 
 // Saturating E4M3FN round-to-nearest-even, including exponent carries.
 // Preserve NaNs instead of silently treating corrupt data as a finite value.
+// On gfx12 the hardware E4M3 conversion (cvt_pk_fp8_f32 after an fmed3f
+// clamp to +/-448) is bit-identical to the software recipe for every
+// finite input (verified: all 256 codes, all RNE midpoints, denormal scan
+// and 4M random values, hip/tests/test_e4m3_hw.hip); the software path
+// stays as the non-finite fallback.
 __host__ __device__ inline u8 e4m3_byte(float v) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    if ((as_u32(v) & 0x7fffffffu) < 0x7f800000u)
+        return u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
+#endif
     u32 b = as_u32(v), a = b & 0x7fffffffu;
     u8 sg = u8((b >> 24) & 0x80u);
     if (a > 0x7f800000u)

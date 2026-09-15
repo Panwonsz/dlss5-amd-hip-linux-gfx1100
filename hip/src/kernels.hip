@@ -30,11 +30,24 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
     if (!tokens || in == out || (c == 32 && !scales)) throw std::runtime_error("FFN extent/alias/scales");
     uint groups = (tokens + 15) / 16;
     switch (c) {
-    case 32: LAUNCH(k_ffn_f32<32>, groups, 64, in, w, scales, out, tokens, chain_residual, precise_c32); break;
-    case 64: LAUNCH(k_ffn_f32<64>, groups, 128, in, w, scales, out, tokens); break;
-    case 128: LAUNCH(k_ffn_f32<128>, groups, 256, in, w, scales, out, tokens); break;
-    case 256: LAUNCH(k_ffn_f32<256>, groups, 512, in, w, scales, out, tokens); break;
+    case 32: LAUNCH((k_ffn_f32<32, false>), groups, 64, in, w, scales, out, nullptr, tokens,
+                    chain_residual, precise_c32); break;
+    case 64: LAUNCH((k_ffn_f32<64, false>), groups, 128, in, w, scales, out, nullptr, tokens); break;
+    case 128: LAUNCH((k_ffn_f32<128, false>), groups, 256, in, w, scales, out, nullptr, tokens); break;
+    case 256: LAUNCH((k_ffn_f32<256, false>), groups, 512, in, w, scales, out, nullptr, tokens); break;
     default: throw std::runtime_error("FFN channels");
+    }
+}
+void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
+                       u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {
+    if (!tokens || c == 32 || !out_f32 || !out_f8)
+        throw std::runtime_error("FFN f8 extent/alias");
+    uint groups = (tokens + 15) / 16;
+    switch (c) {
+    case 64: LAUNCH((k_ffn_f32<64, true>), groups, 128, in, w, scales, out_f32, out_f8, tokens); break;
+    case 128: LAUNCH((k_ffn_f32<128, true>), groups, 256, in, w, scales, out_f32, out_f8, tokens); break;
+    case 256: LAUNCH((k_ffn_f32<256, true>), groups, 512, in, w, scales, out_f32, out_f8, tokens); break;
+    default: throw std::runtime_error("FFN f8 channels");
     }
 }
 
@@ -51,27 +64,52 @@ void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
     if (!m || !c || c % 32 || !scales) throw std::runtime_error("QKV norm extent/scales");
     switch (c) {
     case 32:
-        LAUNCH((k_qkv_norm_f32<32, 1>), dim3((m + 15) / 16, 3u), 64, in, w, out, m, c, scales,
-               qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<32, 1, false>), dim3((m + 15) / 16, 3u), 64, in, nullptr, w, out, m,
+               c, scales, qgain, half_squares);
         break;
     case 64:
-        LAUNCH((k_qkv_norm_f32<64, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
-               scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<64, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
+               w, out, m, c, scales, qgain, half_squares);
         break;
     case 128:
-        LAUNCH((k_qkv_norm_f32<128, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
-               scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<128, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
+               w, out, m, c, scales, qgain, half_squares);
         break;
     case 256:
-        LAUNCH((k_qkv_norm_f32<256, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
-               scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<256, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
+               w, out, m, c, scales, qgain, half_squares);
         break;
     case 512:
-        LAUNCH((k_qkv_norm_f32<512, 2>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, w, out, m, c,
-               scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<512, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
+               w, out, m, c, scales, qgain, half_squares);
         break;
     default:
-        throw std::runtime_error("QKV norm channels");
+        throw std::runtime_error("QKV norm extent");
+    }
+}
+void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
+                              const float* scales, float qgain, bool half_squares) {
+    if (!m || c == 32 || !in || !out || !scales)
+        throw std::runtime_error("QKV norm f8 extent");
+    switch (c) {
+    case 64:
+        LAUNCH((k_qkv_norm_f32<64, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
+               w, out, m, c, scales, qgain, half_squares);
+        break;
+    case 128:
+        LAUNCH((k_qkv_norm_f32<128, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
+               w, out, m, c, scales, qgain, half_squares);
+        break;
+    case 256:
+        LAUNCH((k_qkv_norm_f32<256, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
+               w, out, m, c, scales, qgain, half_squares);
+        break;
+    case 512:
+        LAUNCH((k_qkv_norm_f32<512, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
+               w, out, m, c, scales, qgain, half_squares);
+        break;
+    default:
+        throw std::runtime_error("QKV norm f8 channels");
     }
 }
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
@@ -93,8 +131,28 @@ void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n,
         (residual && !scales) || in == out || ordered < 0 || ordered > 2 ||
         (ordered == 2 && k % 128))
         throw std::runtime_error("linear geometry/alias");
-    LAUNCH(k_linear_f32, dim3((m + 15) / 16, (n + 63) / 64), 128, in, w, out, m, n, k,
-           residual, scales, mode, ordered, matrix_residual);
+    LAUNCH((k_linear_f32<false, false>), dim3((m + 15) / 16, (n + 63) / 64), 128, in, nullptr, w, out,
+           nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual);
+}
+void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
+                            const float* residual, const float* scales, int mode, int ordered,
+                            bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 ||
+        (residual && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out))
+        throw std::runtime_error("linear geometry/alias");
+    LAUNCH((k_linear_f32<true, false>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, out,
+           nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual);
+}
+void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
+                                  uint n, uint k, const float* residual, const float* scales,
+                                  int mode, int ordered, bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 ||
+        (residual && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8)
+        throw std::runtime_error("linear geometry/alias");
+    LAUNCH((k_linear_f32<true, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, out,
+           out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual);
 }
 
 void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens) {
@@ -316,7 +374,10 @@ void launch_linear_half(const float* in,const __half* w,float* out,uint m,uint n
  LAUNCH(k_linear_half,dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw);
 }
 void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,uint n){
- if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH(k_split_f32,dim3((n+15)/16,8),128,in,pre,ex,ct,out,n);
+  if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH((k_split_f32<false>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,nullptr,n);
+}
+void launch_split_f32_f8(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
+  if(!n||in==out||!out_f8)throw std::runtime_error("split f8 geometry/alias");LAUNCH((k_split_f32<true>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,out_f8,n);
 }
 void launch_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,uint ow,uint oh){
  if(w<2||h<2||ow%8||oh%8||ow<w||oh<h)throw std::runtime_error("RGB geometry");LAUNCH(k_rgb_graph,(ow*oh+255)/256,256,in,raster,tiles,w,h,ow,oh);

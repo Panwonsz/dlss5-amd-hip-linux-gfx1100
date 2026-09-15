@@ -38,8 +38,8 @@ std::vector<int> map_read(const std::string&p){
 }
 struct StreamScope {hipStream_t old;explicit StreamScope(hipStream_t s):old(get_launch_stream()){set_launch_stream(s);}~StreamScope(){set_launch_stream(old);}};
 struct Scratch {
- DeviceBuf a,b,d,q,q8,att8,hidden;
- void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);}
+  DeviceBuf a,b,d,q,q8,att8,hidden,d8,f8;
+  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);d8.alloc(n);f8.alloc(n);}
 };
 struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
@@ -62,17 +62,22 @@ struct Block {
  // Residuals remain distinct from quantized matrix operands.
  void window(const float* in,float* out,Scratch&s){
   uint n=sw*sh;float* f=s.b.as<float>();
-  if(c==512)launch_split_f32(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),n);
-  else launch_ffn_f32(c,in,fw.as<u8>(),c==32?fs.as<float>():nullptr,c==32?f:s.d.as<float>(),n,chain,c==32);
+  if(c==512)launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
+  else if(c==32)launch_ffn_f32(32,in,fw.as<u8>(),fs.as<float>(),f,n,chain,true);
+  else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
   // mapfeature FFN projection: H(scale product); direct store only C64..256.
-  if(c!=32)launch_linear_f32(s.d.as<float>(),p0.as<u8>(),f,n,c,c,in,s0.as<float>(),c==512?1:5,0);
+  // Non-C32 activations are already on the E4M3 grid, so p0/QKV consume the bytes
+  // directly while the f32 copy stays available for residuals.
+  if(c!=32)launch_linear_f32_f8in_f8out(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in,s0.as<float>(),c==512?1:5,0);
   // QKV GEMM + per-head scaling + E4M3 in one launch (no f32 round trip).
-  launch_qkv_norm_f32(c,f,qw.as<u8>(),s.q8.as<u8>(),n,qs.as<float>(),1.f,c==32);
+  if(c==32)launch_qkv_norm_f32(32,f,qw.as<u8>(),s.q8.as<u8>(),n,qs.as<float>(),1.f,true);
+  else launch_qkv_norm_f32_f8in(c,s.f8.as<u8>(),qw.as<u8>(),s.q8.as<u8>(),n,qs.as<float>(),1.f,c==32);
   launch_attention(c,s.q8.as<u8>(),bias.as<float>(),s.att8.as<u8>(),sw,sh,1,true);
-  launch_f8_to_f32(s.att8.as<u8>(),s.d.as<float>(),n*c);
-  // mapoutput C64..256 uses NATIVE_MATRIX_RESIDUAL even for raw outputs.
-  // C512 split shaders retain H(product) and H before FP8 stores.
-  launch_linear_f32(s.d.as<float>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),c==32?4:raw?0:c==512?1:5,0,c!=32&&c!=512);
+   // mapoutput C64..256 uses NATIVE_MATRIX_RESIDUAL even for raw outputs.
+   // C512 split shaders retain H(product) and H before FP8 stores.
+   // The attention output is already E4M3; e4m3_byte(from_e4m3(x)) is the identity,
+   // so the projection consumes the bytes directly (no f8->f32 round trip).
+   launch_linear_f32_f8in(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),c==32?4:raw?0:c==512?1:5,0,c!=32&&c!=512);
  }
  void run(const float* in,float* out,Scratch&s){
   launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
@@ -95,8 +100,7 @@ struct Vit {
   launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),640,1024,5.65625f);
   launch_f8_to_f32(s.q8.as<u8>(),s.q.as<float>(),640*3072);
   launch_vit_attention(s.q.as<float>(),s.att8.as<u8>(),640,1024);
-  launch_f8_to_f32(s.att8.as<u8>(),s.d.as<float>(),640*1024);
-  launch_linear_f32(s.d.as<float>(),pw.as<u8>(),out,640,1024,1024,s.b.as<float>(),ps.as<float>(),1,2);
+   launch_linear_f32_f8in(s.att8.as<u8>(),pw.as<u8>(),out,640,1024,1024,s.b.as<float>(),ps.as<float>(),1,2);
  }
 };
 struct Up {

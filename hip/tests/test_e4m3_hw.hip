@@ -22,8 +22,9 @@ __global__ void probe(const float* x, u32* out, int n) {
     float vc = ((b & 0x7f800000u) != 0x7f800000u) ? __builtin_amdgcn_fmed3f(v, 448.f, -448.f) : v;
     uint16_t p2 = __builtin_amdgcn_cvt_pk_fp8_f32(vc, 0.f, 0, false);
     u8 clamped = (u8)(p2 & 0xffu);
-    // final variant: early SW return for non-finite, branchless fmed3f clamp for finite
-    u8 fin = (b >= 0x7f800000u) ? sw
+    // final variant (the one dlss5_common.hpp e4m3_byte uses on device):
+    // SW return for non-finite, branchless fmed3f clamp + HW cvt for finite
+    u8 fin = ((b & 0x7fffffffu) >= 0x7f800000u) ? sw
         : (u8)(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
     out[i] = u32(sw) | u32(raw) << 8 | u32(clamped) << 16 | u32(fin) << 24;
 }
