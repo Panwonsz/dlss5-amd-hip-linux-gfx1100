@@ -351,20 +351,25 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
 
 // Split FFWD group parallel, logical window-major input/output. No opaque
 // tiled activation format crosses a launch boundary.
-template <bool F8OUT>
+template <bool F8OUT, bool F8IN = false>
 __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const u8* contract,
-                            float* out,u8* out_f8,uint tokens){
- using namespace linalg;
- uint first=blockIdx.x*16,group=blockIdx.y,wave=threadIdx.x/32;
- __shared__ u8 tile[512],mix[16*64],hid[16*256];
-  C32 a=C32::Splat(0.f);
-  for(uint g=0;g<16;++g){
-   {
-    const uint col=(threadIdx.x%8u)*4u, row=first+threadIdx.x/8u;
-    const float4 v=row<tokens?*reinterpret_cast<const float4*>(in+row*512u+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
-    *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col)=
-     u32(e4m3_byte(v.x))|u32(e4m3_byte(v.y))<<8|u32(e4m3_byte(v.z))<<16|u32(e4m3_byte(v.w))<<24;
-   }
+                             float* out,u8* out_f8,uint tokens,const u8* in_f8=nullptr){
+  using namespace linalg;
+  uint first=blockIdx.x*16,group=blockIdx.y,wave=threadIdx.x/32;
+  __shared__ u8 tile[512],mix[16*64],hid[16*256];
+   C32 a=C32::Splat(0.f);
+   for(uint g=0;g<16;++g){
+    {
+     const uint col=(threadIdx.x%8u)*4u, row=first+threadIdx.x/8u;
+     if constexpr (F8IN)
+         *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col) =
+             row < tokens ? *reinterpret_cast<const u32*>(in_f8 + row * 512u + g * 32u + col) : 0u;
+     else {
+         const float4 v=row<tokens?*reinterpret_cast<const float4*>(in+row*512u+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
+         *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col)=
+          u32(e4m3_byte(v.x))|u32(e4m3_byte(v.y))<<8|u32(e4m3_byte(v.z))<<16|u32(e4m3_byte(v.w))<<24;
+     }
+    }
    __syncthreads();
   a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRow(pre,((group*4+wave)*16+g)*512,16));__syncthreads();
  }

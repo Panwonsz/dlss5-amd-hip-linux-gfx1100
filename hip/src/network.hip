@@ -62,7 +62,10 @@ struct Block {
  // Residuals remain distinct from quantized matrix operands.
   void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false){
    uint n=sw*sh;float* f=s.b.as<float>();
-   if(c==512)launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
+    if(c==512){
+     if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
+     else launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
+    }
    else if(c==32)launch_ffn_f32_hout(32,in,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
    else if(in_f8)launch_ffn_f32_f8in_f8out(c,in_f8,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
    else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
@@ -88,7 +91,7 @@ struct Block {
     else launch_linear_f32_f8in(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512);
   }
   void run(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false){
-   bool use_f8 = c!=32 && c!=512 && in_f8;
+   bool use_f8 = c!=32 && in_f8;
    if(use_f8) launch_reframe_f8in_f8out(in_f8,s.a8.as<u8>(),w,h,sw,sh,px,py,c);
    else launch_reframe_f32(in,s.a.as<float>(),w,h,sw,sh,px,py,c,0,0);
    window(use_f8?in:s.a.as<float>(),s.a.as<float>(),s,use_f8?s.a8.as<u8>():nullptr,emit_f8);
@@ -176,7 +179,7 @@ struct Network70::Impl {
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
   for(int g=0;g<5;++g){
    const u8* in_f8=nullptr;
-    for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit=!b.raw&&b.c>=64&&b.c<=256;b.run(src,dst,s,in_f8,emit);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit?s.out8.as<u8>():nullptr;}
+    for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit=!b.raw&&b.c>=64;b.run(src,dst,s,in_f8,emit);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit?s.out8.as<u8>():nullptr;}
    hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
    uint ow=g==4?32:w/2,oh=g==4?20:h/2;
    launch_pool_f32(src,s.b.as<float>(),w,h,c,ow,oh);
@@ -190,7 +193,7 @@ struct Network70::Impl {
    const int decfirst[]={40,48,56,62,66},decnum[]={8,8,6,4,4};
    for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),dst,s);std::swap(src,dst);}
     const u8* in_f8=nullptr;
-    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit=!b.raw&&b.c>=64&&b.c<=256;b.run(src,dst,s,in_f8,emit);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit?s.out8.as<u8>():nullptr;}}
+    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit=!b.raw&&b.c>=64;b.run(src,dst,s,in_f8,emit);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit?s.out8.as<u8>():nullptr;}}
   launch_post_merge_f32(src,skip[0].as<float>(),post_sc.as<float>(),dst,W,Ht,true);std::swap(src,dst);
   blocks[70].run(src,dst,s);std::swap(src,dst);mark(70,src,N*32);
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);

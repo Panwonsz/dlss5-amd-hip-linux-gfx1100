@@ -494,6 +494,10 @@ void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,fl
 void launch_split_f32_f8(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
   if(!n||in==out||!out_f8)throw std::runtime_error("split f8 geometry/alias");LAUNCH((k_split_f32<true>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,out_f8,n);
 }
+void launch_split_f32_f8in_f8(const u8* in_f8,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
+  if(!n||!in_f8||!out_f8)throw std::runtime_error("split f8in geometry/alias");
+  LAUNCH((k_split_f32<true, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,in_f8);
+}
 void launch_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,uint ow,uint oh){
  if(w<2||h<2||ow%8||oh%8||ow<w||oh<h)throw std::runtime_error("RGB geometry");LAUNCH(k_rgb_graph,(ow*oh+255)/256,256,in,raster,tiles,w,h,ow,oh);
 }
