@@ -38,8 +38,15 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
     default: throw std::runtime_error("FFN channels");
     }
 }
+void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scales, __half* out_h,
+                         uint tokens, bool chain_residual, bool precise_c32) {
+    if (!tokens || c != 32 || !scales || !out_h)
+        throw std::runtime_error("FFN f16 extent/alias");
+    LAUNCH((k_ffn_f32<32, false, 2, true>), (tokens + 31) / 32, 128, in, w, scales, nullptr,
+           nullptr, tokens, chain_residual, precise_c32, out_h);
+}
 void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
-                       u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {
+                        u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c == 32 || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f8 extent/alias");
     uint groups = (tokens + 15) / 16;
@@ -114,6 +121,14 @@ void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
         throw std::runtime_error("QKV norm f8 channels");
     }
 }
+void launch_qkv_norm_f32_hin(int c, const __half* in, const u8* w, u8* out, uint m,
+                             const float* scales, float qgain, bool half_squares) {
+    if (!m || c != 32 || !in || !out || !scales)
+        throw std::runtime_error("QKV norm f16 extent");
+    // Same NH=3 CTA as the f32 path; the f16 input is the exact H(acc) grid.
+    LAUNCH((k_qkv_norm_f32<32, 3, false, true>), dim3((m + 15) / 16, 1u), 192, nullptr, nullptr,
+           w, out, m, c, scales, qgain, half_squares, in);
+}
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
                         uint px, uint py, uint c, int crop, int quantize) {
     if (!w || !h || sw % 8 || sh % 8 || w + px > sw || h + py > sh || src == dst)
@@ -145,6 +160,18 @@ void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint 
         throw std::runtime_error("linear geometry/alias");
     LAUNCH((k_linear_f32<true, false>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, out,
            nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual);
+}
+void launch_linear_f32_f8in_hrid(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
+                                 const __half* residual_h, const float* scales, int mode, int ordered,
+                                 bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 ||
+        (residual_h && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out))
+        throw std::runtime_error("linear geometry/alias");
+    // residual_h doubles as the non-null enable flag for the residual path.
+    LAUNCH((k_linear_f32<true, false, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in,
+           w, out, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales, mode,
+           ordered, matrix_residual, residual_h);
 }
 void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                   uint n, uint k, const float* residual, const float* scales,

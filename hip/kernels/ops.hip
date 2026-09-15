@@ -8,11 +8,11 @@ namespace dlss5 {
 // 4 C32 final H(branch + residual*scale) without H(product), 5 direct FP8.
 // ordered: 0 FP32 accumulation, 1 H after each K32, 2 four independent
 // FP32 K partitions combined with H(residual*scale) (fast ViT reduce).
-template <bool F8IN, bool F8OUT = false>
+template <bool F8IN, bool F8OUT = false, bool HRID = false>
 __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* weights,
                              float* output, u8* output_f8, uint m, uint n, uint k,
                              const float* residual, const float* scales, int mode, int ordered,
-                             bool matrix_residual = false) {
+                             bool matrix_residual = false, const __half* residual_h = nullptr) {
     using namespace linalg;
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
     __shared__ u8 tile[512];
@@ -20,10 +20,11 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     if (residual && mode != 4)
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
-            if (first + rc.x < m && col < n)
-                acc.Set(i, matrix_residual
-                    ? residual[(first + rc.x) * n + col + rc.y] * scales[col + rc.y]
-                    : H(residual[(first + rc.x) * n + col + rc.y] * scales[col + rc.y]));
+            if (first + rc.x < m && col < n) {
+                float rv = HRID ? __half2float(residual_h[(first + rc.x) * n + col + rc.y])
+                                : residual[(first + rc.x) * n + col + rc.y];
+                acc.Set(i, matrix_residual ? rv * scales[col + rc.y] : H(rv * scales[col + rc.y]));
+            }
         }
     C32 partition = C32::Splat(0.f);
     for (uint g = 0; g < k / 32; ++g) {
@@ -64,7 +65,8 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         uint2 rc = acc.GetCoordinate(i);
         float v = acc.Get(i);
         if (mode == 4 && residual && first + rc.x < m && col < n)
-            v += residual[(first + rc.x) * n + col + rc.y] * scales[col + rc.y];
+            v += (HRID ? __half2float(residual_h[(first + rc.x) * n + col + rc.y])
+                       : residual[(first + rc.x) * n + col + rc.y]) * scales[col + rc.y];
         u8 qout = 0;
         if (mode == 2) {
             u8 q = e4m3_byte(ActivatePoly(v));
@@ -87,10 +89,10 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     }
 }
 
-template <int C, bool F8OUT = false, int GROUPS = 1>
+template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
-                          bool precise_c32 = false) {
+                          bool precise_c32 = false, __half* output_h = nullptr) {
     using namespace linalg;
     constexpr uint hidden_c = 4 * C;
     constexpr uint WAVES_PER_GROUP = C / 16;
@@ -159,7 +161,14 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             uint2 rc = acc.GetCoordinate(i);
             if (first + t0 + rc.x < tokens) {
                 if constexpr (C == 32) {
-                    output[(first + t0 + rc.x) * C + sub * 16 + rc.y] = H(acc.Get(i));
+                    // HOUT stores the exact H(acc) in f16. The f16 -> f32 round
+                    // trip is lossless, so QKV/p1-residual can consume it with half
+                    // the global traffic while staying bit-identical.
+                    if constexpr (HOUT)
+                        output_h[(first + t0 + rc.x) * C + sub * 16 + rc.y] =
+                            __float2half_rn(acc.Get(i));
+                    else
+                        output[(first + t0 + rc.x) * C + sub * 16 + rc.y] = H(acc.Get(i));
                 } else {
                     u8 q = e4m3_byte(acc.Get(i));
                     if constexpr (F8OUT)

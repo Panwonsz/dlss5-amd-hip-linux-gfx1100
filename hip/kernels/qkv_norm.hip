@@ -31,10 +31,10 @@ __device__ inline float sq_f32(float v) {
     return t;
 }
 
-template <int C, int NH, bool F8IN = false>
+template <int C, int NH, bool F8IN = false, bool HIN = false>
 __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
                                u8* output, uint m, uint k, const float* scales, float qgain,
-                               bool half_squares) {
+                               bool half_squares, const __half* input_h = nullptr) {
     using namespace linalg;
     constexpr uint HEADS = C / 32u;
     constexpr uint COLS = 32u * NH;
@@ -67,6 +67,18 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
                         row < m
                             ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + c4)
                             : 0u;
+                } else if (HIN) {
+                    const __half2* hp = reinterpret_cast<const __half2*>(
+                        input_h + row * k + g * 32u + c4);
+                    __half2 h0 = row < m ? hp[0] : __half2(0.f, 0.f);
+                    __half2 h1 = row < m ? hp[1] : __half2(0.f, 0.f);
+                    float x = __half2float(__low2half(h0));
+                    float y = __half2float(__high2half(h0));
+                    float z = __half2float(__low2half(h1));
+                    float w = __half2float(__high2half(h1));
+                    *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
+                        u32(e4m3_byte(x)) | u32(e4m3_byte(y)) << 8 |
+                        u32(e4m3_byte(z)) << 16 | u32(e4m3_byte(w)) << 24;
                 } else {
                     const float4 v = row < m
                         ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
