@@ -57,6 +57,22 @@ void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales,
     default: throw std::runtime_error("FFN f8 channels");
     }
 }
+void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float* scales,
+                               float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
+                               bool precise_c32) {
+    if (!tokens || c == 32 || !in_f8 || !out_f32 || !out_f8)
+        throw std::runtime_error("FFN f8in extent/alias");
+    uint groups = (tokens + 15) / 16;
+    switch (c) {
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, true>), groups, 128, nullptr, w, scales, out_f32,
+                    out_f8, tokens, chain_residual, precise_c32, nullptr, in_f8); break;
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, true>), groups, 256, nullptr, w, scales, out_f32,
+                     out_f8, tokens, chain_residual, precise_c32, nullptr, in_f8); break;
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, true>), groups, 512, nullptr, w, scales, out_f32,
+                     out_f8, tokens, chain_residual, precise_c32, nullptr, in_f8); break;
+    default: throw std::runtime_error("FFN f8in channels");
+    }
+}
 
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
                           uint tokens, uint c, float qgain, bool half_squares) {
@@ -138,12 +154,19 @@ void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, u
            crop, quantize);
 }
 void launch_reframe_f32_hin(const __half* src_h, float* dst, uint w, uint h, uint sw, uint sh,
-                            uint px, uint py, uint c, int crop, int quantize) {
+                             uint px, uint py, uint c, int crop, int quantize) {
     if (!w || !h || sw % 8 || sh % 8 || w + px > sw || h + py > sh || !src_h || !dst)
         throw std::runtime_error("reframe f16 extent/alias");
     uint count = (crop ? w * h : sw * sh) * c;
     LAUNCH((k_reframe_f32<true>), (count / 4 + 255) / 256, 256, nullptr, dst, w, h, sw, sh, px, py,
            c, crop, quantize, src_h);
+}
+void launch_reframe_f8in_f8out(const u8* src, u8* dst, uint w, uint h, uint sw, uint sh,
+                               uint px, uint py, uint c) {
+    if (!w || !h || sw % 8 || sh % 8 || c % 4 || w + px > sw || h + py > sh || !src || !dst)
+        throw std::runtime_error("reframe f8 extent/alias");
+    uint count = sw * sh * c;
+    LAUNCH(k_reframe_f8in_f8out, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c);
 }
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh) {
     if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || src == dst)
@@ -211,6 +234,33 @@ void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out
         throw std::runtime_error("linear geometry/alias");
     LAUNCH((k_linear_f32<true, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, out,
            out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual);
+}
+void launch_linear_f32_f8in_f8out_f8res(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
+                                        uint n, uint k, const u8* residual_f8,
+                                        const float* scales, int mode, int ordered,
+                                        bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || (!residual_f8 && !scales) ||
+        ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8)
+        throw std::runtime_error("linear f8res extent/alias");
+    LAUNCH((k_linear_f32<true, true, false, false, false, true>),
+           dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, out, out_f8, m, n, k,
+           reinterpret_cast<const float*>(residual_f8), scales, mode, ordered, matrix_residual,
+           nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, residual_f8);
+}
+void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, u8* out_f8_raster,
+                                         uint m, uint n, uint k, const float* residual,
+                                         const float* scales, int mode, int ordered,
+                                         bool matrix_residual, uint rw, uint rh, uint rsw,
+                                         uint rpx, uint rpy) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || (residual && !scales) ||
+        ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8_raster ||
+        rsw % 8 || rw + rpx > rsw || rh + rpy > rsw)
+        throw std::runtime_error("linear raster f8 extent/alias");
+    LAUNCH((k_linear_f32<true, false, false, false, true>), dim3((m + 15) / 16, (n + 63) / 64), 128,
+           nullptr, in, w, out, nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual,
+           nullptr, nullptr, out_f8_raster, rw, rh, rsw, rpx, rpy);
 }
 
 void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens) {
