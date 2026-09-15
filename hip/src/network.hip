@@ -38,8 +38,8 @@ std::vector<int> map_read(const std::string&p){
 }
 struct StreamScope {hipStream_t old;explicit StreamScope(hipStream_t s):old(get_launch_stream()){set_launch_stream(s);}~StreamScope(){set_launch_stream(old);}};
 struct Scratch {
-  DeviceBuf a,b,bh,ah,d,q,q8,att8,hidden,d8,f8;
-  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);d8.alloc(n);f8.alloc(n);}
+  DeviceBuf a,b,bh,ah,d,q,q8,att8,hidden,hidden8,d8,f8;
+  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3);att8.alloc(n);hidden.alloc(640ull*4096*4);hidden8.alloc(640ull*4096);d8.alloc(n);f8.alloc(n);}
 };
 struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
@@ -98,9 +98,11 @@ struct Vit {
   ex=upload_tiled_e4m3(e.data(),4096,1024);ct=upload_tiled_e4m3(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
   qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_e4m3(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
  }
- void run(const float* in,float* out,Scratch&s){
-  launch_linear_f32(in,ex.as<u8>(),s.hidden.as<float>(),640,4096,1024,nullptr,nullptr,2,0);
-  launch_linear_f32(s.hidden.as<float>(),ct.as<u8>(),s.b.as<float>(),640,1024,4096,in,cs.as<float>(),1,2);
+  void run(const float* in,float* out,Scratch&s){
+   // The expand output is already on the E4M3 grid; keeping the bytes lets the
+   // contract GEMM consume them directly (e4m3_byte(from_e4m3(q)) == q).
+   launch_linear_f32_f8out(in,ex.as<u8>(),s.hidden.as<float>(),s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);
+   launch_linear_f32_f8in(s.hidden8.as<u8>(),ct.as<u8>(),s.b.as<float>(),640,1024,4096,in,cs.as<float>(),1,2);
   // QKV fast fused uses genuine F16 weights, raw FP32 dot before normalization.
   launch_linear_half(s.b.as<float>(),qw.as<__half>(),s.q.as<float>(),640,3072,1024,1,0,2);
   launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),640,1024,5.65625f);

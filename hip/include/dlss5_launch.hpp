@@ -9,6 +9,9 @@ void set_launch_stream(hipStream_t s);
 void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n, uint k,
                         const float* residual, const float* scales, int mode, int ordered,
                         bool matrix_residual = false);
+void launch_linear_f32_f8out(const float* in, const u8* w, float* out, u8* out_f8, uint m,
+                             uint n, uint k, const float* residual, const float* scales, int mode,
+                             int ordered, bool matrix_residual = false);
 void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
                             const float* residual, const float* scales, int mode, int ordered,
                             bool matrix_residual = false);

@@ -160,6 +160,16 @@ void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n,
     LAUNCH((k_linear_f32<false, false>), dim3((m + 15) / 16, (n + 63) / 64), 128, in, nullptr, w, out,
            nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual);
 }
+void launch_linear_f32_f8out(const float* in, const u8* w, float* out, u8* out_f8, uint m,
+                             uint n, uint k, const float* residual, const float* scales, int mode,
+                             int ordered, bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 ||
+        (residual && !scales) || in == out || ordered < 0 || ordered > 2 ||
+        (ordered == 2 && k % 128) || !out_f8)
+        throw std::runtime_error("linear geometry/alias");
+    LAUNCH((k_linear_f32<false, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, in, nullptr, w, out,
+           out_f8, m, n, k, residual, scales, mode, ordered, matrix_residual);
+}
 void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
                             const float* residual, const float* scales, int mode, int ordered,
                             bool matrix_residual) {
