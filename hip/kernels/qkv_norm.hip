@@ -49,11 +49,14 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
     u8* tile = reinterpret_cast<u8*>(stage);
     C32 acc = C32::Splat(0.f);
     const uint col = blockIdx.y * COLS + wave * 16u;
-    // blockDim = 2*NH*32, 8 threads per input row (float4), so rows per thread =
-    // 16 * 8 / (2*NH*32) = 2/NH. Loading more aliases the stage region of shared.
-    constexpr uint ROWS_PER_THREAD = 2u / NH;
+    // blockDim = 2*NH*32, 8 threads per input row (float4). C32 uses NH=3 so one
+    // CTA computes Q+K+V and reads the input tile once; then 192 threads exist but
+    // only 16*8 load, one row each. NH=1 still needs two rows per thread.
+    constexpr uint LOADERS = 16u * 8u;
+    constexpr uint THREADS = 2u * NH * 32u;
+    constexpr uint ROWS_PER_THREAD = (LOADERS + THREADS - 1u) / THREADS;
     for (uint g = 0; g < k / 32; ++g) {
-        {
+        if (threadIdx.x < LOADERS) {
             const uint c4 = (threadIdx.x % 8u) * 4u;
             const uint base = threadIdx.x / 8u;
             for (uint rr = 0; rr < ROWS_PER_THREAD; ++rr) {

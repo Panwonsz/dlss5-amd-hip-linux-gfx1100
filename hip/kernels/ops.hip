@@ -87,63 +87,85 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     }
 }
 
-template <int C, bool F8OUT = false>
+template <int C, bool F8OUT = false, int GROUPS = 1>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
                           bool precise_c32 = false) {
     using namespace linalg;
     constexpr uint hidden_c = 4 * C;
-    const uint first = blockIdx.x * 16, wave = threadIdx.x / 32;
-    // Single LDS buffer: the input staging (16*C bytes) aliases the start of the
-    // hidden buffer (16*hidden_c bytes). The input is only read during the expand
-    // MMA loop and hidden is only written after it, so one barrier makes the
-    // aliasing safe. Cuts LDS 16*C+16*4C -> 16*4C (e.g. C32 2560B->2048B).
-    __shared__ u8 hidden[16 * hidden_c];
+    constexpr uint WAVES_PER_GROUP = C / 16;
+    const uint first = blockIdx.x * 16 * GROUPS;
+    const uint wave = threadIdx.x / 32;
+    const uint group = wave / WAVES_PER_GROUP;
+    const uint sub = wave % WAVES_PER_GROUP;
+    // Single LDS buffer: the input staging (16*GROUPS*C bytes) aliases the start
+    // of the hidden buffer (16*GROUPS*hidden_c bytes). The input is only read
+    // during the expand MMA loop and hidden is only written after it, so one
+    // barrier makes the aliasing safe. C32 uses GROUPS=2 to halve CTA/weight
+    // traffic while keeping 64 waves/CU.
+    __shared__ u8 hidden[16 * GROUPS * hidden_c];
     u8* in = hidden;
-    for (uint i = threadIdx.x; i < 16 * C; i += blockDim.x)
-        in[i] = first + i / C < tokens ? e4m3_byte(input[first * C + i]) : 0;
+    for (uint i = threadIdx.x; i < 16 * GROUPS * C; i += blockDim.x) {
+        uint local = i % (16 * C);
+        uint row = first + i / (16 * C) * 16 + local / C;
+        in[i] = row < tokens ? e4m3_byte(input[row * C + local % C]) : 0;
+    }
     __syncthreads();
     C32 ex[4];
     for (uint n = 0; n < 4; ++n) ex[n] = C32::Splat(0.f);
-    for (uint g = 0; g < C / 32; ++g) {
-        A8 a = A8::Load(in, g * 32, C);
+    if (group < GROUPS) {
+        const uint t0 = group * 16;
+        for (uint g = 0; g < C / 32; ++g) {
+            A8 a = A8::Load(in + t0 * C, g * 32, C);
+            for (uint n = 0; n < 4; ++n) {
+                uint col = (sub * 4 + n) * 16;
+                B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
+                ex[n].MultiplyAccumulate(a, b);
+            }
+        }
+    }
+    // The hidden buffer aliases the input staging; every group must finish
+    // reading its input tile before any group overwrites it with hidden bytes.
+    __syncthreads();
+    if (group < GROUPS) {
+        const uint t0 = group * 16;
         for (uint n = 0; n < 4; ++n) {
-            uint col = (wave * 4 + n) * 16;
-            B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
-            ex[n].MultiplyAccumulate(a, b);
+            for (uint i = 0; i < ex[n].Length(); ++i) ex[n].Set(i,
+                C == 32 && precise_c32 ? ActivatePolyC32(ex[n].Get(i))
+                                       : ActivatePoly(ex[n].Get(i)));
+            ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
         }
     }
     __syncthreads();
-    for (uint n = 0; n < 4; ++n) {
-        for (uint i = 0; i < ex[n].Length(); ++i) ex[n].Set(i,
-            C == 32 && precise_c32 ? ActivatePolyC32(ex[n].Get(i)) : ActivatePoly(ex[n].Get(i)));
-        ex[n].StoreF8(hidden, (wave * 4 + n) * 16, hidden_c);
-    }
-    __syncthreads();
-    C32 acc = C32::Splat(0.f);
-    if constexpr (C == 32)
+    if (group < GROUPS) {
+        const uint t0 = group * 16;
+        C32 acc = C32::Splat(0.f);
+        if constexpr (C == 32)
+            for (uint i = 0; i < acc.Length(); ++i) {
+                uint2 rc = acc.GetCoordinate(i);
+                if (first + t0 + rc.x < tokens)
+                    acc.Set(i, (chain_residual
+                                    ? from_e4m3(e4m3_byte(
+                                          input[(first + t0 + rc.x) * C + sub * 16 + rc.y]))
+                                    : input[(first + t0 + rc.x) * C + sub * 16 + rc.y]) *
+                                scales[sub * 16 + rc.y]);
+            }
+        for (uint g = 0; g < hidden_c / 32; ++g) {
+            A8 a = A8::Load(hidden + t0 * hidden_c, g * 32, hidden_c);
+            B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
+            acc.MultiplyAccumulate(a, b);
+        }
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
-            if (first + rc.x < tokens)
-                acc.Set(i, (chain_residual
-                    ? from_e4m3(e4m3_byte(input[(first + rc.x) * C + wave * 16 + rc.y]))
-                    : input[(first + rc.x) * C + wave * 16 + rc.y]) * scales[wave * 16 + rc.y]);
-        }
-    for (uint g = 0; g < hidden_c / 32; ++g) {
-        A8 a = A8::Load(hidden, g * 32, hidden_c);
-        B8 b = B8::LoadRow(weights, hidden_c * C + (wave * (hidden_c / 32) + g) * 512, 16);
-        acc.MultiplyAccumulate(a, b);
-    }
-    for (uint i = 0; i < acc.Length(); ++i) {
-        uint2 rc = acc.GetCoordinate(i);
-        if (first + rc.x < tokens) {
-            if constexpr (C == 32) {
-                output[(first + rc.x) * C + wave * 16 + rc.y] = H(acc.Get(i));
-            } else {
-                u8 q = e4m3_byte(acc.Get(i));
-                if constexpr (F8OUT)
-                    output_f8[(first + rc.x) * C + wave * 16 + rc.y] = q;
-                output[(first + rc.x) * C + wave * 16 + rc.y] = from_e4m3(q);
+            if (first + t0 + rc.x < tokens) {
+                if constexpr (C == 32) {
+                    output[(first + t0 + rc.x) * C + sub * 16 + rc.y] = H(acc.Get(i));
+                } else {
+                    u8 q = e4m3_byte(acc.Get(i));
+                    if constexpr (F8OUT)
+                        output_f8[(first + t0 + rc.x) * C + sub * 16 + rc.y] = q;
+                    output[(first + t0 + rc.x) * C + sub * 16 + rc.y] = from_e4m3(q);
+                }
             }
         }
     }

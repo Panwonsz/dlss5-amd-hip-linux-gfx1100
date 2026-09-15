@@ -30,8 +30,8 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
     if (!tokens || in == out || (c == 32 && !scales)) throw std::runtime_error("FFN extent/alias/scales");
     uint groups = (tokens + 15) / 16;
     switch (c) {
-    case 32: LAUNCH((k_ffn_f32<32, false>), groups, 64, in, w, scales, out, nullptr, tokens,
-                    chain_residual, precise_c32); break;
+    case 32: LAUNCH((k_ffn_f32<32, false, 2>), (tokens + 31) / 32, 128, in, w, scales, out, nullptr,
+                    tokens, chain_residual, precise_c32); break;
     case 64: LAUNCH((k_ffn_f32<64, false>), groups, 128, in, w, scales, out, nullptr, tokens); break;
     case 128: LAUNCH((k_ffn_f32<128, false>), groups, 256, in, w, scales, out, nullptr, tokens); break;
     case 256: LAUNCH((k_ffn_f32<256, false>), groups, 512, in, w, scales, out, nullptr, tokens); break;
@@ -64,8 +64,10 @@ void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
     if (!m || !c || c % 32 || !scales) throw std::runtime_error("QKV norm extent/scales");
     switch (c) {
     case 32:
-        LAUNCH((k_qkv_norm_f32<32, 1, false>), dim3((m + 15) / 16, 3u), 64, in, nullptr, w, out, m,
-               c, scales, qgain, half_squares);
+        // NH=3: one CTA computes Q+K+V for 16 rows, so the f32/FP8 input tile is
+        // staged once instead of once per Q/K/V CTA.
+        LAUNCH((k_qkv_norm_f32<32, 3, false>), dim3((m + 15) / 16, 1u), 192, in, nullptr, w, out,
+               m, c, scales, qgain, half_squares);
         break;
     case 64:
         LAUNCH((k_qkv_norm_f32<64, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
