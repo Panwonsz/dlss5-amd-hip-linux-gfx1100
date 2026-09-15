@@ -112,7 +112,9 @@ __global__ void k_split_ffwd(const u8* in, const u8* pre, const u8* expand, cons
 // HLSL native_wave_vit_attention_fp8: bit-map exponents, unquantized
 // denominator, FP8 exponents for PV, normalize only AFTER the value product.
 // qkv is logical interleaved [token][3*dim], already normalized to the FP8 grid.
-__global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim) {
+template <bool F8IN = false>
+__global__ void k_vit_attention(const float* qkv, const u8* qkv_f8, u8* out, uint tokens,
+                                uint dim) {
     using namespace linalg;
     const uint q0 = blockIdx.x * 16u, head = blockIdx.y;
     const uint stride = 3u * dim;
@@ -122,14 +124,21 @@ __global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim
     __shared__ u8 probabilities[16 * 656];
     __shared__ float ex[16 * 33], denom[16];
     // 16B vector staging: same bytes as the scalar path, fewer LSU round trips.
+    // F8IN consumes the already-normalized E4M3 QKV, so e4m3_byte() is the
+    // identity and the f8 -> f32 round trip before attention is redundant.
     {
         const uint col = (threadIdx.x % 8u) * 4u;
         for (uint r = threadIdx.x / 8u; r < 16; r += 4) {
-            const float4 v = *reinterpret_cast<const float4*>(
-                qkv + (q0 + r) * stride + head * 32u + col);
-            *reinterpret_cast<u32*>(qtile + r * 32u + col) =
-                u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            if (F8IN) {
+                *reinterpret_cast<u32*>(qtile + r * 32u + col) =
+                    *reinterpret_cast<const u32*>(qkv_f8 + (q0 + r) * stride + head * 32u + col);
+            } else {
+                const float4 v = *reinterpret_cast<const float4*>(
+                    qkv + (q0 + r) * stride + head * 32u + col);
+                *reinterpret_cast<u32*>(qtile + r * 32u + col) =
+                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
         }
     }
     if (threadIdx.x < 16) denom[threadIdx.x] = 0.f;
@@ -141,13 +150,21 @@ __global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim
                 const uint col = (threadIdx.x % 8u) * 4u;
                 for (uint r = threadIdx.x / 8u; r < 16; r += 4) {
                     uint k = k0 + half * 16u + r;
-                    const float4 v = k < tokens
-                        ? *reinterpret_cast<const float4*>(
-                              qkv + k * stride + dim + head * 32u + col)
-                        : make_float4(0.f, 0.f, 0.f, 0.f);
-                    *reinterpret_cast<u32*>(ktile + r * 32u + col) =
-                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                        u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                    if (F8IN) {
+                        *reinterpret_cast<u32*>(ktile + r * 32u + col) =
+                            k < tokens
+                                ? *reinterpret_cast<const u32*>(
+                                      qkv_f8 + k * stride + dim + head * 32u + col)
+                                : 0u;
+                    } else {
+                        const float4 v = k < tokens
+                            ? *reinterpret_cast<const float4*>(
+                                  qkv + k * stride + dim + head * 32u + col)
+                            : make_float4(0.f, 0.f, 0.f, 0.f);
+                        *reinterpret_cast<u32*>(ktile + r * 32u + col) =
+                            u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                            u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                    }
                 }
             }
             __syncthreads();
@@ -156,10 +173,12 @@ __global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim
             for (uint i = 0; i < score.Length(); ++i) {
                 uint2 rc = score.GetCoordinate(i);
                 float affine = fminf(fmaxf(fmaf(score.Get(i),
-                    __half2float(__ushort_as_half(0x2dbb)), 1.708984375f), 1.439453125f), 1.9775390625f);
+                    __half2float(__ushort_as_half(0x2dbb)), 1.708984375f), 1.439453125f),
+                                     1.9775390625f);
                 uint bits = __half_as_ushort(__float2half_rn(affine));
                 float e = k0 + half * 16 + rc.y < tokens
-                    ? __half2float(__ushort_as_half(uint16_t((bits << 4) + 0x4000u))) : 0.f;
+                              ? __half2float(__ushort_as_half(uint16_t((bits << 4) + 0x4000u)))
+                              : 0.f;
                 ex[rc.x * 33 + half * 16 + rc.y] = e;
                 probabilities[rc.x * 656 + k0 + half * 16 + rc.y] = e4m3_byte(e);
             }
@@ -175,13 +194,21 @@ __global__ void k_vit_attention(const float* qkv, u8* out, uint tokens, uint dim
             const uint col = (threadIdx.x % 8u) * 4u;
             for (uint r = threadIdx.x / 8u; r < 32; r += 4) {
                 uint k = k0 + r;
-                const float4 v = k < tokens
-                    ? *reinterpret_cast<const float4*>(
-                          qkv + k * stride + 2u * dim + head * 32u + col)
-                    : make_float4(0.f, 0.f, 0.f, 0.f);
-                *reinterpret_cast<u32*>(values + r * 32u + col) =
-                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
-                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                if (F8IN) {
+                    *reinterpret_cast<u32*>(values + r * 32u + col) =
+                        k < tokens
+                            ? *reinterpret_cast<const u32*>(
+                                  qkv_f8 + k * stride + 2u * dim + head * 32u + col)
+                            : 0u;
+                } else {
+                    const float4 v = k < tokens
+                        ? *reinterpret_cast<const float4*>(
+                              qkv + k * stride + 2u * dim + head * 32u + col)
+                        : make_float4(0.f, 0.f, 0.f, 0.f);
+                    *reinterpret_cast<u32*>(values + r * 32u + col) =
+                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                        u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+                }
             }
         }
         __syncthreads();

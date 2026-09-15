@@ -98,8 +98,9 @@ struct Vit {
   // QKV fast fused uses genuine F16 weights, raw FP32 dot before normalization.
   launch_linear_half(s.b.as<float>(),qw.as<__half>(),s.q.as<float>(),640,3072,1024,1,0,2);
   launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),640,1024,5.65625f);
-  launch_f8_to_f32(s.q8.as<u8>(),s.q.as<float>(),640*3072);
-  launch_vit_attention(s.q.as<float>(),s.att8.as<u8>(),640,1024);
+   // The normalized QKV is already on the E4M3 grid, so attention can consume
+   // the bytes directly; the f8 -> f32 round trip and re-quantize are redundant.
+   launch_vit_attention_f8(s.q8.as<u8>(),s.att8.as<u8>(),640,1024);
    launch_linear_f32_f8in(s.att8.as<u8>(),pw.as<u8>(),out,640,1024,1024,s.b.as<float>(),ps.as<float>(),1,2);
  }
 };

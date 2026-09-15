@@ -314,7 +314,14 @@ void launch_split_ffwd(const u8* in, const u8* pre, const u8* expand, const u8* 
 void launch_vit_attention(const float* qkv, u8* out, uint tokens, uint dim) {
     if (tokens % 16 || dim % 32)
         throw std::runtime_error("vit attention extent");
-    LAUNCH(k_vit_attention, dim3(tokens / 16, dim / 32), 32, qkv, out, tokens, dim);
+    LAUNCH((k_vit_attention<false>), dim3(tokens / 16, dim / 32), 32, qkv, nullptr, out, tokens,
+           dim);
+}
+void launch_vit_attention_f8(const u8* qkv_f8, u8* out, uint tokens, uint dim) {
+    if (tokens % 16 || dim % 32)
+        throw std::runtime_error("vit attention extent");
+    LAUNCH((k_vit_attention<true>), dim3(tokens / 16, dim / 32), 32, nullptr, qkv_f8, out, tokens,
+           dim);
 }
 void launch_post70_merge(const u8* main, const u8* skip, const float* scales, u8* dst, uint n,
                          uint c) {

@@ -56,6 +56,7 @@ void launch_linear_skip(const u8* in, const u8* w, const u8* skip, u8* out, uint
 void launch_split_ffwd(const u8* in, const u8* pre, const u8* expand, const u8* contract, u8* out,
                        uint tokens);
 void launch_vit_attention(const float* qkv, u8* out, uint tokens, uint dim);
+void launch_vit_attention_f8(const u8* qkv_f8, u8* out, uint tokens, uint dim);
 void launch_post70_merge(const u8* main, const u8* skip, const float* scales, u8* dst, uint n,
                          uint c);
 void launch_shift_pack_f32(const float* s, float* d, uint w, uint h, uint sw, uint sh, uint px,
