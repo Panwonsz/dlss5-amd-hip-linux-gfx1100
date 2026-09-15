@@ -115,7 +115,7 @@ def main() -> None:
             for notice in sorted((HERE / 'vendor' / 'notices').glob('*')):
                 add_file(notice, 'licenses/' + notice.name)
             manifest = {'schema': 1, 'purpose': 'slow experimental HIP proof of concept; optimization required',
-                        'source_url': 'https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.0',
+                        'source_url': 'https://github.com/guentra/dlss5-amd-hip-linux/tree/lmxxf-base',
                         'gameplay_verified': False, 'nvidia_equivalence_verified': False,
                         'files': records}
             _add_bytes(tar, f'{ARCHIVE}/manifest.json',
