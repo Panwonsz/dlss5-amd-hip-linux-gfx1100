@@ -108,7 +108,8 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
                             __float2half_rn(v);
                 }
             } else {
-                output[(first + rc.x) * n + col + rc.y] = v;
+                if (output)
+                    output[(first + rc.x) * n + col + rc.y] = v;
                 if constexpr (F8OUT)
                     output_f8[(first + rc.x) * n + col + rc.y] = qout;
                 if constexpr (F8OUT_RASTER) {
