@@ -30,9 +30,13 @@ void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out
                                    uint n, uint k, const float* residual, const float* scales,
                                    int mode, int ordered, bool matrix_residual = false);
 void launch_linear_f32_f8in_f8out_f8res(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
-                                        uint n, uint k, const u8* residual_f8,
-                                        const float* scales, int mode, int ordered,
-                                        bool matrix_residual);
+                                         uint n, uint k, const u8* residual_f8,
+                                         const float* scales, int mode, int ordered,
+                                         bool matrix_residual);
+void launch_linear_f32_f8in_f8out_hrid(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
+                                       uint n, uint k, const __half* residual_h,
+                                       const float* scales, int mode, int ordered,
+                                       bool matrix_residual);
 void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, u8* out_f8_raster,
                                          uint m, uint n, uint k, const float* residual,
                                          const float* scales, int mode, int ordered,
@@ -47,6 +51,9 @@ void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales,
 void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float* scales,
                                float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
                                bool precise_c32);
+void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
+                              float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
+                              bool precise_c32);
 void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
                               const float* scales, float qgain, bool half_squares);
 void launch_qkv_norm_f32_hin(int c, const __half* in, const u8* w, u8* out, uint m,
@@ -70,6 +77,8 @@ void launch_reframe_f32_to_h(const float* src, __half* dst, uint w, uint h, uint
 void launch_reframe_hin_hout(const __half* src, __half* dst, uint w, uint h, uint sw, uint sh,
                              uint px, uint py, uint c);
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh);
+void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint h, uint c,
+                       uint ow, uint oh);
 void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, float* out, uint tokens,
                     bool chain_residual = false, bool precise_c32 = false);
 
@@ -119,10 +128,12 @@ void launch_fused_mh(int c, const u8* in, const u8* ffn, const u8* proj0, const 
 
 hipStream_t get_launch_stream();
 void launch_linear_half(const float*,const __half*,float*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
+void launch_linear_half_h(const float*,const __half*,float*,__half*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
 void launch_split_f32(const float*,const u8*,const u8*,const u8*,float*,uint tokens);
 void launch_rgb_graph(const float*,float*,float*,uint w,uint h,uint ow,uint oh);
 void launch_gather_f32(const float*,const int*,float*,uint n);
 void launch_up_f32(const float*,const float*,const float*,float*,uint iw,uint ih,uint ow,uint oh,uint c);
+void launch_up_f32_h(const float*,const float*,const float*,float*,__half*,uint iw,uint ih,uint ow,uint oh,uint c);
 void launch_post_merge_f32(const float*,const float*,const float*,float*,uint w,uint h,bool main8_low = false);
 void launch_head_f32(const float*,const float*,const float*,float*,uint n);
 void launch_trace_f32(const float*,uint n,float*,uint*);

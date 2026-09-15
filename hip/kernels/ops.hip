@@ -351,22 +351,29 @@ __global__ void k_reframe_hin_hout(const __half* src, __half* dst, uint w, uint 
     *reinterpret_cast<uint2*>(dst + (win * 64u + tok) * c + ch) = v;
 }
 
-__global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh) {
+__global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh,
+                           __half* dst_h = nullptr) {
     uint i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= ow * oh * c) return;
     uint ch = i % c, t = i / c, x = t % ow, y = t / ow;
-    if (x >= w / 2 || y >= h / 2) { dst[i] = 0.f; return; }
-    uint base = (y * 2 * w + x * 2) * c + ch;
-    float top = H(src[base] + src[base + c]);
-    float bottom = H(src[base + w * c] + src[base + (w + 1) * c]);
-    dst[i] = from_e4m3(e4m3_byte(H(H(top + bottom) * .25f)));
+    float v;
+    if (x >= w / 2 || y >= h / 2) v = 0.f;
+    else {
+        uint base = (y * 2 * w + x * 2) * c + ch;
+        float top = H(src[base] + src[base + c]);
+        float bottom = H(src[base + w * c] + src[base + (w + 1) * c]);
+        v = from_e4m3(e4m3_byte(H(H(top + bottom) * .25f)));
+    }
+    dst[i] = v;
+    if (dst_h)
+        dst_h[i] = __float2half_rn(v);
 }
 
 // True half operands for ViT QKV, decoder entry and pool/head matrices.
 // partitions reproduce the fast shader's independent K reductions; ordered
 // rounds after each K32 only for the head/DS reference path.
 __global__ void k_linear_half(const float* input,const __half* weights,float* output,
- uint m,uint n,uint k,uint partitions,int ordered,int raw) {
+  uint m,uint n,uint k,uint partitions,int ordered,int raw,__half* output_h=nullptr) {
  using namespace linalg;
  uint first=blockIdx.x*16,col=blockIdx.y*16;
  __shared__ __half tile[512];
@@ -393,7 +400,7 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
   }
   for(uint i=0;i<total.Length();++i)total.Set(i,total.Get(i)+acc.Get(i));
  }
- for(uint i=0;i<total.Length();++i){uint2 rc=total.GetCoordinate(i);if(first+rc.x<m){float v=total.Get(i);output[(first+rc.x)*n+col+rc.y]=raw==2?v:raw==1?H(v):from_e4m3(e4m3_byte(H(v)));}}
+  for(uint i=0;i<total.Length();++i){uint2 rc=total.GetCoordinate(i);if(first+rc.x<m){float v=total.Get(i);float out=raw==2?v:raw==1?H(v):from_e4m3(e4m3_byte(H(v)));output[(first+rc.x)*n+col+rc.y]=out;if(output_h)output_h[(first+rc.x)*n+col+rc.y]=__float2half_rn(out);}}
 }
 
 // Split FFWD group parallel, logical window-major input/output. No opaque
@@ -437,11 +444,13 @@ __global__ void k_rgb_graph(const float* in,float* raster,float* tiles,uint w,ui
  for(uint c=0;c<4;++c){float v=in[(ry*w+rx)*4+c];raster[p*4+c]=v;tiles[t*4+c]=v;}
 }
 __global__ void k_gather_f32(const float* in,const int* map,float* out,uint n){uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=in[map[i]];}
-__global__ void k_up_f32(const float* lo,const float* skip,const float* scale,float* out,uint iw,uint ow,uint oh,uint c){
- uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=ow*oh*c)return;
- uint ch=i%c,p=i/c,x=p%ow,y=p/ow;
- float v=H(lo[((y/2)*iw+x/2)*c+ch]+from_e4m3(e4m3_byte(skip[i]))*scale[ch]);
- out[i]=c==32?v:from_e4m3(e4m3_byte(v));
+__global__ void k_up_f32(const float* lo,const float* skip,const float* scale,float* out,uint iw,uint ow,uint oh,uint c,__half* out_h=nullptr){
+  uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=ow*oh*c)return;
+  uint ch=i%c,p=i/c,x=p%ow,y=p/ow;
+  float v=H(lo[((y/2)*iw+x/2)*c+ch]+from_e4m3(e4m3_byte(skip[i]))*scale[ch]);
+  float r=c==32?v:from_e4m3(e4m3_byte(v));
+  out[i]=r;
+  if(out_h)out_h[i]=__float2half_rn(r);
 }
 __global__ void k_post_merge_f32(const float* low,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low = false){
  uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=w*h*32)return;

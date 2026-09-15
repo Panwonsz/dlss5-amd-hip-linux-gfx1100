@@ -67,19 +67,21 @@ struct Block {
     if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
     else launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
    }
-   else if(c==32){
+    else if(c==32){
     if(in_h)launch_ffn_f32_hin_hout(32,in_h,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
     else launch_ffn_f32_hout(32,in,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
    }
-   else if(in_f8)launch_ffn_f32_f8in_f8out(c,in_f8,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
-   else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
+    else if(in_h)launch_ffn_f32_hin_f8out(c,in_h,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
+    else if(in_f8)launch_ffn_f32_f8in_f8out(c,in_f8,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
+    else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
    // mapfeature FFN projection: H(scale product); direct store only C64..256.
    // Non-C32 activations are already on the E4M3 grid, so p0/QKV consume the bytes
    // directly while the f32 copy stays available for residuals.
-    if(c!=32){
-     if(in_f8)launch_linear_f32_f8in_f8out_f8res(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in_f8,s0.as<float>(),c==512?1:5,0,false);
-     else launch_linear_f32_f8in_f8out(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in,s0.as<float>(),c==512?1:5,0);
-    }
+     if(c!=32){
+      if(in_h)launch_linear_f32_f8in_f8out_hrid(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in_h,s0.as<float>(),c==512?1:5,0,false);
+      else if(in_f8)launch_linear_f32_f8in_f8out_f8res(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in_f8,s0.as<float>(),c==512?1:5,0,false);
+      else launch_linear_f32_f8in_f8out(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in,s0.as<float>(),c==512?1:5,0);
+     }
    // QKV GEMM + per-head scaling + E4M3 in one launch (no f32 round trip).
    // C32 keeps the FFN output in f16: H(acc) is exactly representable, so the
    // f16 -> f32 -> E4M3 path is bit-identical with half the global traffic.
@@ -100,8 +102,8 @@ struct Block {
   void run(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
            const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true,
            bool input_f16_exact=false){
-   bool use_f8 = c!=32 && in_f8;
-   bool use_h = c==32 && (in_h || input_f16_exact);
+   bool use_h = c!=512 && (in_h || (c==32 && input_f16_exact));
+   bool use_f8 = c!=32 && in_f8 && !use_h;
    if(use_h){
     if(in_h) launch_reframe_hin_hout(in_h,s.a16.as<__half>(),w,h,sw,sh,px,py,c);
     else launch_reframe_f32_to_h(in,s.a16.as<__half>(),w,h,sw,sh,px,py,c);
@@ -141,7 +143,7 @@ struct Vit {
 struct Up {
  uint iw,ih,ow,oh,cin,cout;DeviceBuf wt,sc;
  void create(const std::string&dir,const std::string&name,uint w,uint h,uint width,uint height,uint ic,uint oc){iw=w;ih=h;ow=width;oh=height;cin=ic;cout=oc;auto v=load(dir,name,size_t(ic)*oc+oc);wt=half_matrix(v.data(),oc,ic);sc=floats(v.data()+size_t(ic)*oc,oc);}
- void run(const float* in,const float* skip,float* out,Scratch&s){launch_linear_half(in,wt.as<__half>(),s.d.as<float>(),iw*ih,cout,cin,cin==1024?4:1,0,1);launch_up_f32(s.d.as<float>(),skip,sc.as<float>(),out,iw,ih,ow,oh,cout);}
+  void run(const float* in,const float* skip,float* out,Scratch&s,__half* out_h=nullptr){launch_linear_half(in,wt.as<__half>(),s.d.as<float>(),iw*ih,cout,cin,cin==1024?4:1,0,1);if(out_h)launch_up_f32_h(s.d.as<float>(),skip,sc.as<float>(),out,out_h,iw,ih,ow,oh,cout);else launch_up_f32(s.d.as<float>(),skip,sc.as<float>(),out,iw,ih,ow,oh,cout);}
 };
 }
 struct Network70::Impl {
@@ -191,25 +193,28 @@ struct Network70::Impl {
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
    launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
-  launch_pool_f32(skip[0].as<float>(),src,W,Ht,32,960,576);
+  launch_pool_f32_h(skip[0].as<float>(),src,s.out16.as<__half>(),W,Ht,32,960,576);
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
+  const __half* group_in_h=s.out16.as<__half>();
    for(int g=0;g<5;++g){
-   const u8* in_f8=nullptr; const __half* in_h=nullptr;
-   for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,j==0&&b.c==32);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
+   const u8* in_f8=nullptr; const __half* in_h=group_in_h;
+   for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
    hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
    uint ow=g==4?32:w/2,oh=g==4?20:h/2;
-   launch_pool_f32(src,s.b.as<float>(),w,h,c,ow,oh);
-   launch_linear_half(s.b.as<float>(),g==4?head_w.as<__half>():ds[g].as<__half>(),dst,ow*oh,c*2,c,1,1,0);
-   std::swap(src,dst);w=ow;h=oh;c*=2;
+    launch_pool_f32(src,s.b.as<float>(),w,h,c,ow,oh);
+    launch_linear_half_h(s.b.as<float>(),g==4?head_w.as<__half>():ds[g].as<__half>(),dst,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);
+    group_in_h=s.out16.as<__half>();
+    std::swap(src,dst);w=ow;h=oh;c*=2;
   }
   launch_gather_f32(src,map.as<int>(),dst,655360);std::swap(src,dst);
   for(int j=0;j<8;++j){vit[j].run(src,dst,s);std::swap(src,dst);mark(31+j,src,655360);}
   launch_gather_f32(src,inv.as<int>(),dst,655360);std::swap(src,dst);
-  up[0].run(src,skip[5].as<float>(),dst,s);std::swap(src,dst);mark(39,src,60*36*512);
+  up[0].run(src,skip[5].as<float>(),dst,s,s.out16.as<__half>());std::swap(src,dst);mark(39,src,60*36*512);
+  const __half* dec_group_in_h=s.out16.as<__half>();
    const int decfirst[]={40,48,56,62,66},decnum[]={8,8,6,4,4};
-   for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),dst,s);std::swap(src,dst);}
-    const u8* in_f8=nullptr; const __half* in_h=nullptr;
-    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,j==0&&b.c==32);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
+   for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),dst,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
+    const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
+    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
   launch_post_merge_f32(src,skip[0].as<float>(),post_sc.as<float>(),dst,W,Ht,true);std::swap(src,dst);
   blocks[70].run(src,dst,s,nullptr,false,nullptr,false,true,true);std::swap(src,dst);mark(70,src,N*32);
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);

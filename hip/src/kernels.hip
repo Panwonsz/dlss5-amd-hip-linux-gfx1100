@@ -80,6 +80,22 @@ void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float*
     default: throw std::runtime_error("FFN f8in channels");
     }
 }
+void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
+                              float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
+                              bool precise_c32) {
+    if (!tokens || c == 32 || c == 512 || !in_h || !out_f32 || !out_f8)
+        throw std::runtime_error("FFN f16in extent/alias");
+    uint groups = (tokens + 15) / 16;
+    switch (c) {
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true>), groups, 128, nullptr, w, scales,
+                    out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, true>), groups, 256, nullptr, w, scales,
+                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, true>), groups, 512, nullptr, w, scales,
+                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
+    default: throw std::runtime_error("FFN f16in channels");
+    }
+}
 
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
                           uint tokens, uint c, float qgain, bool half_squares) {
@@ -194,6 +210,12 @@ void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint 
         throw std::runtime_error("pool extent/alias");
     LAUNCH(k_pool_f32, (ow * oh * c + 255) / 256, 256, src, dst, w, h, c, ow, oh);
 }
+void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint h, uint c,
+                       uint ow, uint oh) {
+    if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || src == dst || !dst_h)
+        throw std::runtime_error("pool f16 extent/alias");
+    LAUNCH(k_pool_f32, (ow * oh * c + 255) / 256, 256, src, dst, w, h, c, ow, oh, dst_h);
+}
 
 void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n, uint k,
                        const float* residual, const float* scales, int mode, int ordered, bool matrix_residual) {
@@ -283,6 +305,18 @@ void launch_linear_f32_f8in_f8out_f8res(const u8* in, const u8* w, float* out, u
            dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, out, out_f8, m, n, k,
            reinterpret_cast<const float*>(residual_f8), scales, mode, ordered, matrix_residual,
            nullptr, nullptr, nullptr, 0, 0, 0, 0, 0, residual_f8);
+}
+void launch_linear_f32_f8in_f8out_hrid(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
+                                       uint n, uint k, const __half* residual_h,
+                                       const float* scales, int mode, int ordered,
+                                       bool matrix_residual) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || (residual_h && !scales) ||
+        ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8)
+        throw std::runtime_error("linear f16res extent/alias");
+    LAUNCH((k_linear_f32<true, true, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in,
+           w, out, out_f8, m, n, k, reinterpret_cast<const float*>(residual_h), scales, mode,
+           ordered, matrix_residual, residual_h);
 }
 void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, u8* out_f8_raster,
                                          uint m, uint n, uint k, const float* residual,
@@ -521,8 +555,12 @@ void launch_fused_mh(int c, const u8* in, const u8* ffn, const u8* proj0, const 
 
 hipStream_t get_launch_stream() { return g_stream; }
 void launch_linear_half(const float* in,const __half* w,float* out,uint m,uint n,uint k,uint parts,int ordered,int raw){
- if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||in==out||raw<0||raw>2)throw std::runtime_error("half linear geometry/alias");
- LAUNCH(k_linear_half,dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw);
+  if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||in==out||raw<0||raw>2)throw std::runtime_error("half linear geometry/alias");
+  LAUNCH(k_linear_half,dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw);
+}
+void launch_linear_half_h(const float* in,const __half* w,float* out,__half* out_h,uint m,uint n,uint k,uint parts,int ordered,int raw){
+  if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||in==out||raw<0||raw>2||!out_h)throw std::runtime_error("half linear f16 geometry/alias");
+  LAUNCH(k_linear_half,dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw,out_h);
 }
 void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,uint n){
   if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH((k_split_f32<false>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,nullptr,n);
@@ -539,7 +577,10 @@ void launch_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,u
 }
 void launch_gather_f32(const float* in,const int* map,float* out,uint n){if(in==out)throw std::runtime_error("gather alias");LAUNCH(k_gather_f32,(n+255)/256,256,in,map,out,n);}
 void launch_up_f32(const float* lo,const float* skip,const float* scale,float* out,uint iw,uint ih,uint ow,uint oh,uint c){
- if(!iw||!ih||ow>2*iw||oh>2*ih||out==lo||out==skip)throw std::runtime_error("upsample geometry/alias");LAUNCH(k_up_f32,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c);
+  if(!iw||!ih||ow>2*iw||oh>2*ih||out==lo||out==skip)throw std::runtime_error("upsample geometry/alias");LAUNCH(k_up_f32,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c);
+}
+void launch_up_f32_h(const float* lo,const float* skip,const float* scale,float* out,__half* out_h,uint iw,uint ih,uint ow,uint oh,uint c){
+  if(!iw||!ih||ow>2*iw||oh>2*ih||out==lo||out==skip||!out_h)throw std::runtime_error("upsample f16 geometry/alias");LAUNCH(k_up_f32,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c,out_h);
 }
 void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low);}
 void launch_head_f32(const float* in,const float* w,const float* color,float* out,uint n){LAUNCH(k_head_f32,(n+63)/64,64,in,w,color,out,n);}
