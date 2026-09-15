@@ -39,11 +39,18 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
     }
 }
 void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scales, __half* out_h,
-                         uint tokens, bool chain_residual, bool precise_c32) {
+                          uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !scales || !out_h)
         throw std::runtime_error("FFN f16 extent/alias");
     LAUNCH((k_ffn_f32<32, false, 2, true>), (tokens + 31) / 32, 128, in, w, scales, nullptr,
            nullptr, tokens, chain_residual, precise_c32, out_h);
+}
+void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float* scales,
+                             __half* out_h, uint tokens, bool chain_residual, bool precise_c32) {
+    if (!tokens || c != 32 || !in_h || !scales || !out_h)
+        throw std::runtime_error("FFN f16 in extent/alias");
+    LAUNCH((k_ffn_f32<32, false, 2, true, false, true>), (tokens + 31) / 32, 128, nullptr, w,
+           scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr, in_h);
 }
 void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
                         u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {
@@ -168,6 +175,13 @@ void launch_reframe_f8in_f8out(const u8* src, u8* dst, uint w, uint h, uint sw, 
     uint count = sw * sh * c;
     LAUNCH(k_reframe_f8in_f8out, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c);
 }
+void launch_reframe_hin_hout(const __half* src, __half* dst, uint w, uint h, uint sw, uint sh,
+                             uint px, uint py, uint c) {
+    if (!w || !h || sw % 8 || sh % 8 || c % 4 || w + px > sw || h + py > sh || !src || !dst)
+        throw std::runtime_error("reframe f16 extent/alias");
+    uint count = sw * sh * c;
+    LAUNCH(k_reframe_hin_hout, (count / 4 + 255) / 256, 256, src, dst, w, h, sw, sh, px, py, c);
+}
 void launch_pool_f32(const float* src, float* dst, uint w, uint h, uint c, uint ow, uint oh) {
     if (!w || !h || w % 2 || h % 2 || ow < w / 2 || oh < h / 2 || src == dst)
         throw std::runtime_error("pool extent/alias");
@@ -224,6 +238,21 @@ void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, 
     LAUNCH((k_linear_f32<true, false, true, true>), dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr,
            in, w, nullptr, nullptr, m, n, k, reinterpret_cast<const float*>(residual_h), scales,
            mode, ordered, matrix_residual, residual_h, out_h);
+}
+void launch_linear_f32_f8in_hrid_hout_raster(const u8* in, const u8* w, __half* out_h,
+                                             __half* out_h_raster, uint m, uint n, uint k,
+                                             const __half* residual_h, const float* scales, int mode,
+                                             int ordered, bool matrix_residual, uint rw, uint rh,
+                                             uint rsw, uint rpx, uint rpy) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || (residual_h && !scales) ||
+        ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) || !out_h || !out_h_raster ||
+        rsw % 8 || rw + rpx > rsw || rh + rpy > rsw)
+        throw std::runtime_error("linear raster f16 extent/alias");
+    LAUNCH((k_linear_f32<true, false, true, true, false, false, true>),
+           dim3((m + 15) / 16, (n + 63) / 64), 128, nullptr, in, w, nullptr, nullptr, m, n, k,
+           reinterpret_cast<const float*>(residual_h), scales, mode, ordered, matrix_residual,
+           residual_h, out_h, nullptr, rw, rh, rsw, rpx, rpy,
+           reinterpret_cast<const u8*>(residual_h), out_h_raster);
 }
 void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                   uint n, uint k, const float* residual, const float* scales,
