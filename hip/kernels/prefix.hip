@@ -5,7 +5,8 @@
 namespace dlss5 {
 
 __global__ void k_prefix(const float* input, const float* weights, const float* temporal_rgb,
-                         float* output, uint seed, uint width, uint height, uint temporal) {
+                         float* output, uint seed, uint width, uint height, uint temporal,
+                         __half* output_h = nullptr) {
     using namespace linalg;
     const uint t = threadIdx.x;
     const uint first = (blockIdx.x + blockIdx.y * 65535u) * 16u;
@@ -63,8 +64,12 @@ __global__ void k_prefix(const float* input, const float* weights, const float* 
         z.StoreF32(otile, n * 16 * 4, 32 * 4);
     }
     __syncthreads();
-    for (uint i = 0; i < 16; i++)
-        output[first * 32 + i * 32 + t] = otile[i * 32 + t];
+    for (uint i = 0; i < 16; i++) {
+        float v = otile[i * 32 + t];
+        output[first * 32 + i * 32 + t] = v;
+        if (output_h)
+            output_h[first * 32 + i * 32 + t] = __float2half_rn(v);
+    }
 }
 
 } // namespace dlss5

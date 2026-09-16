@@ -95,10 +95,7 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         acc.MultiplyAccumulate(a, b);
         __syncthreads();
     }
-    for (uint i = 0; i < acc.Length(); ++i) {
-        uint2 rc = acc.GetCoordinate(i);
-        stage[rc.x * COLS + wave * 16u + rc.y] = acc.Get(i);
-    }
+    acc.StoreF32(stage, wave * 16u * 4u, COLS * 4u);
     __syncthreads();
     // 16 rows x NH heads; one thread per row-head keeps the strict channel sum order.
     const uint item = threadIdx.x;
@@ -111,24 +108,37 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         float inv = 1.f;
         if (headg < 2u * HEADS) {
             float sum = 0.f;
-            for (uint ch = 0; ch < 16u; ++ch)
-                sum += half_squares ? sq_half_f32(s0[ch]) : sq_f32(s0[ch]);
-            for (uint ch = 0; ch < 16u; ++ch)
-                sum += half_squares ? sq_half_f32(s1[ch]) : sq_f32(s1[ch]);
+            const float4* q0 = reinterpret_cast<const float4*>(s0);
+            const float4* q1 = reinterpret_cast<const float4*>(s1);
+            #pragma unroll
+            for (uint q = 0; q < 4u; ++q) {
+                float4 a = q0[q];
+                sum += half_squares ? sq_half_f32(a.x) : sq_f32(a.x);
+                sum += half_squares ? sq_half_f32(a.y) : sq_f32(a.y);
+                sum += half_squares ? sq_half_f32(a.z) : sq_f32(a.z);
+                sum += half_squares ? sq_half_f32(a.w) : sq_f32(a.w);
+            }
+            #pragma unroll
+            for (uint q = 0; q < 4u; ++q) {
+                float4 b = q1[q];
+                sum += half_squares ? sq_half_f32(b.x) : sq_f32(b.x);
+                sum += half_squares ? sq_half_f32(b.y) : sq_f32(b.y);
+                sum += half_squares ? sq_half_f32(b.z) : sq_f32(b.z);
+                sum += half_squares ? sq_half_f32(b.w) : sq_f32(b.w);
+            }
             inv = rsqrtf(fmaxf(sum, 6.198883056640625e-5f));
             if (headg < HEADS)
                 inv *= scales[headg] * qgain;
         }
-        u8 b[32];
+        u32 w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (uint ch = 0; ch < 16u; ++ch)
-            b[ch] = e4m3_byte(s0[ch] * inv);
+            w[ch >> 2] |= u32(e4m3_byte(s0[ch] * inv)) << ((ch & 3u) * 8u);
         for (uint ch = 0; ch < 16u; ++ch)
-            b[16u + ch] = e4m3_byte(s1[ch] * inv);
+            w[4u + (ch >> 2)] |= u32(e4m3_byte(s1[ch] * inv)) << ((ch & 3u) * 8u);
         u8* out = output + (size_t)(first + row) * (3u * C) + headg * 32u;
-        for (uint k4 = 0; k4 < 8u; ++k4)
-            *reinterpret_cast<u32*>(out + k4 * 4u) =
-                u32(b[k4 * 4u]) | u32(b[k4 * 4u + 1]) << 8 |
-                u32(b[k4 * 4u + 2]) << 16 | u32(b[k4 * 4u + 3]) << 24;
+        uint4* o4 = reinterpret_cast<uint4*>(out);
+        o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
+        o4[1] = make_uint4(w[4], w[5], w[6], w[7]);
     }
 }
 

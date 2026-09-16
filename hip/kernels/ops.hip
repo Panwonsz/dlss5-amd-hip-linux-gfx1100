@@ -147,16 +147,46 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     // traffic while keeping 64 waves/CU.
     __shared__ u8 hidden[16 * GROUPS * hidden_c];
     u8* in = hidden;
-    for (uint i = threadIdx.x; i < 16 * GROUPS * C; i += blockDim.x) {
-        uint local = i % (16 * C);
-        uint row = first + i / (16 * C) * 16 + local / C;
-        if (F8IN)
-            in[i] = row < tokens ? input_f8[row * C + local % C] : 0;
-        else if (HIN)
-            // The C32 p1 sibling is H(v), exactly representable in f16.
-            in[i] = row < tokens ? e4m3_byte(__half2float(input_h[row * C + local % C])) : 0;
-        else
-            in[i] = row < tokens ? e4m3_byte(input[row * C + local % C]) : 0;
+    if constexpr (C == 32) {
+        // 4-byte input staging for C32: same E4M3 bytes, fewer LDS stores.
+        const uint count4 = 16 * GROUPS * 8;
+        for (uint i4 = threadIdx.x; i4 < count4; i4 += blockDim.x) {
+            uint local4 = i4 % (16 * 8);
+            uint row = first + (i4 / (16 * 8)) * 16 + local4 / 8;
+            uint ch = (local4 % 8) * 4;
+            if (F8IN) {
+                uint v = row < tokens ? *reinterpret_cast<const u32*>(input_f8 + row * C + ch) : 0u;
+                *reinterpret_cast<u32*>(in + i4 * 4) = v;
+            } else if (HIN) {
+                const __half2* hp = reinterpret_cast<const __half2*>(input_h + row * C + ch);
+                __half2 h0 = row < tokens ? hp[0] : __half2(0.f, 0.f);
+                __half2 h1 = row < tokens ? hp[1] : __half2(0.f, 0.f);
+                *reinterpret_cast<u32*>(in + i4 * 4) =
+                    u32(e4m3_byte(__half2float(__low2half(h0)))) |
+                    u32(e4m3_byte(__half2float(__high2half(h0)))) << 8 |
+                    u32(e4m3_byte(__half2float(__low2half(h1)))) << 16 |
+                    u32(e4m3_byte(__half2float(__high2half(h1)))) << 24;
+            } else {
+                const float4 v = row < tokens
+                                     ? *reinterpret_cast<const float4*>(input + row * C + ch)
+                                     : make_float4(0.f, 0.f, 0.f, 0.f);
+                *reinterpret_cast<u32*>(in + i4 * 4) =
+                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
+            }
+        }
+    } else {
+        for (uint i = threadIdx.x; i < 16 * GROUPS * C; i += blockDim.x) {
+            uint local = i % (16 * C);
+            uint row = first + i / (16 * C) * 16 + local / C;
+            if (F8IN)
+                in[i] = row < tokens ? input_f8[row * C + local % C] : 0;
+            else if (HIN)
+                // The C32 p1 sibling is H(v), exactly representable in f16.
+                in[i] = row < tokens ? e4m3_byte(__half2float(input_h[row * C + local % C])) : 0;
+            else
+                in[i] = row < tokens ? e4m3_byte(input[row * C + local % C]) : 0;
+        }
     }
     __syncthreads();
     C32 ex[4];
@@ -405,9 +435,10 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
 
 // Split FFWD group parallel, logical window-major input/output. No opaque
 // tiled activation format crosses a launch boundary.
-template <bool F8OUT, bool F8IN = false>
+template <bool F8OUT, bool F8IN = false, bool HIN = false>
 __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const u8* contract,
-                             float* out,u8* out_f8,uint tokens,const u8* in_f8=nullptr){
+                             float* out,u8* out_f8,uint tokens,const u8* in_f8=nullptr,
+                             const __half* in_h=nullptr){
   using namespace linalg;
   uint first=blockIdx.x*16,group=blockIdx.y,wave=threadIdx.x/32;
   __shared__ u8 tile[512],mix[16*64],hid[16*256];
@@ -418,7 +449,17 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
      if constexpr (F8IN)
          *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col) =
              row < tokens ? *reinterpret_cast<const u32*>(in_f8 + row * 512u + g * 32u + col) : 0u;
-     else {
+     else if constexpr (HIN) {
+         // The upstream f16 sibling is already on the f16 grid; quantize to E4M3.
+         const __half2* hp = reinterpret_cast<const __half2*>(in_h + row * 512u + g * 32u + col);
+         __half2 h0 = row < tokens ? hp[0] : __half2(0.f, 0.f);
+         __half2 h1 = row < tokens ? hp[1] : __half2(0.f, 0.f);
+         *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col) =
+             u32(e4m3_byte(__half2float(__low2half(h0)))) |
+             u32(e4m3_byte(__half2float(__high2half(h0)))) << 8 |
+             u32(e4m3_byte(__half2float(__low2half(h1)))) << 16 |
+             u32(e4m3_byte(__half2float(__high2half(h1)))) << 24;
+     } else {
          const float4 v=row<tokens?*reinterpret_cast<const float4*>(in+row*512u+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
          *reinterpret_cast<u32*>(tile+(threadIdx.x/8u)*32u+col)=
           u32(e4m3_byte(v.x))|u32(e4m3_byte(v.y))<<8|u32(e4m3_byte(v.z))<<16|u32(e4m3_byte(v.w))<<24;
@@ -452,11 +493,13 @@ __global__ void k_up_f32(const float* lo,const float* skip,const float* scale,fl
   out[i]=r;
   if(out_h)out_h[i]=__float2half_rn(r);
 }
-__global__ void k_post_merge_f32(const float* low,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low = false){
- uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=w*h*32)return;
- uint ch=i%32,p=i/32,lp=((p/w)/2)*(w/2)+(p%w)/2;
- float lo=main8_low?from_e4m3(e4m3_byte(low[lp*32+ch])):low[lp*32+ch];
- out[i]=H(H(lo*scales[ch])+from_e4m3(e4m3_byte(pre[i]))*scales[32+ch]);
+__global__ void k_post_merge_f32(const float* low,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low = false,__half* out_h=nullptr){
+  uint i=blockIdx.x*blockDim.x+threadIdx.x;if(i>=w*h*32)return;
+  uint ch=i%32,p=i/32,lp=((p/w)/2)*(w/2)+(p%w)/2;
+  float lo=main8_low?from_e4m3(e4m3_byte(low[lp*32+ch])):low[lp*32+ch];
+  float v=H(H(lo*scales[ch])+from_e4m3(e4m3_byte(pre[i]))*scales[32+ch]);
+  out[i]=v;
+  if(out_h)out_h[i]=__float2half_rn(v);
 }
 __global__ void k_head_f32(const float* feat,const float* weights,const float* color,float* out,uint n){
  uint p=blockIdx.x*blockDim.x+threadIdx.x;if(p>=n)return;

@@ -269,10 +269,10 @@ void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, 
            mode, ordered, matrix_residual, residual_h, out_h);
 }
 void launch_linear_f32_f8in_hrid_hout_raster(const u8* in, const u8* w, __half* out_h,
-                                             __half* out_h_raster, uint m, uint n, uint k,
-                                             const __half* residual_h, const float* scales, int mode,
-                                             int ordered, bool matrix_residual, uint rw, uint rh,
-                                             uint rsw, uint rpx, uint rpy) {
+                                              __half* out_h_raster, uint m, uint n, uint k,
+                                              const __half* residual_h, const float* scales, int mode,
+                                              int ordered, bool matrix_residual, uint rw, uint rh,
+                                              uint rsw, uint rpx, uint rpy) {
     if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || (residual_h && !scales) ||
         ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) || !out_h || !out_h_raster ||
         rsw % 8 || rw + rpx > rsw || rh + rpy > rsw)
@@ -319,10 +319,10 @@ void launch_linear_f32_f8in_f8out_hrid(const u8* in, const u8* w, float* out, u8
            ordered, matrix_residual, residual_h);
 }
 void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, u8* out_f8_raster,
-                                         uint m, uint n, uint k, const float* residual,
-                                         const float* scales, int mode, int ordered,
-                                         bool matrix_residual, uint rw, uint rh, uint rsw,
-                                         uint rpx, uint rpy) {
+                                          uint m, uint n, uint k, const float* residual,
+                                          const float* scales, int mode, int ordered,
+                                          bool matrix_residual, uint rw, uint rh, uint rsw,
+                                          uint rpx, uint rpy) {
     if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || (residual && !scales) ||
         ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8_raster ||
@@ -332,6 +332,7 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
            nullptr, in, w, out, nullptr, m, n, k, residual, scales, mode, ordered, matrix_residual,
            nullptr, nullptr, out_f8_raster, rw, rh, rsw, rpx, rpy);
 }
+
 
 void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens) {
     uint groups = grid_cap(tokens / 16);
@@ -433,9 +434,15 @@ void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, 
 }
 
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,
-                   uint width, uint height, uint temporal_on) {
+                    uint width, uint height, uint temporal_on) {
     uint tokens = width * height;
     LAUNCH(k_prefix, (tokens + 15) / 16, 32, in, w, temporal, out, seed, width, height, temporal_on);
+}
+void launch_prefix_h(const float* in, const float* w, const float* temporal, float* out,
+                     __half* out_h, uint seed, uint width, uint height, uint temporal_on) {
+    uint tokens = width * height;
+    LAUNCH(k_prefix, (tokens + 15) / 16, 32, in, w, temporal, out, seed, width, height,
+            temporal_on, out_h);
 }
 
 void launch_gemm_tiled(const u8* a, const u8* b, u8* c, uint M, uint N, uint K, int activate) {
@@ -572,6 +579,10 @@ void launch_split_f32_f8in_f8(const u8* in_f8,const u8* pre,const u8* ex,const u
   if(!n||!in_f8||!out_f8)throw std::runtime_error("split f8in geometry/alias");
   LAUNCH((k_split_f32<true, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,in_f8);
 }
+void launch_split_f32_hin_f8(const __half* in_h,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
+  if(!n||!in_h||!out_f8)throw std::runtime_error("split f16in geometry/alias");
+  LAUNCH((k_split_f32<true, false, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,nullptr,in_h);
+}
 void launch_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,uint ow,uint oh){
  if(w<2||h<2||ow%8||oh%8||ow<w||oh<h)throw std::runtime_error("RGB geometry");LAUNCH(k_rgb_graph,(ow*oh+255)/256,256,in,raster,tiles,w,h,ow,oh);
 }
@@ -583,6 +594,7 @@ void launch_up_f32_h(const float* lo,const float* skip,const float* scale,float*
   if(!iw||!ih||ow>2*iw||oh>2*ih||out==lo||out==skip||!out_h)throw std::runtime_error("upsample f16 geometry/alias");LAUNCH(k_up_f32,(ow*oh*c+255)/256,256,lo,skip,scale,out,iw,ow,oh,c,out_h);
 }
 void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low);}
+void launch_post_merge_f32_h(const float* lo,const float* pre,const float* scales,float* out,__half* out_h,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low,out_h);}
 void launch_head_f32(const float* in,const float* w,const float* color,float* out,uint n){LAUNCH(k_head_f32,(n+63)/64,64,in,w,color,out,n);}
 void launch_trace_f32(const float* in,uint n,float* stats,uint* bits){LAUNCH(k_trace_f32,1,256,in,n,stats,bits);}
 

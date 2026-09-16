@@ -22,10 +22,11 @@ void launch_linear_f32_f8in_hrid_hout(const u8* in, const u8* w, __half* out_h, 
                                        uint k, const __half* residual_h, const float* scales,
                                        int mode, int ordered, bool matrix_residual = false);
 void launch_linear_f32_f8in_hrid_hout_raster(const u8* in, const u8* w, __half* out_h,
-                                             __half* out_h_raster, uint m, uint n, uint k,
-                                             const __half* residual_h, const float* scales, int mode,
-                                             int ordered, bool matrix_residual, uint rw, uint rh,
-                                             uint rsw, uint rpx, uint rpy);
+                                              __half* out_h_raster, uint m, uint n, uint k,
+                                              const __half* residual_h, const float* scales, int mode,
+                                              int ordered, bool matrix_residual, uint rw, uint rh,
+                                              uint rsw, uint rpx, uint rpy);
+
 void launch_linear_f32_f8in_f8out(const u8* in, const u8* w, float* out, u8* out_f8, uint m,
                                    uint n, uint k, const float* residual, const float* scales,
                                    int mode, int ordered, bool matrix_residual = false);
@@ -42,6 +43,7 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
                                          const float* scales, int mode, int ordered,
                                          bool matrix_residual, uint rw, uint rh, uint rsw,
                                          uint rpx, uint rpy);
+
 void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scales, __half* out_h,
                           uint tokens, bool chain_residual, bool precise_c32);
 void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float* scales,
@@ -62,6 +64,8 @@ void launch_split_f32_f8(const float* in, const u8* pre, const u8* ex, const u8*
                           u8* out_f8, uint tokens);
 void launch_split_f32_f8in_f8(const u8* in_f8, const u8* pre, const u8* ex, const u8* ct,
                               float* out, u8* out_f8, uint tokens);
+void launch_split_f32_hin_f8(const __half* in_h, const u8* pre, const u8* ex, const u8* ct,
+                             float* out, u8* out_f8, uint tokens);
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
                           uint tokens, uint c, float qgain, bool half_squares = true);
 void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
@@ -90,6 +94,8 @@ void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, 
                       uint packed = 0, bool direct_f8 = false);
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,
                    uint width, uint height, uint temporal_on);
+void launch_prefix_h(const float* in, const float* w, const float* temporal, float* out,
+                     __half* out_h, uint seed, uint width, uint height, uint temporal_on);
 void launch_gemm_tiled(const u8* a, const u8* b, u8* c, uint M, uint N, uint K, int activate);
 void launch_f32_to_f8(const float* s, u8* d, uint n);
 void launch_f8_to_f32(const u8* s, float* d, uint n);
@@ -135,6 +141,7 @@ void launch_gather_f32(const float*,const int*,float*,uint n);
 void launch_up_f32(const float*,const float*,const float*,float*,uint iw,uint ih,uint ow,uint oh,uint c);
 void launch_up_f32_h(const float*,const float*,const float*,float*,__half*,uint iw,uint ih,uint ow,uint oh,uint c);
 void launch_post_merge_f32(const float*,const float*,const float*,float*,uint w,uint h,bool main8_low = false);
+void launch_post_merge_f32_h(const float*,const float*,const float*,float*,__half*,uint w,uint h,bool main8_low);
 void launch_head_f32(const float*,const float*,const float*,float*,uint n);
 void launch_trace_f32(const float*,uint n,float*,uint*);
 
