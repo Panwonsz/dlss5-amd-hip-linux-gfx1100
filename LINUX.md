@@ -1,7 +1,7 @@
 # Linux overlay
 
 `main` contains the Linux HIP/rocWMMA implementation, the Proton installer under
-[`linux/`](linux/), and the supporting D3D12/HLSL reference sources.
+[`linux/`](linux/), and the supporting add-on sources.
 
 | Path | What |
 | --- | --- |
@@ -9,7 +9,7 @@
 | [`linux/`](linux/) | Proton installer that deploys the add-on and launch wrapper |
 
 `linux/` copies the add-on package (`dlss5-amd.addon64`, ReShade loader,
-`DLSS5-AMD/`, Agility SDK) next to the game `.exe` and writes
+`DLSS5-AMD/`) next to the game `.exe` and writes
 `.dlssnr-linux/launch.sh` (`WINEDLLOVERRIDES` for `d3d12` / `dxgi`). It does
 **not** install a proprietary HIP `setup.exe`.
 

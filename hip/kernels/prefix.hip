@@ -1,4 +1,4 @@
-// HIP port of shaders/native_wave_prefix.hlsl (ALU noise + 16→32 prefix GEMM).
+// Native HIP prefix stage (ALU noise + 16→32 prefix GEMM).
 #pragma once
 #include "dlss5_linalg.hpp"
 

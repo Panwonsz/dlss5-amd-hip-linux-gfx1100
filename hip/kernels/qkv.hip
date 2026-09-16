@@ -1,4 +1,4 @@
-// HIP port of shaders/native_wave_qkv.hlsl (E4M3 operands, tiled B, H() epilogue).
+// Native HIP QKV (E4M3 operands, tiled B, H() epilogue).
 #pragma once
 #include "dlss5_linalg.hpp"
 

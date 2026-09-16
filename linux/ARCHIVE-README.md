@@ -64,7 +64,6 @@ requires ROCm installed separately. `manifest.json` records every packaged file'
 digest; it is an integrity inventory, not a test certificate.
 
 Code license: `LICENSE`. ReShade and MinHook notices: `licenses/` and
-`THIRD-PARTY.md`. No NVIDIA DLL, weights, proprietary AMD inference binaries or
-Agility SDK are included. Corresponding source (including modified LGPL
+`THIRD-PARTY.md`. No NVIDIA DLL, weights, or proprietary AMD inference binaries are included. Corresponding source (including modified LGPL
 vkd3d-proton) is available with this release:
 https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.1.0-poc

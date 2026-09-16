@@ -54,7 +54,7 @@ def parser():
             command.add_argument('--hip', action='store_true', default=True,
                                  help='Experimental native Linux HIP (default), with the matching modified vkd3d runtime.')
             command.add_argument('--no-hip', action='store_false', dest='hip',
-                                 help='Keep the D3D12 SM 6.10 path (needs Agility SDK; usually fails in Proton).')
+                                 help='Keep the D3D12 SM 6.10 path (needs the corresponding D3D12 runtime; usually fails in Proton).')
     return result
 
 
@@ -162,10 +162,10 @@ def emit(result, args):
         if result['package'].get('hip'):
             print('HIP weights:', result['package'].get('weights_dir', result['package']['root']))
             print('Conversion required:', result['package'].get('conversion_required', False))
-            print('Agility SDK: not used by HIP')
+            print('D3D12 runtime: not used by HIP')
         else:
             print('Files:', result['package']['file_count'], 'weights:', result['package']['weights'])
-            print('Agility SDK:', 'yes' if result['package']['agility_sdk'] else 'NO — SM 6.10 will not initialise')
+            print('D3D12 runtime:', 'found' if result['package']['agility_sdk'] else 'missing — SM 6.10 will not initialise')
         print('Game:', result['game']['exe'])
         print('Runner:', result['proton']['root'])
         for warning in result.get('warnings', []):
@@ -268,7 +268,7 @@ def main(argv=None):
         else:
             info = package.validate(pkg, magpie=args.magpie)
             if not info['agility_sdk']:
-                warnings.append('Agility SDK runtime missing from the package (DLSS5-D3D12-721).')
+                warnings.append('D3D12 SM 6.10 runtime missing from the package.')
         if args.command == 'doctor':
             emit({'host': host, 'game': evidence, 'proton': proton, 'package': info, 'warnings': warnings}, args)
             return 0

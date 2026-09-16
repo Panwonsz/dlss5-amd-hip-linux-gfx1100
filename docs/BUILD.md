@@ -14,10 +14,8 @@ make -C hip -j3 game hip-network70 MINGW_CC=x86_64-w64-mingw32-gcc
 linux/install.sh build-addon
 ```
 
-The add-on helper downloads MinHook/ReShade headers when absent; upstream build
-scripts and their Windows-only HLSL paths are retained for source provenance,
-not advertised as the Linux runtime. The binary release needs neither a compiler
-nor the Agility SDK.
+The add-on helper downloads MinHook/ReShade headers when absent. The binary
+release needs neither a compiler nor a D3D12 SM 6.10 runtime.
 
 For the exact vendored headers used in this release, extract the accompanying
 `addon-build-deps.tar.gz` into the source root. Its `third_party/` folder includes
@@ -30,7 +28,7 @@ The release supplies `vkd3d-proton-poc-source.tar.gz`: complete source and bundl
 subprojects corresponding to the shipped DLL pair, including LGPL notices,
 a record of modified files and a portable cross file. Follow its `BUILD-POC.md`.
 The source was derived from HansKristian-Work/vkd3d-proton
-`35bdee1435c94f8c3548725fcb046595b263bd7e`, with local ordering and lmxxf callback
+`35bdee1435c94f8c3548725fcb046595b263bd7e`, with local ordering and local callback
 extensions. It is **not** an unmodified upstream build. Its embedded version
 string was generated inside the parent worktree and is not an upstream revision
 identifier; use the supplied source inventory and binary hashes.
@@ -39,7 +37,7 @@ For `linux/build_release.py`, place the extracted source at
 `linux/build/live/vkd3d-proton`, and its build directory at
 `linux/build/live/build-vkd3d`. The packager expects both `libs/d3d12/d3d12.dll`
 and `libs/d3d12core/d3d12core.dll`. The latter is the LGPL vkd3d implementation,
-not Microsoft's similarly named Agility runtime.
+not a Microsoft D3D12 runtime.
 
 Obtain ReShade's full-add-on build from https://reshade.me/ (the release used
 6.8.0). Place `ReShade64.dll`, its `LICENSE.md` and `PROVENANCE.txt` in

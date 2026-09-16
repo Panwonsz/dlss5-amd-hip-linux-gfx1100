@@ -1,4 +1,4 @@
-// Numerics matching shaders/native_wave_*.hlsl (fast chain).
+// Numerics for the native HIP fast chain.
 // H() = f16 RNE, F() = E4M3FN RNE (OCP, bias 7, max 448).
 #pragma once
 #include <hip/hip_runtime.h>

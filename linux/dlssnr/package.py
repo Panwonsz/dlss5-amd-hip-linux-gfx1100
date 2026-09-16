@@ -1,4 +1,4 @@
-"""Validate an lmxxf user package (ReShade addon + lab folder + optional Agility SDK)."""
+"""Validate a user package (ReShade addon + lab folder + optional D3D12 runtime)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -160,7 +160,7 @@ def validate(package: Path, *, magpie: bool = False) -> dict:
     missing = [name for name in (ADDON, loader, REQUIRED_FLAGS) if name not in names]
     if missing:
         raise RuntimeError(
-            'Not an lmxxf user package (see scripts/package-release.py). Missing: '
+            'Not a valid user package. Missing: '
             + ', '.join(missing)
             + f'. Pass the extracted folder that contains {ADDON} next to DLSS5-AMD/.'
         )

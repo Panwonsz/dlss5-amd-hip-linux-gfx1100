@@ -19,7 +19,7 @@ STORE = '.dlssnr-linux'
 SCHEMA = 2
 NOTES = [
     'D3D path: this deploys the ReShade add-on and package shaders without native HIP.',
-    'SM 6.10 wave-matrix requires the Agility SDK and driver support; successful installation does not verify rendering under vkd3d-proton.',
+    'SM 6.10 wave-matrix requires the corresponding D3D12 runtime and driver support; successful installation does not verify rendering under vkd3d-proton.',
     'Remove the wrapper from your launcher after uninstall.',
 ]
 HIP_NOTES = [

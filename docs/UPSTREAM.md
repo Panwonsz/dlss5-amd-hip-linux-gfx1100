@@ -17,15 +17,14 @@ In the user's *Onimusha* test, a 1080p window scaled to 2K maintained about **30
 
 Version **0.14** updates the FPS number no more often than every three seconds, caches the text strip, and records its copy in the existing network-output submission, removing the separate FPS submission and CPU wait.
 
-The network requires 1080p output, Windows Developer Mode and AMD's 26.10.07.02 preview driver. VRAM pressure can cause frame-rate drops; for the Stellar Blade hook, use texture quality "High" or lower. `scripts/game-flags.txt` and `scripts/magpie-flags.txt` hold the two runtime configurations; `scripts/bench.ps1` compiles the shader set. See the [Magpie package instructions](scripts/package-README-magpie.txt) (Chinese).
+The network requires 1080p output, Windows Developer Mode and an AMD driver with D3D12 wave-matrix support. VRAM pressure can cause frame-rate drops; for the Stellar Blade hook, use texture quality "High" or lower. `scripts/game-flags.txt` holds the runtime configuration used by the Linux/HIP package.
 
 ## What is in this repository
 
 | Directory | Content |
 |---|---|
 | `src/` | Host code: the ReShade add-on (`native_submission_order_probe.cpp` + `native_game_*.h`) and the offline bench (`d3d12_native_network70_test.cpp`); one header per network stage (`native_c64.h`, `native_preblock_runtime.h`, `native_vit_*.h`, `native_post70.h`, …). |
-| `shaders/` | The HLSL compute kernels of the fast chain. Wave-matrix kernels are `native_wave_*.hlsl`; the `NATIVE_*` defines select the fast paths. |
-| `scripts/` | `build-addon.sh` (mingw-w64 cross build of the add-on), `build-bench.sh`, `bench.ps1` (compiles every shader of the fast chain with the preview `dxc` and runs the bench), `deploy_fast.ps1` / `update-manifest.ps1` (install into the game's asset folder), `game-flags.txt` (the runtime flag set the game currently runs with). |
+| `scripts/` | `build-addon.sh` / `build-addon-oneclick.sh` (mingw-w64 cross build of the add-on) and `game-flags.txt` (the runtime flag set used by the Linux/HIP package). |
 | `tools/` | `compare_fast_output.py` (PSNR against the exact chain), `flicker_stats.py` (frame-to-frame analysis of the in-game dumps). |
 | `Development/` | Everything produced on the way: reverse-engineering notes, per-block reference implementations and validation scripts, the 76 nested experiment runners the fast chain grew out of, plans and state logs. `DevHistory.md` is the single consolidated development history; the original per-period documents are under `history/`. Not needed to build. |
 
@@ -47,35 +46,13 @@ The network requires 1080p output, Windows Developer Mode and AMD's 26.10.07.02 
 
 ## Building
 
-Requirements: Linux / WSL with `x86_64-w64-mingw32-g++` (cross build), Windows with an RDNA 4 GPU and a driver exposing
-D3D12 wave matrices (linalg tier 10), the Shader Model 6.10 preview `dxc` (with `dx/linalg.h`), ReShade 6.8 add-on
-headers, MinHook sources.
-
-Where the preview pieces come from (all linked from Microsoft's post
-[Announcing Agility SDK 1.721 preview and more Shader Model 6.10 features](https://devblogs.microsoft.com/directx/announcing-agilitysdk-721-preview-and-more-shader-model-6-10-features/)):
-the preview DXC is a *preview* release of [microsoft/DirectXShaderCompiler](https://github.com/microsoft/DirectXShaderCompiler/releases)
-(we use v1.10.2605.24, `dxc_preview_2026_05_22.zip`; unzip anywhere and pass the folder as `-DxcRoot`); the Agility SDK
-runtime (`D3D12Core.dll`, folder `DLSS5-D3D12-721` in the package) is NuGet `Microsoft.Direct3D.D3D12` 1.721.3-preview;
-the AMD driver is the RC "Agility SDK" build 26.10.07.02 (32.0.31007.2048), not a release driver: [download from AMD](https://drivers.amd.com/drivers/amd-software-adrenalin-edition-26.10.07.02-win11-rc7-agility-sdk.exe).
-**Windows Developer Mode must be on** (Settings → System → For developers): the add-on enables the experimental shader models with
-`D3D12EnableExperimentalFeatures`, which only succeeds in developer mode; without it the initialisation stops at its first step
-(`sdk721_before_device ... experimental=` in `logs\native-submission-order.txt` is not `00000000`). Nothing else has to be installed
-to run a release package: the shaders are precompiled.
+Requirements for the Linux/HIP add-on build: Linux / WSL with `x86_64-w64-mingw32-g++`, ReShade 6.8 add-on headers, and MinHook sources. The HIP network itself is built from [`hip/`](hip/) with ROCm/HIP and does not require the D3D12 toolchain.
 
 ```bash
 # one click (Ubuntu / WSL): sudo apt install g++-mingw-w64-x86-64 git; fetches MinHook + ReShade headers into third_party/
 bash scripts/build-addon-oneclick.sh            # -> native-game.addon64
 # or by hand
 bash scripts/build-addon.sh <minhook-src> <reshade-include> native-game.addon64 --tiled
-bash scripts/build-bench.sh native-network70-temporal.exe
-```
-
-```powershell
-# shaders only, any Windows x64 machine (needs the SM 6.10 preview dxc package; no GPU, no weights)
-powershell -ExecutionPolicy Bypass -File scripts\compile-shaders.ps1 -Folder D:\dlss5-shaders -DxcRoot <dxc-preview>
-# shaders + bench on the RX 9070 XT machine: <lab> holds the shaders, the weights and the bench exe
-powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Folder <lab> -DxcRoot <dxc-preview>
-powershell -ExecutionPolicy Bypass -File scripts\deploy_fast.ps1 -Source <lab> -Dll native-game.addon64 -Flags scripts\game-flags.txt
 ```
 
 ## Changelog

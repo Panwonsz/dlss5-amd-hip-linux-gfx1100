@@ -1,4 +1,4 @@
-// HIP port of shaders/native_wave_project.hlsl (FP8 input, tiled B, FP8 store, fast accumulate).
+// Native HIP projection (FP8 input, tiled B, FP8 store, fast accumulate).
 #pragma once
 #include "dlss5_linalg.hpp"
 

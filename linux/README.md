@@ -57,4 +57,4 @@ available through `dlss5_last_error()`.
 
 Not affiliated with NVIDIA or AMD. No NVIDIA DLL or weights are distributed.
 Use a copy of `nvngx_dlssnr.dll` you obtained legitimately, converted with the
-lmxxf lab scripts, then packaged. Provided as-is.
+project weight-conversion scripts, then packaged. Provided as-is.

@@ -1,4 +1,4 @@
-// HIP port of shaders/native_wave_attention_direct.hlsl (fast path).
+// Native HIP window-attention fast path.
 // 8×8 windows, 32-channel heads, FP8 QKV in window-major [token][3C].
 #pragma once
 #include "dlss5_linalg.hpp"

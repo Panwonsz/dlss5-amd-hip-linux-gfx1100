@@ -1,4 +1,4 @@
-// HIP port of shaders/native_wave_ffn_fused.hlsl (tiled E4M3, HW quantize, FP8 output).
+// Native HIP fused FFN (tiled E4M3, HW quantize, FP8 output).
 #pragma once
 #include "dlss5_linalg.hpp"
 

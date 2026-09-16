@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # One-click cross build of the add-on on Linux / WSL (Ubuntu): fetches MinHook and the ReShade 6.8 add-on headers into
 # third_party/ (git, network needed the first time) and runs build-addon.sh. Needs: sudo apt install g++-mingw-w64-x86-64 git
-# Output: native-game.addon64 in the current directory (copy it next to d3d12.dll in the game as dlss5-amd.addon64 or deploy
-# it with scripts/deploy_fast.ps1 on the Windows machine).
+# Output: native-game.addon64 in the current directory (deploy it as dlss5-amd.addon64 next to the game).
 set -euo pipefail
 here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd -- "$here/.." && pwd)
