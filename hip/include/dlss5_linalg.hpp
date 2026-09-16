@@ -60,12 +60,22 @@ template <typename DataT> using StorageT = DataT;
 #define DLSS5_LOAD_FRAG(frag, p, ldm) rocwmma::load_matrix_sync(frag, p, ldm)
 #endif
 
+#if DLSS5_GFX11
+// gfx11 f32 accumulator layout (measured on RX 7900 XT, tests/probe_gfx11.hip):
+// 8 elems/thread, column = lane%16, rows interleaved: even rows on lanes 0..15,
+// odd rows on lanes 16..31 (row = 2i + (lane>=16)).
+__device__ inline uint2 acc_coord(uint i) {
+    uint lane = threadIdx.x & 31u;
+    return uint2{2u * i + (lane >= 16u ? 1u : 0u), lane & 15u};
+}
+#else
 // gfx12 f32 accumulator layout (GPUOpen RDNA 4): 8 elems/thread,
 // column = lane%16, rows = (lane>=16 ? 8 : 0) + i.
 __device__ inline uint2 acc_coord(uint i) {
     uint lane = threadIdx.x & 31u;
     return uint2{(lane >= 16u ? 8u : 0u) + i, lane & 15u};
 }
+#endif
 
 template <typename DataT>
 struct MatrixA {
