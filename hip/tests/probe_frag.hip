@@ -60,6 +60,47 @@ __global__ void k_f8map(const u8* A, const u8* B, float* X, const uint* tab) {
     rocwmma::mma_sync(acc, a1, b1, acc);
     rocwmma::store_matrix_sync(X + o * 256u, acc, 16u, rocwmma::mem_row_major);
 }
+// Branch-free E4M3 -> f16 bits, no table, coordinates from the measured gfx11 lane map:
+// lane l holds lead-dim index (l & 15) for A, or trail index for B; the other index is
+// (l >= 16 ? 8 : 0) + i.  Codes 0x7f/0xff (NaN) decode as 480 - never produced by e4m3_byte.
+__device__ inline __half e4m3_to_half(u32 b) {
+    u32 e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 8;
+    u32 normal = ((e + 8u) << 10) | (m << 7);
+    u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
+    u32 mask = 0u - u32(e != 0u);
+    return __ushort_as_half(uint16_t(s | (normal & mask) | (sub & ~mask)));
+}
+// A row_major (memory p[r*ldm + c]): lane -> row = l&15, col = base + i
+template <typename Frag>
+__device__ inline void fillA_nb(Frag& f, const u8* p, uint ldm) {
+    uint l = threadIdx.x & 31u, row = l & 15u, base = l >= 16u ? 8u : 0u;
+    const u8* rp = p + row * ldm + base;
+    for (uint i = 0; i < 8u; i++) f[i] = rocwmma::hfloat16_t(e4m3_to_half(rp[i]));
+}
+// B col_major (memory p[c*ldm + r]): lane -> col = l&15, row = base + i
+template <typename Frag>
+__device__ inline void fillBc_nb(Frag& f, const u8* p, uint ldm) {
+    uint l = threadIdx.x & 31u, col = l & 15u, base = l >= 16u ? 8u : 0u;
+    const u8* cp = p + col * ldm + base;
+    for (uint i = 0; i < 8u; i++) f[i] = rocwmma::hfloat16_t(e4m3_to_half(cp[i]));
+}
+__global__ void k_f8nb(const u8* A, const u8* B, float* X) {
+    uint o = blockIdx.x;
+    const u8* a = A + o * 512u;
+    const u8* b = B + o * 512u;
+    FA a0, a1;
+    FBC b0, b1;
+    fillA_nb(a0, a, 32u);
+    fillA_nb(a1, a + 16, 32u);
+    fillBc_nb(b0, b, 32u);
+    fillBc_nb(b1, b + 16, 32u);
+    FragC acc;
+    rocwmma::fill_fragment(acc, 0.f);
+    rocwmma::mma_sync(acc, a0, b0, acc);
+    rocwmma::mma_sync(acc, a1, b1, acc);
+    rocwmma::store_matrix_sync(X + o * 256u, acc, 16u, rocwmma::mem_row_major);
+}
+
 __global__ void k_f8(const u8* A, const u8* B, float* X) {
     uint o = blockIdx.x;
     A8 a = A8::Load(A, o * 512u, 32);
@@ -139,7 +180,9 @@ int main() {
     time("f8", [&] { k_f8<<<blocks, 32>>>(dA8.as<u8>(), dB8.as<u8>(), dX1.as<float>()); });
     time("f16", [&] { k_f16<<<blocks, 32>>>(dA16.as<f16>(), dB16.as<f16>(), dX1.as<float>()); });
     time("f8map", [&] { k_f8map<<<blocks, 32>>>(dA8.as<u8>(), dB8.as<u8>(), dX2.as<float>(), dT.as<uint>()); });
-    std::vector<float> x1(blocks * 256ull), x2(blocks * 256ull);
+    DeviceBuf dX3(blocks * 256ull * 4);
+    time("f8nb", [&] { k_f8nb<<<blocks, 32>>>(dA8.as<u8>(), dB8.as<u8>(), dX3.as<float>()); });
+    std::vector<float> x1(blocks * 256ull), x2(blocks * 256ull), x3(blocks * 256ull);
     k_f8<<<blocks, 32>>>(dA8.as<u8>(), dB8.as<u8>(), dX1.as<float>());
     hip_check(hipDeviceSynchronize(), "f8 ref");
     dX1.download(x1.data(), x1.size() * 4);
@@ -147,5 +190,20 @@ int main() {
     size_t bad = 0;
     for (size_t i = 0; i < x1.size(); i++) bad += x1[i] != x2[i];
     std::printf("f8map vs f8 result mismatches=%zu / %zu\n", bad, x1.size());
+    dX3.download(x3.data(), x3.size() * 4);
+    bad = 0;
+    for (size_t i = 0; i < x1.size(); i++) bad += x1[i] != x3[i];
+    std::printf("f8nb  vs f8 result mismatches=%zu / %zu\n", bad, x1.size());
+    // exhaustive decode check on host
+    uint dec_bad = 0;
+    for (uint b = 0; b < 256; b++) {
+        if ((b & 0x7f) == 0x7f) continue;
+        u32 e = (b >> 3) & 15u, m = b & 7u, sg = (b & 0x80u) << 8;
+        u32 normal = ((e + 8u) << 10) | (m << 7);
+        u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
+        u32 bits = sg | (e ? normal : sub);
+        dec_bad += half_to_float(uint16_t(bits)) != from_e4m3(u8(b));
+    }
+    std::printf("host decode table check bad=%u (expect 0)\n", dec_bad);
     return 0;
 }
