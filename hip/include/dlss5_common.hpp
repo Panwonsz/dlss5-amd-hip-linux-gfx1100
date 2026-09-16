@@ -72,9 +72,9 @@ __host__ __device__ inline float F_sw(float v) {
 }
 
 __host__ __device__ inline float H_hw(float v) {
-// gfx11: use the software RNE recipe until __float2half_rn is verified
-// bit-identical on RDNA 3 (tests/probe_gfx11.hip section 4).
-#if defined(__HIP_DEVICE_COMPILE__) && !DLSS5_GFX11
+// __float2half_rn verified bit-identical to H_sw on gfx1100 too
+// (tests/probe_gfx11.hip section 4: 2^20 samples incl. ties, 0 mismatches).
+#if defined(__HIP_DEVICE_COMPILE__)
     return __half2float(__float2half_rn(v));
 #else
     return H_sw(v);

@@ -2,6 +2,8 @@
 #include "dlss5_launch.hpp"
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -186,7 +188,14 @@ struct Network70::Impl {
    hip_check(hipMemcpyAsync(history.p,host_history,size_t(N)*16,hipMemcpyHostToDevice,stream),"history upload");
   }
   counts.fill(0);for(auto&t:trace)t=Trace{};
-  auto mark=[&](int id,const float* data,uint count){++counts[id];trace[id].elements=count;if(tracing)launch_trace_f32(data,count,trace_stats.as<float>()+id*768,trace_bits.as<uint>()+id*512);};
+  // DLSS5_HIP_TIME=1: synchronize after every traced block and report host wall ms per block
+  // (includes the pools/gathers/upsamples launched since the previous block). Slows the run.
+  const bool timing=std::getenv("DLSS5_HIP_TIME")&&std::string(std::getenv("DLSS5_HIP_TIME"))!="0";
+  std::array<double,71> block_ms{};using clk=std::chrono::steady_clock;
+  if(timing)hip_check(hipStreamSynchronize(stream),"time sync");
+  auto t_last=clk::now();const auto t_start=t_last;
+  auto mark=[&](int id,const float* data,uint count){++counts[id];trace[id].elements=count;if(tracing)launch_trace_f32(data,count,trace_stats.as<float>()+id*768,trace_bits.as<uint>()+id*512);
+   if(timing){hip_check(hipStreamSynchronize(stream),"time sync");auto t=clk::now();block_ms[id]+=std::chrono::duration<double,std::milli>(t-t_last).count();t_last=t;}};
   hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
   launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
@@ -221,6 +230,9 @@ struct Network70::Impl {
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
   hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
+  if(timing){double total=std::chrono::duration<double,std::milli>(clk::now()-t_start).count();
+   for(int b=0;b<71;++b)std::fprintf(stderr,"time block=%02d ms=%.1f\n",b,block_ms[b]);
+   std::fprintf(stderr,"time total_ms=%.1f (head+download after block 70 included)\n",total);}
   if(tracing){std::vector<float> stats(71*768);std::vector<uint> bits(71*512);trace_stats.download(stats.data(),stats.size()*4);trace_bits.download(bits.data(),bits.size()*4);
    bool bad=false;for(int b=0;b<71;++b){auto&t=trace[b];t.minimum=INFINITY;t.maximum=-INFINITY;t.checked=true;
     for(int l=0;l<256;++l){t.minimum=std::min(t.minimum,stats[b*768+l*3]);t.maximum=std::max(t.maximum,stats[b*768+l*3+1]);t.sum+=stats[b*768+l*3+2];t.nonfinite+=bits[b*512+l*2];t.hash^=bits[b*512+l*2+1];}
