@@ -21,7 +21,17 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
     __shared__ u8 tile[512];
     C32 acc = C32::Splat(0.f);
-    if ((F8RES && residual_f8) || (residual && mode != 4))
+#if DLSS5_GFX11
+    // gfx11 f16-operand WMMA does not accumulate onto a fine-grid f32 residual
+    // with one rounding like gfx12 FP8 WMMA. Accumulate the E4M3 products from
+    // zero (exact on their 2^-18 grid) and add the residual once at the end,
+    // which reproduces the single-rounding reference (tests/test_linear.hip).
+    const bool late_residual = ordered == 0;
+#else
+    const bool late_residual = false;
+#endif
+    const bool has_residual = (F8RES && residual_f8) || (residual && mode != 4);
+    if (has_residual && !late_residual)
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
             if (first + rc.x < m && col < n) {
@@ -71,6 +81,20 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         } else acc.MultiplyAccumulate(a, b);
         __syncthreads();
     }
+    if (has_residual && late_residual)
+        for (uint i = 0; i < acc.Length(); ++i) {
+            uint2 rc = acc.GetCoordinate(i);
+            if (first + rc.x < m && col < n) {
+                float rv;
+                if (F8RES && residual_f8)
+                    rv = from_e4m3(residual_f8[(first + rc.x) * n + col + rc.y]);
+                else
+                    rv = HRID ? __half2float(residual_h[(first + rc.x) * n + col + rc.y])
+                              : residual[(first + rc.x) * n + col + rc.y];
+                acc.Set(i, acc.Get(i) + (matrix_residual ? rv * scales[col + rc.y]
+                                                         : H(rv * scales[col + rc.y])));
+            }
+        }
     for (uint i = 0; i < acc.Length(); ++i) {
         uint2 rc = acc.GetCoordinate(i);
         float v = acc.Get(i);
