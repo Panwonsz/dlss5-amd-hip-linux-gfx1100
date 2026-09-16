@@ -194,27 +194,26 @@ struct Network70::Impl {
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
    launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
-  launch_pool_f32_h(skip[0].as<float>(),src,s.out16.as<__half>(),W,Ht,32,960,576);
+  launch_pool_f32_h(skip[0].as<float>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576);
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
   const __half* group_in_h=s.out16.as<__half>();
    for(int g=0;g<5;++g){
    const u8* in_f8=nullptr; const __half* in_h=group_in_h;
    for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
    hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
-   uint ow=g==4?32:w/2,oh=g==4?20:h/2;
-    launch_pool_f32(src,s.b.as<float>(),w,h,c,ow,oh);
-    if(g<4)launch_linear_half_h(s.b.as<float>(),ds[g].as<__half>(),dst,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);
-    else launch_linear_half(s.b.as<float>(),head_w.as<__half>(),dst,ow*oh,c*2,c,1,1,0);
+    uint ow=g==4?32:w/2,oh=g==4?20:h/2;
+     if(g<4){launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
+     else{launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
     group_in_h=g<4?s.out16.as<__half>():nullptr;
     std::swap(src,dst);w=ow;h=oh;c*=2;
   }
   launch_gather_f32(src,map.as<int>(),dst,655360);std::swap(src,dst);
   for(int j=0;j<8;++j){vit[j].run(src,dst,s);std::swap(src,dst);mark(31+j,src,655360);}
   launch_gather_f32(src,inv.as<int>(),dst,655360);std::swap(src,dst);
-  up[0].run(src,skip[5].as<float>(),dst,s,s.out16.as<__half>());std::swap(src,dst);mark(39,src,60*36*512);
+  up[0].run(src,skip[5].as<float>(),tracing?dst:nullptr,s,s.out16.as<__half>());std::swap(src,dst);mark(39,src,60*36*512);
   const __half* dec_group_in_h=s.out16.as<__half>();
    const int decfirst[]={40,48,56,62,66},decnum[]={8,8,6,4,4};
-   for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),dst,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
+   for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
     const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
     for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
   launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),dst,s.out16.as<__half>(),W,Ht,true);std::swap(src,dst);

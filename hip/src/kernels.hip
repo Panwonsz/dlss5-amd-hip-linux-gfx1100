@@ -115,22 +115,38 @@ void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
         LAUNCH((k_qkv_norm_f32<32, 3, false>), dim3((m + 15) / 16, 1u), 192, in, nullptr, w, out,
                m, c, scales, qgain, half_squares);
         break;
-    case 64:
-        LAUNCH((k_qkv_norm_f32<64, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
-               w, out, m, c, scales, qgain, half_squares);
+    case 64: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<64, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
+                out, m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<64, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
-    case 128:
-        LAUNCH((k_qkv_norm_f32<128, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
-               w, out, m, c, scales, qgain, half_squares);
+    }
+    case 128: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<128, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
+                out, m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<128, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
-    case 256:
-        LAUNCH((k_qkv_norm_f32<256, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
-               w, out, m, c, scales, qgain, half_squares);
+    }
+    case 256: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<256, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
+                out, m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<256, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
-    case 512:
-        LAUNCH((k_qkv_norm_f32<512, 2, false>), dim3((m + 15) / 16, 3u * c / 64u), 128, in, nullptr,
-               w, out, m, c, scales, qgain, half_squares);
+    }
+    case 512: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<512, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
+                out, m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<512, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
+    }
     default:
         throw std::runtime_error("QKV norm extent");
     }
@@ -140,22 +156,38 @@ void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
     if (!m || c == 32 || !in || !out || !scales)
         throw std::runtime_error("QKV norm f8 extent");
     switch (c) {
-    case 64:
-        LAUNCH((k_qkv_norm_f32<64, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
-               w, out, m, c, scales, qgain, half_squares);
+    case 64: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<64, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
+                m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<64, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
-    case 128:
-        LAUNCH((k_qkv_norm_f32<128, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
-               w, out, m, c, scales, qgain, half_squares);
+    }
+    case 128: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<128, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
+                m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<128, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
-    case 256:
-        LAUNCH((k_qkv_norm_f32<256, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
-               w, out, m, c, scales, qgain, half_squares);
+    }
+    case 256: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<256, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
+                m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<256, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
-    case 512:
-        LAUNCH((k_qkv_norm_f32<512, 2, true>), dim3((m + 15) / 16, 3u * c / 64u), 128, nullptr, in,
-               w, out, m, c, scales, qgain, half_squares);
+    }
+    case 512: {
+        uint heads = c / 32u;
+        LAUNCH((k_qkv_norm_f32<512, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
+                m, c, scales, qgain, half_squares);
+        LAUNCH((k_qkv_norm_f32<512, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
+                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
         break;
+    }
     default:
         throw std::runtime_error("QKV norm f8 channels");
     }
@@ -563,11 +595,15 @@ void launch_fused_mh(int c, const u8* in, const u8* ffn, const u8* proj0, const 
 hipStream_t get_launch_stream() { return g_stream; }
 void launch_linear_half(const float* in,const __half* w,float* out,uint m,uint n,uint k,uint parts,int ordered,int raw){
   if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||in==out||raw<0||raw>2)throw std::runtime_error("half linear geometry/alias");
-  LAUNCH(k_linear_half,dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw);
+  LAUNCH((k_linear_half<false>),dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw);
 }
 void launch_linear_half_h(const float* in,const __half* w,float* out,__half* out_h,uint m,uint n,uint k,uint parts,int ordered,int raw){
   if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||in==out||raw<0||raw>2||!out_h)throw std::runtime_error("half linear f16 geometry/alias");
-  LAUNCH(k_linear_half,dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw,out_h);
+  LAUNCH((k_linear_half<false>),dim3((m+15)/16,n/16),32,in,w,out,m,n,k,parts,ordered,raw,out_h);
+}
+void launch_linear_half_hin(const __half* in,const __half* w,float* out,__half* out_h,uint m,uint n,uint k,uint parts,int ordered,int raw){
+  if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||!in||raw<0||raw>2)throw std::runtime_error("half linear f16-in geometry/alias");
+  LAUNCH((k_linear_half<true>),dim3((m+15)/16,n/16),32,reinterpret_cast<const float*>(in),w,out,m,n,k,parts,ordered,raw,out_h);
 }
 void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,uint n){
   if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH((k_split_f32<false>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,nullptr,n);

@@ -31,24 +31,26 @@ __device__ inline float sq_f32(float v) {
     return t;
 }
 
-template <int C, int NH, bool F8IN = false, bool HIN = false>
+template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false>
 __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
                                u8* output, uint m, uint k, const float* scales, float qgain,
-                               bool half_squares, const __half* input_h = nullptr) {
+                               bool half_squares, const __half* input_h = nullptr,
+                               uint head_base = 0u) {
     using namespace linalg;
     constexpr uint HEADS = C / 32u;
     constexpr uint COLS = 32u * NH;
     const uint first = blockIdx.x * 16u;
-    const uint head0 = blockIdx.y * NH;
+    const uint head0 = head_base + blockIdx.y * NH;
     const uint wave = threadIdx.x / 32u;
     // Single LDS buffer: the A-tile staging (512B) aliases the start of the
     // stage buffer. The tile is only read inside the K loop; stage is only
     // written after it (with a barrier between), so the aliasing is safe.
     // Cuts LDS 512+16*COLS*4 -> 16*COLS*4 (e.g. C32/NH1 2560B->2048B).
-    __shared__ float stage[16 * COLS];
+    constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 64u : COLS;
+    __shared__ float stage[16 * STAGE_COLS];
     u8* tile = reinterpret_cast<u8*>(stage);
     C32 acc = C32::Splat(0.f);
-    const uint col = blockIdx.y * COLS + wave * 16u;
+    const uint col = head0 * 32u + wave * 16u;
     // blockDim = 2*NH*32, 8 threads per input row (float4). C32 uses NH=3 so one
     // CTA computes Q+K+V and reads the input tile once; then 192 threads exist but
     // only 16*8 load, one row each. NH=1 still needs two rows per thread.
@@ -95,41 +97,44 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         acc.MultiplyAccumulate(a, b);
         __syncthreads();
     }
-    acc.StoreF32(stage, wave * 16u * 4u, COLS * 4u);
+    const uint norm_heads = head0 < 2u * HEADS
+                                ? (NH < 2u * HEADS - head0 ? NH : 2u * HEADS - head0)
+                                : 0u;
+    const uint norm_waves = 2u * norm_heads;
+    if (wave < norm_waves)
+        acc.StoreF32(stage, wave * 16u * 4u, STAGE_COLS * 4u);
     __syncthreads();
-    // 16 rows x NH heads; one thread per row-head keeps the strict channel sum order.
+    // 16 rows x normalized heads; one thread per row-head keeps the strict channel sum order.
     const uint item = threadIdx.x;
-    constexpr uint ROW_THREADS = 16 * NH;
+    const uint ROW_THREADS = 16 * norm_heads;
     if (item < ROW_THREADS) {
-        const uint row = item / NH;
-        const uint headg = head0 + (item % NH);
-        const float* s0 = &stage[row * COLS + (item % NH) * 32u];
+        const uint row = item / norm_heads;
+        const uint headg = head0 + (item % norm_heads);
+        const float* s0 = &stage[row * STAGE_COLS + (item % norm_heads) * 32u];
         const float* s1 = s0 + 16u;
         float inv = 1.f;
-        if (headg < 2u * HEADS) {
-            float sum = 0.f;
-            const float4* q0 = reinterpret_cast<const float4*>(s0);
-            const float4* q1 = reinterpret_cast<const float4*>(s1);
-            #pragma unroll
-            for (uint q = 0; q < 4u; ++q) {
-                float4 a = q0[q];
-                sum += half_squares ? sq_half_f32(a.x) : sq_f32(a.x);
-                sum += half_squares ? sq_half_f32(a.y) : sq_f32(a.y);
-                sum += half_squares ? sq_half_f32(a.z) : sq_f32(a.z);
-                sum += half_squares ? sq_half_f32(a.w) : sq_f32(a.w);
-            }
-            #pragma unroll
-            for (uint q = 0; q < 4u; ++q) {
-                float4 b = q1[q];
-                sum += half_squares ? sq_half_f32(b.x) : sq_f32(b.x);
-                sum += half_squares ? sq_half_f32(b.y) : sq_f32(b.y);
-                sum += half_squares ? sq_half_f32(b.z) : sq_f32(b.z);
-                sum += half_squares ? sq_half_f32(b.w) : sq_f32(b.w);
-            }
-            inv = rsqrtf(fmaxf(sum, 6.198883056640625e-5f));
-            if (headg < HEADS)
-                inv *= scales[headg] * qgain;
+        float sum = 0.f;
+        const float4* q0 = reinterpret_cast<const float4*>(s0);
+        const float4* q1 = reinterpret_cast<const float4*>(s1);
+        #pragma unroll
+        for (uint q = 0; q < 4u; ++q) {
+            float4 a = q0[q];
+            sum += half_squares ? sq_half_f32(a.x) : sq_f32(a.x);
+            sum += half_squares ? sq_half_f32(a.y) : sq_f32(a.y);
+            sum += half_squares ? sq_half_f32(a.z) : sq_f32(a.z);
+            sum += half_squares ? sq_half_f32(a.w) : sq_f32(a.w);
         }
+        #pragma unroll
+        for (uint q = 0; q < 4u; ++q) {
+            float4 b = q1[q];
+            sum += half_squares ? sq_half_f32(b.x) : sq_f32(b.x);
+            sum += half_squares ? sq_half_f32(b.y) : sq_f32(b.y);
+            sum += half_squares ? sq_half_f32(b.z) : sq_f32(b.z);
+            sum += half_squares ? sq_half_f32(b.w) : sq_f32(b.w);
+        }
+        inv = rsqrtf(fmaxf(sum, 6.198883056640625e-5f));
+        if (headg < HEADS)
+            inv *= scales[headg] * qgain;
         u32 w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (uint ch = 0; ch < 16u; ++ch)
             w[ch >> 2] |= u32(e4m3_byte(s0[ch] * inv)) << ((ch & 3u) * 8u);
@@ -139,6 +144,15 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         uint4* o4 = reinterpret_cast<uint4*>(out);
         o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
         o4[1] = make_uint4(w[4], w[5], w[6], w[7]);
+    }
+    if (wave >= norm_waves) {
+        const uint headg = head0 + wave / 2u;
+        u8* out = output + (size_t)first * (3u * C) + headg * 32u + (wave % 2u) * 16u;
+        for (uint i = 0; i < acc.Length(); ++i) {
+            uint2 rc = acc.GetCoordinate(i);
+            if (first + rc.x < m)
+                out[(size_t)rc.x * (3u * C) + rc.y] = e4m3_byte(acc.Get(i));
+        }
     }
 }
 

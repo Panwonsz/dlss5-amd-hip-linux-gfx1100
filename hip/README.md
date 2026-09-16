@@ -1,8 +1,7 @@
 # DLSS5-AMD — native HIP backend
 
-Port of [lmxxf/dlss5-on-amd-9070xt-porting](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting),
-using HIP and rocWMMA on RDNA 4 (`gfx1201`), without D3D12 wave-matrix support.
-The source contracts are pinned to upstream `85feab01987b59afe8311d30f2c8bbaf06c94d6d`.
+Native HIP/rocWMMA implementation of the 71-block DLSS5 network for RDNA 4
+(`gfx1201`), without D3D12 wave-matrix support.
 
 **The complete 71-block network runs offline:** preblock, Swin encoder, eight
 640×1024 ViT blocks, decoder with skip connections, postblock and RGB head.

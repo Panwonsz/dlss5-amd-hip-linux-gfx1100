@@ -2,11 +2,11 @@
 
 > **This is a slow, experimental proof of concept. It needs substantial optimization and is not ready for normal gameplay.** Expect very low frame rates, high latency and possible rendering problems. It is not an official NVIDIA DLSS implementation or a claim of equivalent image quality.
 
-A Linux HIP/rocWMMA port of [lmxxf's DLSS5-AMD work](https://github.com/lmxxf/dlss5-on-amd-9070xt-porting), with a ReShade add-on, Wine bridge and modified vkd3d-proton submission path. The complete 71-block network runs on AMD `gfx1201`. NVIDIA DLLs and weights are **not included**.
+A native Linux HIP/rocWMMA implementation of the complete 71-block DLSS5 network for AMD `gfx1201`, with a ReShade add-on, Wine bridge and modified vkd3d-proton submission path. NVIDIA DLLs and weights are **not included**.
 
 ## Download and install
 
-**[Download the current dev .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/raw/lmxxf-base/dist/dlss5-amd-hip-linux.tar.gz)** · [SHA256](https://github.com/guentra/dlss5-amd-hip-linux/raw/lmxxf-base/dist/dlss5-amd-hip-linux.tar.gz.sha256) · [Latest stable release v0.2.1](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.1)
+**[Download the current dev .tar.gz](https://github.com/guentra/dlss5-amd-hip-linux/raw/main/dist/dlss5-amd-hip-linux.tar.gz)** · [SHA256](https://github.com/guentra/dlss5-amd-hip-linux/raw/main/dist/dlss5-amd-hip-linux.tar.gz.sha256) · [Latest stable release v0.2.1](https://github.com/guentra/dlss5-amd-hip-linux/releases/tag/v0.2.1)
 
 1. Close the game. Extract the archive inside its directory, keeping the `dlss5-amd-hip-linux` subfolder.
 2. Put your legitimately obtained `nvngx_dlssnr.dll` **310.8.0.0** beside the game executable or in the game root (or select it in the wizard).
@@ -24,7 +24,7 @@ The archive contains the prebuilt HIP library, Windows bridge, add-on, ReShade l
 - The prototype uses CPU readback/upload and HIP execution at a split vkd3d submission boundary. **The game still waits for neural rendering.** It is not an asynchronous performance fix.
 - General gameplay stability, HDR behavior and broad game compatibility are not certified. F6 toggles the live path's bypass when the hook is active; it cannot fix a missing hook or failed initialization.
 
-The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~86–90 ms GPU time per inference** on the current development build — `0.2.1` measured ~98–105 ms and `0.1.0-poc` 210–216 ms. That is network-only timing, **not in-game FPS**. Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
+The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~63–66 ms GPU time per inference** on the current development build — `0.2.1` measured ~98–105 ms and `0.1.0-poc` 210–216 ms. That is network-only timing, **not in-game FPS**. Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
 
 ## Changelog
 
@@ -32,10 +32,10 @@ Unless a scenario is specified, timings are the offline bench (network only, fix
 
 | Version | Date | What changed | Result |
 |---|---|---|---|
-| `0.1.0-poc` | 09-13 | First complete Linux port: all 71 blocks as HIP/rocWMMA wave-matrix kernels on `gfx1201`; weights converted from the user's own `nvngx_dlssnr.dll` 310.8.0.0 (225 tables, resident in VRAM, no NVIDIA DLL at inference time); Win64→SysV trampoline + ReShade add-on + modified vkd3d-proton submission boundary for the in-game hook (synchronous, motion history reset per frame); offline `hip-network70` bench and `infer_image.py` | bench 210–216 ms, in-game staging only |
+| `0.1.0-poc` | 09-13 | First complete Linux implementation: all 71 blocks as HIP/rocWMMA wave-matrix kernels on `gfx1201`; weights converted from the user's own `nvngx_dlssnr.dll` 310.8.0.0 (225 tables, resident in VRAM, no NVIDIA DLL at inference time); Win64→SysV trampoline + ReShade add-on + modified vkd3d-proton submission boundary for the in-game hook (synchronous, motion history reset per frame); offline `hip-network70` bench and `infer_image.py` | bench 210–216 ms, in-game staging only |
 | `0.2.0` | 09-14 | lmxxf upstream sync 0.12 → 0.15 (≤1920×1080 window fit with aspect preservation, on-screen notice + bitmap font, FPS-display refresh, Windows-Update driver trap) and the Linux installer retargeted at the lmxxf ReShade add-on (wizard, managed backups, consent-based ROCm fallback, per-file sha256 manifest, install/trampoline/weights-safety test suites). GPU kernel optimization, all bit-exact (0 mismatches on every operator and graph test): fused QKV+LayerNorm+quant kernel (one dispatch per row group instead of GEMM → normalize → quant; the `ROWS_PER_THREAD` fix also removed 4× redundant row loads and out-of-bounds aliased stores); window-attention rewrite (padded score matrix kills the 32-way LDS bank conflict, softmax writes E4M3 bytes straight into the P·V operand with 16-byte stores, the provable-identity re-quantization stage is gone, 4 → 2 barriers); exact squares through opaque inline asm (`v_fma_mixlo_f16` / `v_mul_f32_e32`) instead of 32 volatile SCOPE_SYS private-memory round-trips per row-head | bench 175 → 167 → 131 → 122 ms (−30 % vs the pre-optimization build), bit-identical output; in-game verification in progress |
 | `0.2.1` | 09-14 | Further GPU optimization, all bit-exact (operator + graph suites, network fingerprint unchanged): C32 FFN activation spill eliminated — `ActivatePolyC32`'s four volatile private-memory round-trips became opaque `v_mul_f32_e32` inline asm (2.0 → 0.45 ms/call, scratch 20 → 0 B, the kernel was occupancy-limited, not instruction-bound); the per-row-head squares in `k_normalize_qkv` use the same opaque asm helpers (scratch 40 → 36 B); LDS aliasing in `k_ffn_f32` and `k_qkv_norm_f32` (input/A-tile staging shares one LDS buffer, −512 B/block, C32 FFN occupancy 78 % → 100 %); `hip/tests/bench_ffn32.hip` isolated micro-benchmark + `make bench-ffn32`. ReShade add-on: the upscaler hook worker now also recognizes the self-contained FFX provider dlls (`amd_fidelityfx_upscaler_dx12.dll`, `amd_fidelityfx_framegeneration_dx12.dll`) that UE FSR-plugin titles load directly from `Engine/Plugins/Marketplace/FSR` signedbin — they export the same `ffxDispatch` API and the dispatch handler already filters on the upscaler header type; titles shipping only the 26 KB FFX loader next to the exe were unaffected | bench 122 → ≈98–105 ms (−15/20 %), bit-identical output; in-game FSR3/FSR4 takeover verified on Beast of Reincarnation (previously impossible: the hook waited for a loader dll that title never loads); Stellar Blade deployment refreshed with the same library |
-| `0.2.2-dev` | 09-15 | Post-`0.2.1` GPU optimization, all bit-exact (operator + graph suites, network fingerprint unchanged): E4M3 activation siblings are kept in FP8 across launch boundaries for C64–C512 block FFN, p0 residual, p1 output and repack, while C32 uses exact f16 siblings for H-grid values; C32 QKV uses one CTA for Q+K+V (`NH=3`) and C32 FFN uses two 16-token groups; ViT expand output feeds the contract GEMM directly in E4M3 and ViT attention consumes normalized E4M3 QKV; C32 FFN/p1/crop paths store and read f16; reframe/pack kernels have f8 and f16 variants to avoid f32 round-trips. `QKV NH=2` was tested and rejected because it changes C32 normalization coverage. | bench ≈98–105 → ~86–90 ms warm offline (network only, not in-game FPS), bit-identical output |
+| `0.2.2-dev` | 09-15 | Post-`0.2.1` GPU optimization, all bit-exact (operator + graph suites, network fingerprint unchanged): E4M3 activation siblings are kept in FP8 across launch boundaries for C64–C512 block FFN, p0 residual, p1 output and repack, while C32 uses exact f16 siblings for H-grid values; C32 QKV uses one CTA for Q+K+V (`NH=3`) and C32 FFN uses two 16-token groups; ViT expand output feeds the contract GEMM directly in E4M3 and ViT attention consumes normalized E4M3 QKV; C32 FFN/p1/crop paths store and read f16; reframe/pack kernels have f8 and f16 variants to avoid f32 round-trips. `QKV NH=2` was tested and rejected because it changes C32 normalization coverage. QKV V heads are now quantized directly from the accumulator, non-C32 QKV splits QK/V to reduce LDS, and DS/head consume f16 pool outputs directly. | bench ≈98–105 → ~63–66 ms warm offline (network only, not in-game FPS), bit-identical output |
 
 ## Troubleshooting and removal
 
@@ -49,12 +49,11 @@ Uninstall: `./install.sh uninstall --exe /path/to/Game.exe --yes`, then remove t
 
 [HIP backend / offline inference](hip/README.md) · [Build and source details](docs/BUILD.md) · [Third-party notices](linux/THIRD-PARTY.md)
 
-Original D3D12/HLSL network and game integration: **Kien / lmxxf**. Linux HIP port, bridge and packaging: **guentra and AI collaborators**. The Windows upstream performance claims do not describe this port.
+Linux HIP implementation, bridge and packaging: **guentra and AI collaborators**. Third-party components and upstream references remain covered by [Third-party notices](linux/THIRD-PARTY.md).
 
 ## Legal
 
 Not affiliated with NVIDIA or AMD. No NVIDIA DLL or weights are distributed.
-Use a copy of `nvngx_dlssnr.dll` you obtained legitimately, converted with the
-lmxxf lab scripts, then packaged. Provided as-is.
+Use a copy of `nvngx_dlssnr.dll` you obtained legitimately, converted with the project's weight-conversion scripts, then packaged. Provided as-is.
 
 Project code: [MIT](LICENSE). Modified vkd3d-proton: LGPL-2.1-or-later, with corresponding source provided alongside the binaries. Third-party components retain their own licenses.

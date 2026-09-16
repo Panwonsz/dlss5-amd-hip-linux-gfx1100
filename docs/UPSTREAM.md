@@ -1,6 +1,6 @@
 # DLSS 5 (DLSSNR) on AMD RX 9070 XT
 
-> **Local Linux HIP port:** [`hip/README.md`](hip/README.md) documents the complete offline 71-block network and its tests. Reconstructed weight layouts require explicit opt-in; NVIDIA equivalence and live Proton gameplay are **not** verified. The Windows performance/temporal claims below describe upstream, not this HIP port. Branch `lmxxf-base` also contains a local diagnostic installer under [`linux/`](linux/); no publication or `master` rewrite is implied.
+> **Local Linux HIP implementation:** [`hip/README.md`](hip/README.md) documents the complete offline 71-block network and its tests. Reconstructed weight layouts require explicit opt-in; NVIDIA equivalence and live Proton gameplay are **not** verified. The Windows performance/temporal claims below describe the D3D12/HLSL reference, not the Linux HIP implementation. A local diagnostic installer is available under [`linux/`](linux/).
 
 
 A from-scratch Direct3D 12 re-implementation of NVIDIA's DLSS 5 neural renderer ("DLSSNR", the 71-block

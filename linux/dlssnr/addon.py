@@ -25,7 +25,7 @@ def build(output: Path | None = None) -> Path:
     root = repo_root()
     script = root / 'scripts' / 'build-addon-oneclick.sh'
     if not script.is_file():
-        raise RuntimeError(f'Missing {script}; run this from the lmxxf-base tree')
+        raise RuntimeError(f'Missing {script}; run this from the repository tree')
     mingw_cxx()
     output = Path(output).expanduser() if output else root / 'linux' / 'build' / 'dlss5-amd.addon64'
     output.parent.mkdir(parents=True, exist_ok=True)

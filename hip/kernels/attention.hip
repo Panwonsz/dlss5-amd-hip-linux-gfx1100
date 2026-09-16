@@ -22,7 +22,8 @@ __device__ inline uint window_pixel(uint window, uint token, uint width) {
 // (e4m3_byte is the identity on E4M3-grid values, so the separate re-quant pass
 // is numerically redundant) as 16B stores; phase 3 is pure MMAs.
 template <int C>
-__global__ void k_window_attention(const u8* qkv, const float* bias, u8* output, uint width,
+__global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, const float* bias,
+                                                             u8* output, uint width,
                                    uint height, uint packed, bool direct_f8 = false) {
     using namespace linalg;
     constexpr int HEADS = C / 32;

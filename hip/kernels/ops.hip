@@ -394,7 +394,8 @@ __global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c,
         float bottom = H(src[base + w * c] + src[base + (w + 1) * c]);
         v = from_e4m3(e4m3_byte(H(H(top + bottom) * .25f)));
     }
-    dst[i] = v;
+    if (dst)
+        dst[i] = v;
     if (dst_h)
         dst_h[i] = __float2half_rn(v);
 }
@@ -402,35 +403,43 @@ __global__ void k_pool_f32(const float* src, float* dst, uint w, uint h, uint c,
 // True half operands for ViT QKV, decoder entry and pool/head matrices.
 // partitions reproduce the fast shader's independent K reductions; ordered
 // rounds after each K32 only for the head/DS reference path.
+template <bool HIN = false>
 __global__ void k_linear_half(const float* input,const __half* weights,float* output,
   uint m,uint n,uint k,uint partitions,int ordered,int raw,__half* output_h=nullptr) {
  using namespace linalg;
  uint first=blockIdx.x*16,col=blockIdx.y*16;
  __shared__ __half tile[512];
  C32 total=C32::Splat(0.f);
-   for(uint part=0;part<partitions;++part){
-   C32 acc=C32::Splat(0.f);
-   for(uint g=part*(k/32/partitions);g<(part+1)*(k/32/partitions);++g){
-    {
-     const uint col=(threadIdx.x%8u)*4u;
-     for(uint r=threadIdx.x/8u;r<16;r+=4){
-      const uint row=first+r;
-      const float4 v=row<m?*reinterpret_cast<const float4*>(input+row*k+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
-      const __half h0=__float2half(v.x),h1=__float2half(v.y),h2=__float2half(v.z),h3=__float2half(v.w);
-      *reinterpret_cast<uint2*>(tile+r*32u+col)=
-       uint2(u32(__half_as_ushort(h0))|u32(__half_as_ushort(h1))<<16,
-             u32(__half_as_ushort(h2))|u32(__half_as_ushort(h3))<<16);
+    for(uint part=0;part<partitions;++part){
+    C32 acc=C32::Splat(0.f);
+    for(uint g=part*(k/32/partitions);g<(part+1)*(k/32/partitions);++g){
+     {
+      const uint col=(threadIdx.x%8u)*4u;
+      for(uint r=threadIdx.x/8u;r<16;r+=4){
+       const uint row=first+r;
+       if constexpr (HIN) {
+        const uint2 packed=row<m
+          ? *reinterpret_cast<const uint2*>(reinterpret_cast<const __half*>(input)+row*k+g*32u+col)
+          : uint2{0u,0u};
+        *reinterpret_cast<uint2*>(tile+r*32u+col)=packed;
+       } else {
+        const float4 v=row<m?*reinterpret_cast<const float4*>(input+row*k+g*32u+col):make_float4(0.f,0.f,0.f,0.f);
+        const __half h0=__float2half(v.x),h1=__float2half(v.y),h2=__float2half(v.z),h3=__float2half(v.w);
+        *reinterpret_cast<uint2*>(tile+r*32u+col)=
+         uint2(u32(__half_as_ushort(h0))|u32(__half_as_ushort(h1))<<16,
+               u32(__half_as_ushort(h2))|u32(__half_as_ushort(h3))<<16);
+       }
+      }
      }
-    }
-    __syncthreads();
-   A16 a=A16::Load(tile,0,64);B16 b=B16::LoadRow(weights,((col/16)*(k/32)+g)*1024,32);
-   if(ordered){C32 p=Multiply(a,b);for(uint i=0;i<acc.Length();++i)acc.Set(i,H(acc.Get(i)+p.Get(i)));}
-   else acc.MultiplyAccumulate(a,b);
+     __syncthreads();
+    A16 a=A16::Load(tile,0,64);B16 b=B16::LoadRow(weights,((col/16)*(k/32)+g)*1024,32);
+    if(ordered){C32 p=Multiply(a,b);for(uint i=0;i<acc.Length();++i)acc.Set(i,H(acc.Get(i)+p.Get(i)));}
+    else acc.MultiplyAccumulate(a,b);
    __syncthreads();
   }
   for(uint i=0;i<total.Length();++i)total.Set(i,total.Get(i)+acc.Get(i));
  }
-  for(uint i=0;i<total.Length();++i){uint2 rc=total.GetCoordinate(i);if(first+rc.x<m){float v=total.Get(i);float out=raw==2?v:raw==1?H(v):from_e4m3(e4m3_byte(H(v)));output[(first+rc.x)*n+col+rc.y]=out;if(output_h)output_h[(first+rc.x)*n+col+rc.y]=__float2half_rn(out);}}
+  for(uint i=0;i<total.Length();++i){uint2 rc=total.GetCoordinate(i);if(first+rc.x<m){float v=total.Get(i);float out=raw==2?v:raw==1?H(v):from_e4m3(e4m3_byte(H(v)));if(output)output[(first+rc.x)*n+col+rc.y]=out;if(output_h)output_h[(first+rc.x)*n+col+rc.y]=__float2half_rn(out);}}
 }
 
 // Split FFWD group parallel, logical window-major input/output. No opaque
@@ -490,7 +499,7 @@ __global__ void k_up_f32(const float* lo,const float* skip,const float* scale,fl
   uint ch=i%c,p=i/c,x=p%ow,y=p/ow;
   float v=H(lo[((y/2)*iw+x/2)*c+ch]+from_e4m3(e4m3_byte(skip[i]))*scale[ch]);
   float r=c==32?v:from_e4m3(e4m3_byte(v));
-  out[i]=r;
+  if(out)out[i]=r;
   if(out_h)out_h[i]=__float2half_rn(r);
 }
 __global__ void k_post_merge_f32(const float* low,const float* pre,const float* scales,float* out,uint w,uint h,bool main8_low = false,__half* out_h=nullptr){
