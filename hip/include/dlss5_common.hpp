@@ -11,6 +11,14 @@
 #include <cstring>
 #endif
 
+// RDNA 3 targets: no FP8 wave-matrix ops or hardware E4M3 conversion.
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
+    defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+#define DLSS5_GFX11 1
+#else
+#define DLSS5_GFX11 0
+#endif
+
 namespace dlss5 {
 
 using u32 = uint32_t;
@@ -71,7 +79,7 @@ __host__ __device__ inline float H_hw(float v) {
 #endif
 }
 __host__ __device__ inline float F_hw(float v) {
-#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__HIP_DEVICE_COMPILE__) && !DLSS5_GFX11
     return float(__hip_fp8_e4m3(v));
 #else
     return F_sw(v);
@@ -125,7 +133,7 @@ __host__ __device__ inline float ActivatePolyC32(float v) {
 // and 4M random values, hip/tests/test_e4m3_hw.hip); the software path
 // stays as the non-finite fallback.
 __host__ __device__ inline u8 e4m3_byte(float v) {
-#if defined(__HIP_DEVICE_COMPILE__)
+#if defined(__HIP_DEVICE_COMPILE__) && !DLSS5_GFX11
     if ((as_u32(v) & 0x7fffffffu) < 0x7f800000u)
         return u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
 #endif
