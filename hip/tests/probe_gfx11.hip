@@ -8,6 +8,7 @@
 #include "dlss5_runtime.hpp"
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 using namespace dlss5;
@@ -32,6 +33,15 @@ __global__ void k_probe_mul(const u8* A, const u8* B, float* X) {
     B8 b = B8::LoadCol(B, 0, 32);
     C32 c = Multiply(a, b);
     c.StoreF32(X, 0, 16 * 4);
+}
+
+__global__ void k_probe_half(const float* x, float* hw, float* sw, float* prod, const float* a,
+                             const float* b, uint n) {
+    uint i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    hw[i] = __half2float(__float2half_rn(x[i]));
+    sw[i] = H_sw(x[i]);
+    prod[i] = H_sw(a[i] * b[i]);
 }
 
 static std::vector<float> run_mul(const std::vector<u8>& Ah, const std::vector<u8>& Bh) {
@@ -139,6 +149,46 @@ int main() {
         }
         std::printf("[3] codes 0x%02x..0x%02x: not-bit-equal=%d/256 max_rel_err=%.3g  sample gpu=%.9g cpu=%.9g\n",
                     rg[0], rg[1], neq, maxrel, g[5], ref[5]);
+    }
+
+    // ---- 4) f16 RNE: hardware __float2half_rn vs software H_sw ----
+    {
+        const uint n = 1u << 20;
+        std::vector<float> x(n), a(n), b(n), hw(n), sw(n), prod(n);
+        for (uint i = 0; i < n; i++) {
+            if (i < 64 * 64) { // exact residual products from tests/test_linear.hip
+                a[i] = float(int(i % 13) - 6) * .211f;
+                b[i] = H_sw(float(int((i / 64) % 11) - 5) * .073f);
+            } else {
+                a[i] = float(int32_t(rnd())) * 1e-7f;
+                b[i] = float(int32_t(rnd() >> 4)) * 1e-9f;
+            }
+            float e = float(int(rnd() % 44) - 28); // 2^-28 .. 2^15
+            float m = 1.f + float(rnd() % 4096) / 4096.f;
+            if (i % 3 == 0) m = 1.f + float(rnd() % 1024 * 2 + 1) / 2048.f; // exact f16 ties
+            x[i] = std::ldexp(m, int(e)) * ((rnd() & 1) ? -1.f : 1.f);
+        }
+        DeviceBuf dx(n * 4), dh(n * 4), ds(n * 4), dp(n * 4), da(n * 4), db(n * 4);
+        dx.upload(x.data(), n * 4); da.upload(a.data(), n * 4); db.upload(b.data(), n * 4);
+        uint blocks = (n + 255) / 256;
+        k_probe_half<<<blocks, 256>>>(dx.as<float>(), dh.as<float>(), ds.as<float>(), dp.as<float>(),
+                                      da.as<float>(), db.as<float>(), n);
+        hip_check(hipDeviceSynchronize(), "probe_half");
+        dh.download(hw.data(), n * 4); ds.download(sw.data(), n * 4); dp.download(prod.data(), n * 4);
+        uint hw_bad = 0, sw_bad = 0, prod_bad = 0, shown = 0;
+        for (uint i = 0; i < n; i++) {
+            float ref = H_sw(x[i]);
+            bool hb = std::memcmp(&hw[i], &ref, 4) != 0, sb = std::memcmp(&sw[i], &ref, 4) != 0;
+            hw_bad += hb; sw_bad += sb;
+            float pr = H_sw(a[i] * b[i]);
+            prod_bad += std::memcmp(&prod[i], &pr, 4) != 0;
+            if (hb && shown < 8) {
+                std::printf("    x=%.9g host=%.9g gpu_hw=%.9g\n", x[i], ref, hw[i]);
+                shown++;
+            }
+        }
+        std::printf("[4] f16 RNE n=%u  hw_mismatch=%u  sw_mismatch=%u  H(a*b)_mismatch=%u\n", n, hw_bad,
+                    sw_bad, prod_bad);
     }
     return 0;
 }
