@@ -7,6 +7,7 @@ static bool fit_small_input();
 #include "native_lab_paths.h"
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>
 #include <d3d12.h>
 #include <atomic>
 #include <cstdio>
@@ -461,18 +462,23 @@ if(module){
  // Do not retry an existing-hook conflict or modify another addon's hook.
  if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){wchar_t mp[MAX_PATH]{};GetModuleFileNameW(module?module:xess,mp,MAX_PATH);fprintf(f,"pid=%lu hook_status=%u upscaler=%s module=%ls target=%p\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess",mp,reinterpret_cast<void*>(target));fclose(f);}
  if(module&&s==MH_OK){
-  /* Keep watching: hook ffxDispatch in every other FFX provider dll that appears later (UE FSR plugin upscaler/framegen dlls). */
-  const wchar_t*names[]={L"amd_fidelityfx_dx12.dll",L"amd_fidelityfx_loader_dx12.dll",L"amd_fidelityfx_upscaler_dx12.dll",L"amd_fidelityfx_framegeneration_dx12.dll"};
+  /* Keep watching: hook ffxDispatch in EVERY loaded module that exports it, matched by module handle, not by name
+     (OptiScaler loads its own amd_fidelityfx_dx12.dll from its folder next to the game's copy with the same name). */
   using Detour=uint32_t(*)(void**,const Header*);Detour detours[4]={&dispatch_x0,&dispatch_x1,&dispatch_x2,&dispatch_x3};
-  HMODULE hooked[5]{module};unsigned nhooked=1,nslot=0;
-  for(;nslot<4;Sleep(500)){
-   for(auto*name:names){HMODULE m=GetModuleHandleW(name);if(!m)continue;bool seen=false;for(unsigned k=0;k<nhooked;k++)seen|=hooked[k]==m;if(seen)continue;
-    hooked[nhooked++]=m;auto t=GetProcAddress(m,"ffxDispatch");
-    auto es=t?MH_CreateHook(reinterpret_cast<void*>(t),reinterpret_cast<void*>(detours[nslot]),reinterpret_cast<void**>(&extra_original[nslot])):MH_ERROR_NOT_EXECUTABLE;if(es==MH_OK)es=MH_EnableHook(reinterpret_cast<void*>(t));
+  HMODULE hooked[64]{module};unsigned nhooked=1,nslot=0;
+  for(;nslot<4&&nhooked<64;Sleep(500)){
+   HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPMODULE,GetCurrentProcessId());if(snap==INVALID_HANDLE_VALUE)continue;
+   MODULEENTRY32W me{};me.dwSize=sizeof me;
+   for(BOOL ok=Module32FirstW(snap,&me);ok&&nslot<4&&nhooked<64;ok=Module32NextW(snap,&me)){
+    HMODULE m=me.hModule;bool seen=false;for(unsigned k=0;k<nhooked;k++)seen|=hooked[k]==m;if(seen)continue;
+    auto t=GetProcAddress(m,"ffxDispatch");if(!t)continue;
+    hooked[nhooked++]=m;
+    auto es=MH_CreateHook(reinterpret_cast<void*>(t),reinterpret_cast<void*>(detours[nslot]),reinterpret_cast<void**>(&extra_original[nslot]));if(es==MH_OK)es=MH_EnableHook(reinterpret_cast<void*>(t));
     if(es==MH_OK)nslot++;
-    if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){wchar_t mp2[MAX_PATH]{};GetModuleFileNameW(m,mp2,MAX_PATH);fprintf(f,"pid=%lu extra_hook_status=%u module=%ls target=%p\n",GetCurrentProcessId(),unsigned(es),mp2,reinterpret_cast<void*>(t));fclose(f);}
-    if(nhooked>=5||nslot>=4)break;}
-   if(nhooked>=5)break;}
+    if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu extra_hook_status=%u module=%ls target=%p\n",GetCurrentProcessId(),unsigned(es),me.szExePath,reinterpret_cast<void*>(t));fclose(f);}
+   }
+   CloseHandle(snap);
+  }
  }
  return s==MH_OK?0:4;
 }
