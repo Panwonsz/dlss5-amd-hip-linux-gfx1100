@@ -173,6 +173,12 @@ static bool neural_desc_ok(const D3D12_RESOURCE_DESC&d){
   &&d.MipLevels==1&&d.DepthOrArraySize==1&&d.SampleDesc.Count==1&&NativeIsGameColor(d.Format);
 }
 static uint32_t dispatch(void**context,const Header*h){
+ /* Diagnostic: record the first dispatch types whatever they are (a newer FFX SDK may use other upscale type ids). */
+ {static std::atomic<unsigned>seen{0};const unsigned k=seen.fetch_add(1);
+  if(k<48||(k&(k-1))==0)if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){
+   uint64_t t=0,t2=0;const Header*nx=nullptr;SIZE_T got=0;
+   if(h&&ReadProcessMemory(GetCurrentProcess(),h,&t,8,&got)&&got==8){ReadProcessMemory(GetCurrentProcess(),reinterpret_cast<const char*>(h)+8,&nx,8,&got);if(nx)ReadProcessMemory(GetCurrentProcess(),nx,&t2,8,&got);}
+   fprintf(f,"pid=%lu kind=dispatch_seen n=%u context=%p header=%p type=%016llx next_type=%016llx\n",GetCurrentProcessId(),k,static_cast<void*>(context),static_cast<void*>(const_cast<Header*>(h)),(unsigned long long)t,(unsigned long long)t2);fclose(f);}}
  if(!h||(h->type&0x00ffffffu)!=0x00010001u)return original(context,h);
  /* Select the first upscaler context until it is destroyed (including its size-error notice). A following FSR4 (even when its output
     also fits 1080p) must not replace the input stage's motion, pending work or status text. */
@@ -429,7 +435,7 @@ static DWORD WINAPI worker(void*){
 #endif
  s=MH_CreateHook(reinterpret_cast<void*>(target),reinterpret_cast<void*>(&dispatch),reinterpret_cast<void**>(&original));if(s==MH_OK)s=MH_EnableHook(reinterpret_cast<void*>(target));
  // Do not retry an existing-hook conflict or modify another addon's hook.
- if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu hook_status=%u upscaler=%s\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess");fclose(f);}return s==MH_OK?0:4;
+ if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){wchar_t mp[MAX_PATH]{};GetModuleFileNameW(module?module:xess,mp,MAX_PATH);fprintf(f,"pid=%lu hook_status=%u upscaler=%s module=%ls target=%p\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess",mp,reinterpret_cast<void*>(target));fclose(f);}return s==MH_OK?0:4;
 }
 // Before the game creates its D3D12 device: select the private Agility 721 runtime shipped in
 // the game folder and enable the experimental shader-model feature so SM6.10 wave-matrix PSOs
