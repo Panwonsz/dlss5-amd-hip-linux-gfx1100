@@ -405,6 +405,18 @@ static void barrier(reshade::api::command_list*c,uint32_t count,const reshade::a
   }ReleaseSRWLockExclusive(&lock);
  }
 }
+/* Diagnostic: log every other ffx API call (create/query/configure) with header type and return code. */
+using FfxCreate=uint32_t(*)(void**,const Header*,const void*);
+using FfxQueryCfg=uint32_t(*)(void**,const Header*);
+static FfxCreate original_create{};static FfxQueryCfg original_query{},original_configure{};
+static void diag_log(const char*what,void**ctx,const Header*h,uint32_t rc){
+ static std::atomic<unsigned>n{0};const unsigned k=n.fetch_add(1);if(k>=256)return;
+ uint64_t t=0;SIZE_T got=0;if(h)ReadProcessMemory(GetCurrentProcess(),h,&t,8,&got);
+ if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu kind=%s n=%u context=%p type=%016llx rc=%u\n",GetCurrentProcessId(),what,k,static_cast<void*>(ctx),(unsigned long long)t,rc);fclose(f);}
+}
+static uint32_t diag_create(void**c,const Header*h,const void*a){uint32_t r=original_create(c,h,a);diag_log("ffx_create",c,h,r);return r;}
+static uint32_t diag_query(void**c,const Header*h){uint32_t r=original_query(c,h);diag_log("ffx_query",c,h,r);return r;}
+static uint32_t diag_configure(void**c,const Header*h){uint32_t r=original_configure(c,h);diag_log("ffx_configure",c,h,r);return r;}
 static DWORD WINAPI worker(void*){
   // Whichever upscaler dll the title loads first: the FFX SDK 1.x single dll (Stellar Blade), the FSR 4 SDK loader (Magpie's FSR3/FSR4
   // effects: amd_fidelityfx_loader_dx12.dll exports ffxDispatch and forwards to the provider dll), or the self-contained FFX provider
@@ -430,6 +442,11 @@ static DWORD WINAPI worker(void*){
    if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu fit_context_destroy_hook=%u\n",GetCurrentProcessId(),unsigned(ds));fclose(f);}
    if(ds!=MH_OK)return 5;
   }
+if(module){
+  struct{const char*name;void*detour;void**orig;}extra[]={{"ffxCreateContext",reinterpret_cast<void*>(&diag_create),reinterpret_cast<void**>(&original_create)},{"ffxQuery",reinterpret_cast<void*>(&diag_query),reinterpret_cast<void**>(&original_query)},{"ffxConfigure",reinterpret_cast<void*>(&diag_configure),reinterpret_cast<void**>(&original_configure)}};
+  for(auto&e:extra){auto fn=GetProcAddress(module,e.name);auto es=fn?MH_CreateHook(reinterpret_cast<void*>(fn),e.detour,e.orig):MH_ERROR_NOT_EXECUTABLE;if(es==MH_OK)es=MH_EnableHook(reinterpret_cast<void*>(fn));
+   if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){fprintf(f,"pid=%lu diag_hook=%s status=%u\n",GetCurrentProcessId(),e.name,unsigned(es));fclose(f);}}
+ }
 #ifdef NATIVE_ORDER_NEURAL
  if(!module){NativeMotionSign()=-1.f;cross_thread_submit=true;s=MH_CreateHook(reinterpret_cast<void*>(target),reinterpret_cast<void*>(&xess_execute),reinterpret_cast<void**>(&original_xess));}else
 #endif
