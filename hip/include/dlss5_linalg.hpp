@@ -33,17 +33,7 @@ template <typename DataT> using StorageT = typename FragStorage<DataT>::type;
 template <typename DataT>
 constexpr bool kDecodeE4M3 = rocwmma::is_same_v<DataT, float8_t>;
 
-// Branch-free E4M3 byte -> f16 (exact for every code; 0x7f/0xff -> f16 NaN).
-// Integer-only so the 32 lanes vectorize; a private f16[256] + load_matrix_sync
-// was ~19x slower (tests/probe_frag.hip: 129 vs 2471 GFLOPS).
-__device__ inline __half e4m3_to_half(u32 b) {
-    u32 e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 8;
-    u32 normal = ((e + 8u) << 10) | (m << 7);
-    u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
-    u32 mask = 0u - u32(e != 0u);
-    u32 nan = 0u - u32((b & 0x7fu) == 0x7fu);
-    return __ushort_as_half(uint16_t(s | (normal & mask) | (sub & ~mask) | (nan & 0x7e00u)));
-}
+// e4m3_to_half(): dlss5_common.hpp
 
 // gfx11 fragment element map (measured, tests/probe_frag.hip): 8 elements per lane.
 // matrix_a: lane l holds row (l & 15), columns base..base+7 with base = l >= 16 ? 8 : 0.

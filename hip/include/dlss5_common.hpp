@@ -56,6 +56,56 @@ __host__ __device__ inline float H_sw(float v) {
     return as_f32(sg | (r >= 0x47800000u ? 0x7f800000u : r));
 }
 
+#if DLSS5_GFX11
+// ---- gfx11 branch-free numerics -------------------------------------------------
+// gfx11 has no hardware E4M3 conversion. Branchy scalar code in wave kernels does
+// not vectorize across lanes (tests/probe_frag.hip), so these integer/mask versions
+// replace the software paths in device code. All three were verified bit-identical
+// to the originals on the host for all 2^32 float inputs (e4m3_byte, F) and all
+// 256 codes (from_e4m3).
+__device__ inline u32 dlss5_mask(bool c) { return 0u - u32(c); }
+// Branch-free E4M3 byte -> f16 (exact for every code; 0x7f/0xff -> f16 NaN).
+// Integer-only so the 32 lanes vectorize; a private f16[256] + load_matrix_sync
+// was ~19x slower (tests/probe_frag.hip: 129 vs 2471 GFLOPS).
+__device__ inline __half e4m3_to_half(u32 b) {
+    u32 e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 8;
+    u32 normal = ((e + 8u) << 10) | (m << 7);
+    u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
+    u32 mask = 0u - u32(e != 0u);
+    u32 nan = 0u - u32((b & 0x7fu) == 0x7fu);
+    return __ushort_as_half(uint16_t(s | (normal & mask) | (sub & ~mask) | (nan & 0x7e00u)));
+}
+
+__device__ inline u8 e4m3_byte_nb(float v) {
+    u32 b = as_u32(v), a = b & 0x7fffffffu, sg = (b >> 24) & 0x80u;
+    u32 q = u32(nearbyintf(fminf(fabsf(v), 1.f) * 512.f));
+    u32 r = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
+    u32 cn = ((r >> 23) - 120u) * 8u + ((r >> 20) & 7u);
+    u32 mc = dlss5_mask(cn > 126u);
+    cn = (cn & ~mc) | (126u & mc);
+    u32 ms = dlss5_mask(a < 0x3c800000u), mt = dlss5_mask(a >= 0x43e00000u),
+        mn = dlss5_mask(a > 0x7f800000u);
+    u32 code = (q & ms) | (cn & ~ms);
+    code = (code & ~mt) | (126u & mt);
+    code = (code & ~mn) | (127u & mn);
+    return u8(sg | code);
+}
+__device__ inline float F_nb(float v) {
+    u32 bits = as_u32(v), a = bits & 0x7fffffffu, s = bits & 0x80000000u;
+    u32 sub = as_u32(nearbyintf(fminf(fabsf(v), 1.f) * 512.f) / 512.f);
+    u32 r = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
+    u32 mr = dlss5_mask(r > 0x43e00000u);
+    r = (r & ~mr) | (0x43e00000u & mr); // clamp to 448
+    u32 ms = dlss5_mask(a < 0x3c800000u), mt = dlss5_mask(a >= 0x43e00000u),
+        mi = dlss5_mask(a >= 0x7f800000u);
+    u32 mag = (sub & ms) | (r & ~ms);
+    mag = (mag & ~mt) | (0x43e00000u & mt);
+    u32 out = s | mag;
+    out = (out & ~mi) | (bits & mi); // inf/NaN pass through
+    return as_f32(out);
+}
+#endif
+
 // Software E4M3FN RNE (HLSL Ffast / NativeFastFp8).
 __host__ __device__ inline float F_sw(float v) {
     u32 bits = as_u32(v), a = bits & 0x7fffffffu;
@@ -81,7 +131,9 @@ __host__ __device__ inline float H_hw(float v) {
 #endif
 }
 __host__ __device__ inline float F_hw(float v) {
-#if defined(__HIP_DEVICE_COMPILE__) && !DLSS5_GFX11
+#if defined(__HIP_DEVICE_COMPILE__) && DLSS5_GFX11
+    return F_nb(v);
+#elif defined(__HIP_DEVICE_COMPILE__)
     return float(__hip_fp8_e4m3(v));
 #else
     return F_sw(v);
@@ -135,6 +187,9 @@ __host__ __device__ inline float ActivatePolyC32(float v) {
 // and 4M random values, hip/tests/test_e4m3_hw.hip); the software path
 // stays as the non-finite fallback.
 __host__ __device__ inline u8 e4m3_byte(float v) {
+#if defined(__HIP_DEVICE_COMPILE__) && DLSS5_GFX11
+    return e4m3_byte_nb(v);
+#endif
 #if defined(__HIP_DEVICE_COMPILE__) && !DLSS5_GFX11
     if ((as_u32(v) & 0x7fffffffu) < 0x7f800000u)
         return u8(__builtin_amdgcn_cvt_pk_fp8_f32(__builtin_amdgcn_fmed3f(v, 448.f, -448.f), 0.f, 0, false) & 0xffu);
@@ -153,6 +208,9 @@ __host__ __device__ inline u8 e4m3_byte(float v) {
 }
 
 __host__ __device__ inline float from_e4m3(u8 b) {
+#if defined(__HIP_DEVICE_COMPILE__) && DLSS5_GFX11
+    return __half2float(e4m3_to_half(b));
+#endif
     u32 e = (b >> 3) & 15u, m = b & 7u;
     if (e == 15u && m == 7u)
         return as_f32(0x7fc00000u | (u32(b & 0x80u) << 24));
