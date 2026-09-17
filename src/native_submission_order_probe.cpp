@@ -172,7 +172,7 @@ static bool neural_desc_ok(const D3D12_RESOURCE_DESC&d){
  return d.Dimension==D3D12_RESOURCE_DIMENSION_TEXTURE2D&&w>=16&&h>=16&&w<=7680&&h<=4320
   &&d.MipLevels==1&&d.DepthOrArraySize==1&&d.SampleDesc.Count==1&&NativeIsGameColor(d.Format);
 }
-static uint32_t dispatch(void**context,const Header*h){
+static uint32_t dispatch_impl(Dispatch original,void**context,const Header*h){
  /* Diagnostic: record the first dispatch types whatever they are (a newer FFX SDK may use other upscale type ids). */
  {static std::atomic<unsigned>seen{0};const unsigned k=seen.fetch_add(1);
   if(k<48||(k&(k-1))==0)if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){
@@ -405,6 +405,13 @@ static void barrier(reshade::api::command_list*c,uint32_t count,const reshade::a
   }ReleaseSRWLockExclusive(&lock);
  }
 }
+static uint32_t dispatch(void**context,const Header*h){return dispatch_impl(original,context,h);}
+/* Additional FFX providers (e.g. UE FSR plugin dlls loaded after a top-level amd_fidelityfx_dx12.dll): one slot each. */
+static Dispatch extra_original[4]{};
+static uint32_t dispatch_x0(void**c,const Header*h){return dispatch_impl(extra_original[0],c,h);}
+static uint32_t dispatch_x1(void**c,const Header*h){return dispatch_impl(extra_original[1],c,h);}
+static uint32_t dispatch_x2(void**c,const Header*h){return dispatch_impl(extra_original[2],c,h);}
+static uint32_t dispatch_x3(void**c,const Header*h){return dispatch_impl(extra_original[3],c,h);}
 /* Diagnostic: log every other ffx API call (create/query/configure) with header type and return code. */
 using FfxCreate=uint32_t(*)(void**,const Header*,const void*);
 using FfxQueryCfg=uint32_t(*)(void**,const Header*);
@@ -452,7 +459,22 @@ if(module){
 #endif
  s=MH_CreateHook(reinterpret_cast<void*>(target),reinterpret_cast<void*>(&dispatch),reinterpret_cast<void**>(&original));if(s==MH_OK)s=MH_EnableHook(reinterpret_cast<void*>(target));
  // Do not retry an existing-hook conflict or modify another addon's hook.
- if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){wchar_t mp[MAX_PATH]{};GetModuleFileNameW(module?module:xess,mp,MAX_PATH);fprintf(f,"pid=%lu hook_status=%u upscaler=%s module=%ls target=%p\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess",mp,reinterpret_cast<void*>(target));fclose(f);}return s==MH_OK?0:4;
+ if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){wchar_t mp[MAX_PATH]{};GetModuleFileNameW(module?module:xess,mp,MAX_PATH);fprintf(f,"pid=%lu hook_status=%u upscaler=%s module=%ls target=%p\n",GetCurrentProcessId(),unsigned(s),module?"ffx":"xess",mp,reinterpret_cast<void*>(target));fclose(f);}
+ if(module&&s==MH_OK){
+  /* Keep watching: hook ffxDispatch in every other FFX provider dll that appears later (UE FSR plugin upscaler/framegen dlls). */
+  const wchar_t*names[]={L"amd_fidelityfx_dx12.dll",L"amd_fidelityfx_loader_dx12.dll",L"amd_fidelityfx_upscaler_dx12.dll",L"amd_fidelityfx_framegeneration_dx12.dll"};
+  using Detour=uint32_t(*)(void**,const Header*);Detour detours[4]={&dispatch_x0,&dispatch_x1,&dispatch_x2,&dispatch_x3};
+  HMODULE hooked[5]{module};unsigned nhooked=1,nslot=0;
+  for(;nslot<4;Sleep(500)){
+   for(auto*name:names){HMODULE m=GetModuleHandleW(name);if(!m)continue;bool seen=false;for(unsigned k=0;k<nhooked;k++)seen|=hooked[k]==m;if(seen)continue;
+    hooked[nhooked++]=m;auto t=GetProcAddress(m,"ffxDispatch");
+    auto es=t?MH_CreateHook(reinterpret_cast<void*>(t),reinterpret_cast<void*>(detours[nslot]),reinterpret_cast<void**>(&extra_original[nslot])):MH_ERROR_NOT_EXECUTABLE;if(es==MH_OK)es=MH_EnableHook(reinterpret_cast<void*>(t));
+    if(es==MH_OK)nslot++;
+    if(FILE*f=_wfopen(NativeLabPath(L"logs\\native-submission-order.txt").c_str(),L"ab")){wchar_t mp2[MAX_PATH]{};GetModuleFileNameW(m,mp2,MAX_PATH);fprintf(f,"pid=%lu extra_hook_status=%u module=%ls target=%p\n",GetCurrentProcessId(),unsigned(es),mp2,reinterpret_cast<void*>(t));fclose(f);}
+    if(nhooked>=5||nslot>=4)break;}
+   if(nhooked>=5)break;}
+ }
+ return s==MH_OK?0:4;
 }
 // Before the game creates its D3D12 device: select the private Agility 721 runtime shipped in
 // the game folder and enable the experimental shader-model feature so SM6.10 wave-matrix PSOs
