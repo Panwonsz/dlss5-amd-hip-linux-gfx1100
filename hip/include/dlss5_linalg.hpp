@@ -24,7 +24,7 @@ using FragC = rocwmma::fragment<accumulator, 16, 16, 16, float>;
 // RDNA 3 (gfx11): rocWMMA has no FP8 WMMA, only f16 operands with an f32
 // accumulator (same 16x16x16 block, wave32). E4M3 codes (|v| <= 448, 3-bit
 // mantissa) are exactly representable in f16, so FP8 matrices are decoded
-// into f16 fragments at load time. Buffers, weight tiles and byte offsets stay
+// straight into f16 fragments at load time. Buffers, weight tiles and byte offsets stay
 // E4M3, so the converter and host code are unchanged.
 #if DLSS5_GFX11
 template <typename DataT> struct FragStorage { using type = DataT; };
@@ -33,31 +33,45 @@ template <typename DataT> using StorageT = typename FragStorage<DataT>::type;
 template <typename DataT>
 constexpr bool kDecodeE4M3 = rocwmma::is_same_v<DataT, float8_t>;
 
-// Compact 16x16 f16 copy of a strided E4M3 region. row_major: element (r, c)
-// = src[r * ldm + c]; col_major: element (r, c) = src[c * ldm + r]. Both are
-// written so the compact buffer uses the same layout with ldm = 16.
-__device__ inline void decode_e4m3_16x16(f16* dst, const u8* src, uint ldm) {
-    for (uint i = 0; i < 16u; i++)
-        for (uint j = 0; j < 16u; j++)
-            dst[i * 16u + j] = f16(from_e4m3(src[i * ldm + j]));
+// Branch-free E4M3 byte -> f16 (exact for every code; 0x7f/0xff -> f16 NaN).
+// Integer-only so the 32 lanes vectorize; a private f16[256] + load_matrix_sync
+// was ~19x slower (tests/probe_frag.hip: 129 vs 2471 GFLOPS).
+__device__ inline __half e4m3_to_half(u32 b) {
+    u32 e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 8;
+    u32 normal = ((e + 8u) << 10) | (m << 7);
+    u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
+    u32 mask = 0u - u32(e != 0u);
+    u32 nan = 0u - u32((b & 0x7fu) == 0x7fu);
+    return __ushort_as_half(uint16_t(s | (normal & mask) | (sub & ~mask) | (nan & 0x7e00u)));
 }
+
+// gfx11 fragment element map (measured, tests/probe_frag.hip): 8 elements per lane.
+// matrix_a: lane l holds row (l & 15), columns base..base+7 with base = l >= 16 ? 8 : 0.
+// matrix_b (row_major and col_major fragments): lane l holds column (l & 15), rows base+i.
+enum FragKind { kFragA, kFragBRow, kFragBCol };
 template <typename Frag>
-__device__ inline void load_e4m3(Frag& frag, const u8* src, uint ldm) {
-    f16 tmp[256];
-    decode_e4m3_16x16(tmp, src, ldm);
-    rocwmma::load_matrix_sync(frag, static_cast<const f16*>(tmp), 16u);
+__device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) {
+    const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
+    if (kind == kFragBRow) {
+        // memory element (r, c) = p[r * ldm + c]; r = base + i, c = lead
+        for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(p[(base + i) * ldm + lead]);
+    } else {
+        // A row_major: p[row * ldm + col], row = lead;  B col_major: p[col * ldm + row], col = lead
+        const u8* q = p + lead * ldm + base;
+        for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(q[i]);
+    }
 }
-#define DLSS5_LOAD_FRAG(frag, p, ldm)                                                  \
-    do {                                                                               \
-        if constexpr (kDecodeE4M3<DataT>)                                                      \
-            load_e4m3(frag, reinterpret_cast<const u8*>(p), ldm);                      \
-        else                                                                           \
+#define DLSS5_LOAD_FRAG(frag, p, ldm, kind)                                              \
+    do {                                                                                 \
+        if constexpr (kDecodeE4M3<DataT>)                                                \
+            load_e4m3(frag, reinterpret_cast<const u8*>(p), ldm, kind);                  \
+        else                                                                             \
             rocwmma::load_matrix_sync(frag, reinterpret_cast<const StorageT<DataT>*>(p), \
-                                      ldm);                                            \
+                                      ldm);                                              \
     } while (0)
 #else
 template <typename DataT> using StorageT = DataT;
-#define DLSS5_LOAD_FRAG(frag, p, ldm) rocwmma::load_matrix_sync(frag, p, ldm)
+#define DLSS5_LOAD_FRAG(frag, p, ldm, kind) rocwmma::load_matrix_sync(frag, p, ldm)
 #endif
 
 #if DLSS5_GFX11
@@ -86,8 +100,8 @@ struct MatrixA {
             reinterpret_cast<const char*>(buf) + byte_off);
         uint ldm = stride_bytes / uint(sizeof(DataT));
         MatrixA a;
-        DLSS5_LOAD_FRAG(a.k0, p, ldm);
-        DLSS5_LOAD_FRAG(a.k1, p + 16, ldm);
+        DLSS5_LOAD_FRAG(a.k0, p, ldm, kFragA);
+        DLSS5_LOAD_FRAG(a.k1, p + 16, ldm, kFragA);
         return a;
     }
 };
@@ -104,8 +118,8 @@ struct MatrixB {
         uint ldm = stride_bytes / uint(sizeof(DataT));
         MatrixB b;
         b.row = true;
-        DLSS5_LOAD_FRAG(b.k0r, p, ldm);
-        DLSS5_LOAD_FRAG(b.k1r, p + 16 * ldm, ldm);
+        DLSS5_LOAD_FRAG(b.k0r, p, ldm, kFragBRow);
+        DLSS5_LOAD_FRAG(b.k1r, p + 16 * ldm, ldm, kFragBRow);
         return b;
     }
     template <typename Ptr>
@@ -115,8 +129,8 @@ struct MatrixB {
         uint ldm = stride_bytes / uint(sizeof(DataT));
         MatrixB b;
         b.row = false;
-        DLSS5_LOAD_FRAG(b.k0c, p, ldm);
-        DLSS5_LOAD_FRAG(b.k1c, p + 16, ldm);
+        DLSS5_LOAD_FRAG(b.k0c, p, ldm, kFragBCol);
+        DLSS5_LOAD_FRAG(b.k1c, p + 16, ldm, kFragBCol);
         return b;
     }
 };
