@@ -11,6 +11,19 @@
 # mount namespace. glibc, libstdc++ and libgcc_s are left to the container (pressure-vessel
 # imports the newer host versions for the graphics stack).
 #
+# ldd is not the whole story. HIP loads the code object manager with dlopen when it creates a
+# device, so libamd_comgr never appears as a dependency -- and without it ROCclr cannot build a
+# device for an agent it can otherwise see:
+#
+#   comgrctx.cpp : Failed to load COMGR library.
+#   rocdevice.cpp: Code object manager initialization failed for HSA device gfx1100
+#   rocdevice.cpp: Error creating new instance of Device.
+#
+# which surfaces as hipSetDevice reporting "no ROCm-capable device is detected" while hsa_init
+# succeeds and lists the GPU. On a normal system the loader finds it in /opt/rocm/lib; inside
+# Steam's container it does not, because pressure-vessel rebuilds LD_LIBRARY_PATH. dlopen resolves
+# against the calling library's RUNPATH, so a copy beside libamdhip64 is enough.
+#
 # Usage: bundle_hip_libs.sh /path/to/libdlss5_hip.so /path/to/output_lib_dir
 set -euo pipefail
 
@@ -35,6 +48,37 @@ while read -r name path; do
     cp -fL "$path" "$out/$name"
     count=$((count + 1))
 done < <(ldd "$src_real" | awk '/=>/ && $3 ~ /^\// {print $1, $3}')
+
+# The dlopen-only libraries, by name, since nothing in the ELF headers points at them.
+rocm_lib=$(dirname "$(ldd "$src_real" | awk '/libamdhip64/ && $3 ~ /^\// {print $3; exit}')")
+[[ -d "$rocm_lib" ]] || rocm_lib=${ROCM_LIB:-/opt/rocm/lib}
+
+for extra in "$rocm_lib"/libamd_comgr.so*; do
+    [[ -e "$extra" ]] || continue
+    name=$(basename "$extra")
+
+    if [[ -L "$extra" ]]; then
+        ln -sf "$(basename "$(readlink -f "$extra")")" "$out/$name"
+        continue
+    fi
+
+    cp -f "$extra" "$out/$name"
+    count=$((count + 1))
+
+    # comgr brings its own dependencies, and they have to travel too.
+    while read -r dep path; do
+        [[ -n "$path" && -f "$path" ]] || continue
+        [[ "$dep" =~ $skip_re ]] && continue
+        [[ -f "$out/$dep" ]] && continue
+        cp -fL "$path" "$out/$dep"
+        count=$((count + 1))
+    done < <(ldd "$extra" | awk '/=>/ && $3 ~ /^\// {print $1, $3}')
+done
+
+if ! ls "$out"/libamd_comgr.so* >/dev/null 2>&1; then
+    echo "warning: no libamd_comgr found near $rocm_lib -- HIP will report no device inside the" >&2
+    echo "         Steam runtime even though hsa_init succeeds. Set ROCM_LIB to point at it." >&2
+fi
 
 missing=$(ldd "$src_real" | grep "not found" || true)
 if [[ -n "$missing" ]]; then
