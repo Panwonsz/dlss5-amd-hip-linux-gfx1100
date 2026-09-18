@@ -34,6 +34,18 @@ struct FrameBuffers {
 };
 static std::unique_ptr<FrameBuffers> g_frame;
 
+/* Did this library's own initialisation run in THIS process?
+
+   Inside a Proton game the answer turns out to matter more than anything about the sandbox. Wine's
+   preloader reserves its address space and re-execs, and the process that finally calls us has our
+   library mapped without ever having run its constructors -- the mappings came from an ancestor. That
+   is invisible from outside and explains a string of dead ends: a preloaded probe whose constructor
+   never fires, a bridge pointer that is valid because it was inherited rather than published here,
+   and -- if it holds -- HIP reporting no device while ROCr lists a gfx1100 agent, because the fat
+   binary carrying the kernels is registered by a constructor that never ran. */
+static int g_ctor_pid;
+__attribute__((constructor)) static void note_constructor() { g_ctor_pid = (int)getpid(); }
+
 static void run_log(const char* s) {
     FILE* f = fopen("/tmp/dlss5-hip-run.log", "a");
     if (!f)
@@ -101,9 +113,9 @@ static std::string device_report() {
     char buf[768];
     snprintf(buf, sizeof buf,
              " [pid=%d devices=%d (%s) first=%s runtime=%d driver=%d"
-             " | hsa_init=%d agents=%d gpus=%d first_agent=%s]",
+             " | hsa_init=%d agents=%d gpus=%d first_agent=%s | ctor_pid=%d]",
              (int)getpid(), count, hipGetErrorString(counted), name, runtime, driver,
-             hsa_status, hsa.agents, hsa.gpus, hsa.first);
+             hsa_status, hsa.agents, hsa.gpus, hsa.first, g_ctor_pid);
     return buf;
 }
 
