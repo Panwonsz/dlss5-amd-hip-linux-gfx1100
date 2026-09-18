@@ -10,6 +10,7 @@
 #include <cmath>
 #include <vector>
 #include <memory>
+#include <unistd.h>
 
 static std::mutex g_mu;
 static dlss5::Network70* g_net;
@@ -46,6 +47,30 @@ static const char* set_err(const char* s) {
     return g_err.c_str();
 }
 
+/* What the runtime says about itself, appended to any init failure.
+   The error string is the one channel that reliably leaves this library: it is returned through the
+   trampoline to the caller, which logs it. Files written from here land in whatever /tmp the process
+   ended up with -- inside Steam's container that is a private one -- and preloaded probes have their
+   constructors run in an ancestor rather than in the process that actually calls us. So the report
+   travels with the error instead of being left somewhere to be found. */
+static std::string device_report() {
+    int count = -1, runtime = 0, driver = 0;
+    const hipError_t counted = hipGetDeviceCount(&count);
+    hipRuntimeGetVersion(&runtime);
+    hipDriverGetVersion(&driver);
+    char name[128] = "-";
+    if (count > 0) {
+        hipDeviceProp_t props{};
+        if (hipGetDeviceProperties(&props, 0) == hipSuccess)
+            snprintf(name, sizeof name, "%s/%s", props.name, props.gcnArchName);
+    }
+    char buf[512];
+    snprintf(buf, sizeof buf,
+             " [pid=%d devices=%d (%s) first=%s runtime=%d driver=%d]",
+             (int)getpid(), count, hipGetErrorString(counted), name, runtime, driver);
+    return buf;
+}
+
 extern "C" int dlss5_init(const char* weights_dir, int gpu) {
     std::lock_guard<std::mutex> lock(g_mu);
     try {
@@ -65,7 +90,9 @@ extern "C" int dlss5_init(const char* weights_dir, int gpu) {
         run_log("init ok");
         return 0;
     } catch (const std::exception& e) {
-        set_err(e.what());
+        const std::string detail = std::string(e.what()) + device_report();
+        run_log(detail.c_str());
+        set_err(detail.c_str());
         return -1;
     }
 }
