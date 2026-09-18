@@ -1,12 +1,15 @@
 // DLSS-NR model server: runs the network in an ordinary host process and answers frames over loopback.
 //
 // Why this exists. The model used to run inside the game, through dlss5_hip.dll and a preloaded
-// libdlss5_hip.so. That works right up until it doesn't: with the model merely initialised and holding
-// GPU memory, Stellar Blade lost the device two seconds into the first frame -- and it did so with our
-// backend recording *nothing at all* on the game's command list (DLSS5_NR_STEPS=0). ROCm compute and
-// vkd3d graphics sharing one process on one GPU under Wine is what breaks, so the model moves out.
+// libdlss5_hip.so, and the game lost the GPU two seconds into the first frame. The reason first given
+// here -- that a run with the recording switched off crashed too, so ROCm in the game process had to be
+// the cause -- was wrong: that switch was broken and the run proved nothing. With the model out here,
+// the game still dies at the same moment, so the cause is elsewhere and is still being hunted in
+// DlssNr_Hip.cpp.
 //
-// What that buys, beyond not crashing: this process is a normal Linux program on the host. It finds
+// The move is still right, though, for reasons that do not depend on that: 234 ms a frame is only
+// reachable where ROCm is not fighting a Wine process for the GPU, the weights stay loaded across game
+// launches, and this process is a normal Linux program on the host. It finds
 // /opt/rocm and the weights cache by itself. Nothing needs bundling into the Steam container, no
 // LD_PRELOAD, no libamd_comgr copy, no 601 MB of weights beside the game. The container stops being
 // part of the problem.
@@ -668,23 +671,11 @@ int main(int argc, char** argv)
         return 2;
     }
 
-    Model model;
-
-    if (!model.Load(library))
-        return 1;
-
-    std::printf("loading the model from %s\n", weights.c_str());
-    std::fflush(stdout);
-
-    if (model.init(weights.c_str(), gpu) != 0)
-    {
-        std::fprintf(stderr, "the model would not initialise: %s\n", model.Error());
-        return 1;
-    }
-
-    std::printf("model ready, %ux%u\n", kModelWidth, kModelHeight);
-
-    // Loopback only. This speaks to a game on the same machine and has no business being reachable
+    // The port comes first, before the model. Claiming it costs milliseconds and loading 148 MB of
+    // weights costs seconds, so a port that is already taken should be found out immediately rather
+    // than after a long wait -- which is exactly how it was found out the first time.
+    //
+    // Loopback only: this speaks to a game on the same machine and has no business being reachable
     // from anywhere else.
     const int listener = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -705,7 +696,12 @@ int main(int argc, char** argv)
     if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof address) != 0)
     {
         std::perror("bind");
-        std::fprintf(stderr, "is another daemon already on port %u?\n", port);
+        std::fprintf(stderr, "another daemon is probably already on port %u -- dlss5-nr-run.sh starts\n"
+                             "one that outlives the game on purpose. Find it with:\n"
+                             "    ss -ltnp | grep %u\n"
+                             "and either use it as it is (the weights are already loaded) or stop it with:\n"
+                             "    kill $(pgrep -x dlss5-nr-daemon)\n",
+                     port, port);
         return 1;
     }
 
@@ -722,6 +718,22 @@ int main(int argc, char** argv)
     stop.sa_flags = 0;
     sigaction(SIGINT, &stop, nullptr);
     sigaction(SIGTERM, &stop, nullptr);
+    Model model;
+
+    if (!model.Load(library))
+        return 1;
+
+    std::printf("loading the model from %s\n", weights.c_str());
+    std::fflush(stdout);
+
+    if (model.init(weights.c_str(), gpu) != 0)
+    {
+        std::fprintf(stderr, "the model would not initialise: %s\n", model.Error());
+        return 1;
+    }
+
+    std::printf("model ready, %ux%u\n", kModelWidth, kModelHeight);
+
     std::signal(SIGPIPE, SIG_IGN);
 
     while (!g_stop)
