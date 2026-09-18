@@ -1,7 +1,7 @@
 HIPCC ?= /opt/rocm/bin/hipcc
 ARCH ?= gfx1201
 INCLUDES := -Iinclude -I/opt/rocm/include
-LDFLAGS := -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib
+LDFLAGS := -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib
 CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
 BUILD ?= build
 TESTS := test_wmma test_stages test_quantize test_attention test_residual test_linear test_logical_ops test_ffn_f32
