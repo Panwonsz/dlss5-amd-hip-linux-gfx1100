@@ -47,12 +47,37 @@ static const char* set_err(const char* s) {
     return g_err.c_str();
 }
 
+/* The HSA entry points this report uses, declared rather than included: the ROCr headers are not on
+   the include path for this build, and only these three are wanted. */
+extern "C" {
+typedef struct { uint64_t handle; } dlss5_hsa_agent;
+int hsa_init(void);
+int hsa_iterate_agents(int (*callback)(dlss5_hsa_agent, void*), void* data);
+int hsa_agent_get_info(dlss5_hsa_agent agent, int attribute, void* value);
+}
+
 /* What the runtime says about itself, appended to any init failure.
    The error string is the one channel that reliably leaves this library: it is returned through the
    trampoline to the caller, which logs it. Files written from here land in whatever /tmp the process
    ended up with -- inside Steam's container that is a private one -- and preloaded probes have their
    constructors run in an ancestor rather than in the process that actually calls us. So the report
    travels with the error instead of being left somewhere to be found. */
+struct HsaTally { int agents = 0, gpus = 0; char first[64] = "-"; };
+
+static int tally_agent(dlss5_hsa_agent agent, void* data) {
+    auto* t = static_cast<HsaTally*>(data);
+    char name[64] = {0};
+    int kind = -1;
+    hsa_agent_get_info(agent, 0 /* NAME */, name);
+    hsa_agent_get_info(agent, 17 /* DEVICE */, &kind);
+    t->agents++;
+    if (kind == 1) { /* GPU */
+        if (t->gpus == 0) snprintf(t->first, sizeof t->first, "%s", name);
+        t->gpus++;
+    }
+    return 0; /* HSA_STATUS_SUCCESS */
+}
+
 static std::string device_report() {
     int count = -1, runtime = 0, driver = 0;
     const hipError_t counted = hipGetDeviceCount(&count);
@@ -64,10 +89,21 @@ static std::string device_report() {
         if (hipGetDeviceProperties(&props, 0) == hipSuccess)
             snprintf(name, sizeof name, "%s/%s", props.name, props.gcnArchName);
     }
-    char buf[512];
+    /* The layer below HIP, asked separately. HIP reporting no devices while ROCr lists a GPU agent
+       means HIP is rejecting a card the driver can see; ROCr listing none, in a process where the
+       same library lists one outside the container, means ROCr itself cannot come up here -- and
+       that is the difference between a fixable configuration and a design change. */
+    HsaTally hsa;
+    const int hsa_status = hsa_init();
+    if (hsa_status == 0)
+        hsa_iterate_agents(tally_agent, &hsa);
+
+    char buf[768];
     snprintf(buf, sizeof buf,
-             " [pid=%d devices=%d (%s) first=%s runtime=%d driver=%d]",
-             (int)getpid(), count, hipGetErrorString(counted), name, runtime, driver);
+             " [pid=%d devices=%d (%s) first=%s runtime=%d driver=%d"
+             " | hsa_init=%d agents=%d gpus=%d first_agent=%s]",
+             (int)getpid(), count, hipGetErrorString(counted), name, runtime, driver,
+             hsa_status, hsa.agents, hsa.gpus, hsa.first);
     return buf;
 }
 
