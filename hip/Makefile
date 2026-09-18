@@ -11,7 +11,7 @@ MINGW_CC ?= $(firstword $(wildcard \
   /home/guentra/dlssnr-linux-hip/toolchain/llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-gcc \
   $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)))
 
-.PHONY: all clean test game test-api bench-ffn32
+.PHONY: all clean test game daemon test-api bench-ffn32
 
 bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_ffn32.hip -o $(BUILD)/bench_ffn32.o
@@ -20,6 +20,13 @@ bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp
 all: $(TESTS) hip-network70 libdlss5_hip.so
 
 game: libdlss5_hip.so dlss5_hip.dll
+
+# The host-side model server. Plain C++ -- no hipcc, no offload arch -- because it only dlopens
+# libdlss5_hip.so at run time. It is what the game talks to instead of loading the model itself.
+daemon: ../linux/dlss5-nr-daemon
+
+../linux/dlss5-nr-daemon: ../linux/dlss5_nr_daemon.cpp
+	$(CXX) -O2 -std=c++17 -Wall -o $@ $< -ldl -lpthread
 
 test_wmma: tests/test_wmma.hip include/dlss5_linalg.hpp include/dlss5_common.hpp include/dlss5_runtime.hpp
 	$(HIPCC) $(CXXFLAGS) tests/test_wmma.hip $(LDFLAGS) -o $@
