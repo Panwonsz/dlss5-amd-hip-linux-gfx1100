@@ -38,7 +38,14 @@ constexpr bool kDecodeE4M3 = rocwmma::is_same_v<DataT, float8_t>;
 // gfx11 fragment element map (measured, tests/probe_frag.hip): 8 elements per lane.
 // matrix_a: lane l holds row (l & 15), columns base..base+7 with base = l >= 16 ? 8 : 0.
 // matrix_b (row_major and col_major fragments): lane l holds column (l & 15), rows base+i.
-enum FragKind { kFragA, kFragBRow, kFragBCol };
+// kFragBRowPacked is a row-major B fragment read from the PACKED E4M3 weight layout, where a lane's
+// eight elements are adjacent rather than strided by ldm. It is deliberately distinct from kFragBRow:
+// that kind also serves activations, which are not packed this way (attention reads qkv at
+// ldm = STRIDE, stage reads values at 32), and folding the two together would corrupt them silently.
+//
+// It needs no case of its own in load_e4m3 -- adjacent eight bytes at lead*ldm + base is exactly what
+// the kFragA / kFragBCol branch already does.
+enum FragKind { kFragA, kFragBRow, kFragBCol, kFragBRowPacked };
 template <typename Frag>
 __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) {
     const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
@@ -137,6 +144,28 @@ struct MatrixB {
         DLSS5_LOAD_FRAG(b.k1r, p + 16 * ldm, ldm, kFragBRow);
         return b;
     }
+    // The packed E4M3 weight tile: pack_tiled_e4m3 writes j*32 + k inside each 512-byte tile rather
+    // than k*16 + j, so a lane's eight K-values for column `lead` sit adjacent at lead*32 + base. Two
+    // dword loads instead of eight byte loads, on the one fragment kind that was still scalar.
+    //
+    // The tile is still 512 bytes and still in the same place, so every ((col/16) * (C/32) + g) * 512
+    // in the tree is unchanged -- only the order inside a tile moved. k1r starts 16 bytes in rather
+    // than 16*ldm, because the second half of K is now interleaved within each column's run.
+    //
+    // Separate from LoadRow on purpose. See kFragBRowPacked above: LoadRow also serves activations.
+    template <typename Ptr>
+    __device__ static MatrixB LoadRowPacked(Ptr buf, uint byte_off) {
+        static_assert(rocwmma::is_same_v<DataT, float8_t>,
+                      "LoadRowPacked describes the E4M3 weight tile layout only");
+        const DataT* p = reinterpret_cast<const DataT*>(
+            reinterpret_cast<const char*>(buf) + byte_off);
+        MatrixB b;
+        b.row = true;
+        DLSS5_LOAD_FRAG(b.k0r, p, 32, kFragBRowPacked);
+        DLSS5_LOAD_FRAG(b.k1r, p + 16, 32, kFragBRowPacked);
+        return b;
+    }
+
     template <typename Ptr>
     __device__ static MatrixB LoadCol(Ptr buf, uint byte_off, uint stride_bytes) {
         const DataT* p = reinterpret_cast<const DataT*>(

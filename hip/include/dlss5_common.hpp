@@ -233,7 +233,15 @@ inline void pack_tiled_e4m3(u8* dst, const float* src, size_t N, size_t K) {
         for (size_t g = 0; g < K / 32; g++)
             for (size_t k = 0; k < 32; k++)
                 for (size_t j = 0; j < 16; j++)
-                    dst[(t * (K / 32) + g) * 512 + k * 16 + j] =
+                    // j * 32 + k, not k * 16 + j. Same 512-byte tile in the same place, so nothing
+                    // that indexes tiles changes; but a fragment lane's eight K-values for one column
+                    // are now ADJACENT, which lets MatrixB::LoadRowPacked read them as two dwords
+                    // instead of eight byte loads. RDNA3 has no FP8 matrix instruction, so every one of
+                    // these fragments is filled by hand and the layout is what decides the cost.
+                    //
+                    // The f16 weight tiles (pack_tiled_half, half_matrix) keep k * 16 + j: those are
+                    // read by rocwmma::load_matrix_sync, which defines its own layout.
+                    dst[(t * (K / 32) + g) * 512 + j * 32 + k] =
                         e4m3_byte(src[(t * 16 + j) * K + g * 32 + k]);
 }
 

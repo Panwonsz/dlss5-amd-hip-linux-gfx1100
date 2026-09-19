@@ -16,7 +16,7 @@ __global__ void k_gemm_tiled_f8(const u8* A, const u8* Btiles, u8* C, uint M, ui
     for (uint g = 0; g < K / 32; g++) {
         A8 a = A8::Load(A, m0 * K + g * 32u, K);
         uint boff = ((n0 / 16u) * (K / 32u) + g) * 512u;
-        B8 b = B8::LoadRow(Btiles, boff, 16);
+        B8 b = B8::LoadRowPacked(Btiles, boff);
         acc.MultiplyAccumulate(a, b);
     }
     if (activate) {
