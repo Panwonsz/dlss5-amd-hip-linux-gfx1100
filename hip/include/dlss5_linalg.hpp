@@ -207,7 +207,16 @@ struct MatrixC {
 
         for (uint i = 0; i < Length(); i++) {
             uint2 rc = GetCoordinate(i);
+#if DLSS5_GFX11
             p[rc.x * ldm + rc.y] = e4m3_to_half(e4m3_byte(Get(i)));
+#else
+            // e4m3_to_half is a gfx11-only device helper: that architecture has no hardware E4M3
+            // conversion, so the software one sits under #if DLSS5_GFX11. This branch exists only so the
+            // HOST pass compiles -- HIP parses every __global__ body and everything it mentions on the
+            // host to build its launch stub, and nothing here ever runs there. It does not have to be
+            // right; it has to exist.
+            p[rc.x * ldm + rc.y] = __float2half(Get(i));
+#endif
         }
     }
 
