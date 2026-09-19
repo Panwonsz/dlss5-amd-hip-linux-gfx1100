@@ -28,6 +28,16 @@ std::vector<float> load(const std::string& dir,const std::string& name,size_t co
  for(float x:v)if(!std::isfinite(x))throw std::runtime_error("nonfinite table: "+p.string());
  return v;
 }
+// The same tiled layout as pack_tiled_e4m3, in f16, and deliberately ROUND-TRIPPED through E4M3 first.
+//
+// Not full f16 precision: the point is a performance change with a provably identical picture, so the
+// matrix unit must see the values it already saw. __float2half(v[...]) would be slightly MORE accurate
+// and would change the output, which forfeits the only check available -- hip-network70's statistics
+// matching between the two settings.
+void pack_tiled_half(__half* dst,const float* src,size_t N,size_t K){
+ for(size_t t=0;t<N/16;t++)for(size_t g=0;g<K/32;g++)for(size_t k=0;k<32;k++)for(size_t j=0;j<16;j++)
+  dst[(t*(K/32)+g)*512+k*16+j]=__float2half(from_e4m3(e4m3_byte(src[(t*16+j)*K+g*32+k])));
+}
 DeviceBuf half_matrix(const float* v,uint n,uint k){
  std::vector<__half> t(size_t(n)*k);
  for(uint r=0;r<n;++r)for(uint c=0;c<k;++c)t[((r/16)*(k/32)+c/32)*512+(c%32)*16+r%16]=__float2half(v[size_t(r)*k+c]);
@@ -54,7 +64,11 @@ struct Block {
    std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
    auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_e4m3(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
   }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);size_t off=c==32?512:0;
-   std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());
+   // The FFN's weights, in whichever format the kernels will read them. ONE switch decides both, and
+   // the contract half sits after the expand half at 4*m elements -- one byte each as E4M3, two as f16,
+   // which is why the kernel's f16 offset is 2*hidden_c*C.
+   if(dlss5_w16()){std::vector<__half> t(8*m);pack_tiled_half(t.data(),f.data()+off,4*c,c);pack_tiled_half(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size()*2);fw.upload(t.data(),t.size()*2);}
+   else{std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());}
    if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_e4m3(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
   }
   auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);

@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include "dlss5_common.hpp"
 
 #define DLSS5_CONFIGURED_POLICIES 1
@@ -43,6 +44,27 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
                                          const float* scales, int mode, int ordered,
                                          bool matrix_residual, uint rw, uint rh, uint rsw,
                                          uint rpx, uint rpy);
+
+// DLSS5_W16: the FFN's weights are uploaded AND read as f16 instead of E4M3.
+//
+// Measured on a 7900 XT, same kernel and bit-identical output: -44.6% at C=32 rising to -53.5% at
+// C=256. RDNA3 has no FP8 matrix instruction, so load_e4m3 fills each weight fragment with eight
+// strided single-byte reads and eight conversions where the f16 path issues one vectorised
+// load_matrix_sync. The absolute saving is constant across C (~0.69 ms/call), which is what identifies
+// it as per-load overhead rather than anything to do with bandwidth or arithmetic.
+//
+// This ONE function drives both the upload in network.hip and the dispatch in kernels.hip, and it has to
+// stay that way. If the two ever disagree, E4M3 bytes are read as f16 -- a stable, plausible, entirely
+// wrong picture -- and the network's only self-check is replay equality, which such a mismatch passes
+// without complaint. Compare hip-network70's `mean` and `mean_abs_change` across the two settings
+// instead: the f16 weights are the dequantised E4M3 values, so those must match digit for digit.
+inline bool dlss5_w16() {
+    static const bool on = [] {
+        const char* asked = std::getenv("DLSS5_W16");
+        return asked != nullptr && std::atoi(asked) != 0;
+    }();
+    return on;
+}
 
 // The FFN with f16 weights, for measuring what the E4M3 fragment load costs. The caller packs them.
 void launch_ffn_f32_w16(int c, const float* in, const u8* w16, const float* scales, float* out,

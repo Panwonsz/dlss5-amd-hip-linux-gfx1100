@@ -87,83 +87,111 @@ void launch_ffn_f32_w16(int c, const float* in, const u8* w16, const float* scal
     default: throw std::runtime_error("FFN channels");
     }
 }
+// Each of these switches now exists twice, for E4M3 and f16 weights, differing in one template
+// argument. They are generated rather than written out because seventeen near-identical dispatch lines
+// are seventeen chances to mistype a flag, and a mistyped flag runs a block with the wrong weight
+// format -- which looks like an image-quality bug, not a build failure.
+#define DLSS5_FFN_HOUT(W16)                                                                          \
+    switch (ffn_groups32()) {                                                                        \
+    case 1: LAUNCH((k_ffn_f32<32, false, 1, true, false, false, W16>), (tokens + 15) / 16, 64, in, w, \
+                   scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h); break;      \
+    case 4: LAUNCH((k_ffn_f32<32, false, 4, true, false, false, W16>), (tokens + 63) / 64, 256, in,   \
+                   w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h); break;   \
+    case 8: LAUNCH((k_ffn_f32<32, false, 8, true, false, false, W16>), (tokens + 127) / 128, 512, in, \
+                   w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h); break;   \
+    default: LAUNCH((k_ffn_f32<32, false, 2, true, false, false, W16>), (tokens + 31) / 32, 128, in,  \
+                    w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h); break;  \
+    }
+
 void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scales, __half* out_h,
                           uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !scales || !out_h)
         throw std::runtime_error("FFN f16 extent/alias");
-    switch (ffn_groups32()) {
-    case 1: LAUNCH((k_ffn_f32<32, false, 1, true>), (tokens + 15) / 16, 64, in, w, scales, nullptr,
-                   nullptr, tokens, chain_residual, precise_c32, out_h); break;
-    case 4: LAUNCH((k_ffn_f32<32, false, 4, true>), (tokens + 63) / 64, 256, in, w, scales, nullptr,
-                   nullptr, tokens, chain_residual, precise_c32, out_h); break;
-    case 8: LAUNCH((k_ffn_f32<32, false, 8, true>), (tokens + 127) / 128, 512, in, w, scales, nullptr,
-                   nullptr, tokens, chain_residual, precise_c32, out_h); break;
-    default: LAUNCH((k_ffn_f32<32, false, 2, true>), (tokens + 31) / 32, 128, in, w, scales, nullptr,
-                    nullptr, tokens, chain_residual, precise_c32, out_h); break;
-    }
+    if (dlss5_w16()) { DLSS5_FFN_HOUT(true) } else { DLSS5_FFN_HOUT(false) }
 }
+#define DLSS5_FFN_HIN_HOUT(W16)                                                                      \
+    switch (ffn_groups32()) {                                                                        \
+    case 1: LAUNCH((k_ffn_f32<32, false, 1, true, false, true, W16>), (tokens + 15) / 16, 64,        \
+                   nullptr, w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, \
+                   nullptr, in_h); break;                                                            \
+    case 4: LAUNCH((k_ffn_f32<32, false, 4, true, false, true, W16>), (tokens + 63) / 64, 256,       \
+                   nullptr, w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, \
+                   nullptr, in_h); break;                                                            \
+    case 8: LAUNCH((k_ffn_f32<32, false, 8, true, false, true, W16>), (tokens + 127) / 128, 512,     \
+                   nullptr, w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, \
+                   nullptr, in_h); break;                                                            \
+    default: LAUNCH((k_ffn_f32<32, false, 2, true, false, true, W16>), (tokens + 31) / 32, 128,      \
+                    nullptr, w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32,       \
+                    out_h, nullptr, in_h); break;                                                    \
+    }
+
 void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float* scales,
                              __half* out_h, uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !in_h || !scales || !out_h)
         throw std::runtime_error("FFN f16 in extent/alias");
-    switch (ffn_groups32()) {
-    case 1: LAUNCH((k_ffn_f32<32, false, 1, true, false, true>), (tokens + 15) / 16, 64, nullptr, w,
-                   scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
-                   in_h); break;
-    case 4: LAUNCH((k_ffn_f32<32, false, 4, true, false, true>), (tokens + 63) / 64, 256, nullptr, w,
-                   scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
-                   in_h); break;
-    case 8: LAUNCH((k_ffn_f32<32, false, 8, true, false, true>), (tokens + 127) / 128, 512, nullptr,
-                   w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
-                   in_h); break;
-    default: LAUNCH((k_ffn_f32<32, false, 2, true, false, true>), (tokens + 31) / 32, 128, nullptr, w,
-                    scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
-                    in_h); break;
-    }
+    if (dlss5_w16()) { DLSS5_FFN_HIN_HOUT(true) } else { DLSS5_FFN_HIN_HOUT(false) }
 }
+#define DLSS5_FFN_F8(W16)                                                                            \
+    switch (c) {                                                                                     \
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, false, W16>), groups, 128, in, w, scales,   \
+                    out_f32, out_f8, tokens); break;                                                 \
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, false, W16>), groups, 256, in, w, scales, \
+                     out_f32, out_f8, tokens); break;                                                \
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, false, W16>), groups, 512, in, w, scales, \
+                     out_f32, out_f8, tokens); break;                                                \
+    default: throw std::runtime_error("FFN f8 channels");                                             \
+    }
+
 void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
                         u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c == 32 || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f8 extent/alias");
     uint groups = (tokens + 15) / 16;
-    switch (c) {
-    case 64: LAUNCH((k_ffn_f32<64, true>), groups, 128, in, w, scales, out_f32, out_f8, tokens); break;
-    case 128: LAUNCH((k_ffn_f32<128, true>), groups, 256, in, w, scales, out_f32, out_f8, tokens); break;
-    case 256: LAUNCH((k_ffn_f32<256, true>), groups, 512, in, w, scales, out_f32, out_f8, tokens); break;
-    default: throw std::runtime_error("FFN f8 channels");
-    }
+    if (dlss5_w16()) { DLSS5_FFN_F8(true) } else { DLSS5_FFN_F8(false) }
 }
+#define DLSS5_FFN_F8IN(W16)                                                                          \
+    switch (c) {                                                                                     \
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, true, false, W16>), groups, 128, nullptr, w,       \
+                    scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr,           \
+                    in_f8); break;                                                                   \
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, true, false, W16>), groups, 256, nullptr, w,     \
+                     scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr,          \
+                     in_f8); break;                                                                  \
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, true, false, W16>), groups, 512, nullptr, w,     \
+                     scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr,          \
+                     in_f8); break;                                                                  \
+    default: throw std::runtime_error("FFN f8in channels");                                           \
+    }
+
 void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float* scales,
                                float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
                                bool precise_c32) {
     if (!tokens || c == 32 || !in_f8 || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f8in extent/alias");
     uint groups = (tokens + 15) / 16;
-    switch (c) {
-    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, true>), groups, 128, nullptr, w, scales, out_f32,
-                    out_f8, tokens, chain_residual, precise_c32, nullptr, in_f8); break;
-    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, true>), groups, 256, nullptr, w, scales, out_f32,
-                     out_f8, tokens, chain_residual, precise_c32, nullptr, in_f8); break;
-    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, true>), groups, 512, nullptr, w, scales, out_f32,
-                     out_f8, tokens, chain_residual, precise_c32, nullptr, in_f8); break;
-    default: throw std::runtime_error("FFN f8in channels");
-    }
+    if (dlss5_w16()) { DLSS5_FFN_F8IN(true) } else { DLSS5_FFN_F8IN(false) }
 }
+#define DLSS5_FFN_HIN_F8(W16)                                                                        \
+    switch (c) {                                                                                     \
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true, W16>), groups, 128, nullptr, w,       \
+                    scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr,   \
+                    in_h); break;                                                                    \
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, true, W16>), groups, 256, nullptr, w,     \
+                     scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr,  \
+                     in_h); break;                                                                   \
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, true, W16>), groups, 512, nullptr, w,     \
+                     scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr,  \
+                     in_h); break;                                                                   \
+    default: throw std::runtime_error("FFN f16in channels");                                          \
+    }
+
 void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
                               float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
                               bool precise_c32) {
     if (!tokens || c == 32 || c == 512 || !in_h || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f16in extent/alias");
     uint groups = (tokens + 15) / 16;
-    switch (c) {
-    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true>), groups, 128, nullptr, w, scales,
-                    out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
-    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, true>), groups, 256, nullptr, w, scales,
-                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
-    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, true>), groups, 512, nullptr, w, scales,
-                     out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr, in_h); break;
-    default: throw std::runtime_error("FFN f16in channels");
-    }
+    if (dlss5_w16()) { DLSS5_FFN_HIN_F8(true) } else { DLSS5_FFN_HIN_F8(false) }
 }
 
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
