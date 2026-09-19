@@ -160,7 +160,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
 // put a number on that, because gfx1100's hardware counters all read 0.00 and the difference cannot be
 // measured any other way.
 template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false, bool F8IN = false,
-          bool HIN = false, bool W16 = false, bool AH16 = false>
+          bool HIN = false, bool W16 = false, bool AH16 = true>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
                           bool precise_c32 = false, __half* output_h = nullptr,
