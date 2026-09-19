@@ -1,0 +1,26 @@
+make: Entering directory '/home/bartek/Downloads/AUR/dlss5-amd-hip-linux/hip'
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_stages.hip -o build/test_stages.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_quantize.hip -o build/test_quantize.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_attention.hip -o build/test_attention.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_residual.hip -o build/test_residual.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_linear.hip -o build/test_linear.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_logical_ops.hip -o build/test_logical_ops.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_quantize.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_quantize
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_ffn_f32.hip -o build/test_ffn_f32.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_logical_ops.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_logical_ops
+mkdir -p build
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -fPIC -c src/bench.hip -o build/bench.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_attention.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_attention
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_stages.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_stages
+mkdir -p build
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -fPIC -c src/network.hip -o build/network.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_residual.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_residual
+mkdir -p build
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -fPIC -c src/capi.hip -o build/capi.o
+mkdir -p build
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -fPIC -c src/frame.hip -o build/frame.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_linear.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_linear
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_ffn_f32.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_ffn_f32
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/bench.o build/kernels.o build/network.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o hip-network70
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -shared -fPIC build/capi.o build/frame.o build/kernels.o build/network.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o libdlss5_hip.so
+make: Leaving directory '/home/bartek/Downloads/AUR/dlss5-amd-hip-linux/hip'

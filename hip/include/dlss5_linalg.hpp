@@ -21,32 +21,85 @@ template <typename DataT, typename Layout>
 using FragB = rocwmma::fragment<matrix_b, 16, 16, 16, DataT, Layout>;
 using FragC = rocwmma::fragment<accumulator, 16, 16, 16, float>;
 
+// RDNA 3 (gfx11): rocWMMA has no FP8 WMMA, only f16 operands with an f32
+// accumulator (same 16x16x16 block, wave32). E4M3 codes (|v| <= 448, 3-bit
+// mantissa) are exactly representable in f16, so FP8 matrices are decoded
+// straight into f16 fragments at load time. Buffers, weight tiles and byte offsets stay
+// E4M3, so the converter and host code are unchanged.
+#if DLSS5_GFX11
+template <typename DataT> struct FragStorage { using type = DataT; };
+template <> struct FragStorage<float8_t> { using type = f16; };
+template <typename DataT> using StorageT = typename FragStorage<DataT>::type;
+template <typename DataT>
+constexpr bool kDecodeE4M3 = rocwmma::is_same_v<DataT, float8_t>;
+
+// e4m3_to_half(): dlss5_common.hpp
+
+// gfx11 fragment element map (measured, tests/probe_frag.hip): 8 elements per lane.
+// matrix_a: lane l holds row (l & 15), columns base..base+7 with base = l >= 16 ? 8 : 0.
+// matrix_b (row_major and col_major fragments): lane l holds column (l & 15), rows base+i.
+enum FragKind { kFragA, kFragBRow, kFragBCol };
+template <typename Frag>
+__device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) {
+    const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
+    if (kind == kFragBRow) {
+        // memory element (r, c) = p[r * ldm + c]; r = base + i, c = lead
+        for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(p[(base + i) * ldm + lead]);
+    } else {
+        // A row_major: p[row * ldm + col], row = lead;  B col_major: p[col * ldm + row], col = lead
+        const u8* q = p + lead * ldm + base;
+        for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(q[i]);
+    }
+}
+#define DLSS5_LOAD_FRAG(frag, p, ldm, kind)                                              \
+    do {                                                                                 \
+        if constexpr (kDecodeE4M3<DataT>)                                                \
+            load_e4m3(frag, reinterpret_cast<const u8*>(p), ldm, kind);                  \
+        else                                                                             \
+            rocwmma::load_matrix_sync(frag, reinterpret_cast<const StorageT<DataT>*>(p), \
+                                      ldm);                                              \
+    } while (0)
+#else
+template <typename DataT> using StorageT = DataT;
+#define DLSS5_LOAD_FRAG(frag, p, ldm, kind) rocwmma::load_matrix_sync(frag, p, ldm)
+#endif
+
+#if DLSS5_GFX11
+// gfx11 f32 accumulator layout (measured on RX 7900 XT, tests/probe_gfx11.hip):
+// 8 elems/thread, column = lane%16, rows interleaved: even rows on lanes 0..15,
+// odd rows on lanes 16..31 (row = 2i + (lane>=16)).
+__device__ inline uint2 acc_coord(uint i) {
+    uint lane = threadIdx.x & 31u;
+    return uint2{2u * i + (lane >= 16u ? 1u : 0u), lane & 15u};
+}
+#else
 // gfx12 f32 accumulator layout (GPUOpen RDNA 4): 8 elems/thread,
 // column = lane%16, rows = (lane>=16 ? 8 : 0) + i.
 __device__ inline uint2 acc_coord(uint i) {
     uint lane = threadIdx.x & 31u;
     return uint2{(lane >= 16u ? 8u : 0u) + i, lane & 15u};
 }
+#endif
 
 template <typename DataT>
 struct MatrixA {
-    FragA<DataT, row_major> k0, k1;
+    FragA<StorageT<DataT>, row_major> k0, k1;
     template <typename Ptr>
     __device__ static MatrixA Load(Ptr buf, uint byte_off, uint stride_bytes) {
         const DataT* p = reinterpret_cast<const DataT*>(
             reinterpret_cast<const char*>(buf) + byte_off);
         uint ldm = stride_bytes / uint(sizeof(DataT));
         MatrixA a;
-        rocwmma::load_matrix_sync(a.k0, p, ldm);
-        rocwmma::load_matrix_sync(a.k1, p + 16, ldm);
+        DLSS5_LOAD_FRAG(a.k0, p, ldm, kFragA);
+        DLSS5_LOAD_FRAG(a.k1, p + 16, ldm, kFragA);
         return a;
     }
 };
 
 template <typename DataT>
 struct MatrixB {
-    FragB<DataT, row_major> k0r, k1r;
-    FragB<DataT, col_major> k0c, k1c;
+    FragB<StorageT<DataT>, row_major> k0r, k1r;
+    FragB<StorageT<DataT>, col_major> k0c, k1c;
     bool row = false;
     template <typename Ptr>
     __device__ static MatrixB LoadRow(Ptr buf, uint byte_off, uint stride_bytes) {
@@ -55,8 +108,8 @@ struct MatrixB {
         uint ldm = stride_bytes / uint(sizeof(DataT));
         MatrixB b;
         b.row = true;
-        rocwmma::load_matrix_sync(b.k0r, p, ldm);
-        rocwmma::load_matrix_sync(b.k1r, p + 16 * ldm, ldm);
+        DLSS5_LOAD_FRAG(b.k0r, p, ldm, kFragBRow);
+        DLSS5_LOAD_FRAG(b.k1r, p + 16 * ldm, ldm, kFragBRow);
         return b;
     }
     template <typename Ptr>
@@ -66,8 +119,8 @@ struct MatrixB {
         uint ldm = stride_bytes / uint(sizeof(DataT));
         MatrixB b;
         b.row = false;
-        rocwmma::load_matrix_sync(b.k0c, p, ldm);
-        rocwmma::load_matrix_sync(b.k1c, p + 16, ldm);
+        DLSS5_LOAD_FRAG(b.k0c, p, ldm, kFragBCol);
+        DLSS5_LOAD_FRAG(b.k1c, p + 16, ldm, kFragBCol);
         return b;
     }
 };
@@ -84,8 +137,13 @@ struct MatrixC {
     __device__ void Set(uint i, float v) { acc[i] = v; }
     __device__ uint2 GetCoordinate(uint i) const { return acc_coord(i); }
 
-    template <typename DataT>
-    __device__ void MultiplyAccumulate(const MatrixA<DataT>& a, const MatrixB<DataT>& b) {
+    // Independent types for A and B. Both sides store f16 fragments whatever their source format --
+    // FragStorage<float8_t>::type is f16 -- so mma_sync sees the same thing either way, and the only
+    // thing that ever required them to match was deducing one DataT from two arguments. Splitting them
+    // lets an E4M3 activation multiply an f16 weight, which is what measuring the E4M3 load costs
+    // requires.
+    template <typename TA, typename TB>
+    __device__ void MultiplyAccumulate(const MatrixA<TA>& a, const MatrixB<TB>& b) {
         if (b.row) {
             rocwmma::mma_sync(acc, a.k0, b.k0r, acc);
             rocwmma::mma_sync(acc, a.k1, b.k1r, acc);

@@ -21,7 +21,17 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
     __shared__ u8 tile[512];
     C32 acc = C32::Splat(0.f);
-    if ((F8RES && residual_f8) || (residual && mode != 4))
+#if DLSS5_GFX11
+    // gfx11 f16-operand WMMA does not accumulate onto a fine-grid f32 residual
+    // with one rounding like gfx12 FP8 WMMA. Accumulate the E4M3 products from
+    // zero (exact on their 2^-18 grid) and add the residual once at the end,
+    // which reproduces the single-rounding reference (tests/test_linear.hip).
+    const bool late_residual = ordered == 0;
+#else
+    const bool late_residual = false;
+#endif
+    const bool has_residual = (F8RES && residual_f8) || (residual && mode != 4);
+    if (has_residual && !late_residual)
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
             if (first + rc.x < m && col < n) {
@@ -71,6 +81,20 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         } else acc.MultiplyAccumulate(a, b);
         __syncthreads();
     }
+    if (has_residual && late_residual)
+        for (uint i = 0; i < acc.Length(); ++i) {
+            uint2 rc = acc.GetCoordinate(i);
+            if (first + rc.x < m && col < n) {
+                float rv;
+                if (F8RES && residual_f8)
+                    rv = from_e4m3(residual_f8[(first + rc.x) * n + col + rc.y]);
+                else
+                    rv = HRID ? __half2float(residual_h[(first + rc.x) * n + col + rc.y])
+                              : residual[(first + rc.x) * n + col + rc.y];
+                acc.Set(i, acc.Get(i) + (matrix_residual ? rv * scales[col + rc.y]
+                                                         : H(rv * scales[col + rc.y])));
+            }
+        }
     for (uint i = 0; i < acc.Length(); ++i) {
         uint2 rc = acc.GetCoordinate(i);
         float v = acc.Get(i);
@@ -127,8 +151,16 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     }
 }
 
+// W16: weights arrive as f16 rather than E4M3.
+//
+// Not a quantization or quality change -- the caller supplies the same numbers, stored wide (see
+// pack_tiled_f16 in tests/bench_ffn32.hip, which round-trips through E4M3 so the values are identical
+// bit for bit). The only difference is how a weight fragment is filled: one rocwmma::load_matrix_sync
+// instead of load_e4m3's eight strided single-byte reads and eight conversions per lane. This exists to
+// put a number on that, because gfx1100's hardware counters all read 0.00 and the difference cannot be
+// measured any other way.
 template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false, bool F8IN = false,
-          bool HIN = false>
+          bool HIN = false, bool W16 = false>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
                           bool precise_c32 = false, __half* output_h = nullptr,
@@ -197,8 +229,16 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             A8 a = A8::Load(in + t0 * C, g * 32, C);
             for (uint n = 0; n < 4; ++n) {
                 uint col = (sub * 4 + n) * 16;
-                B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
-                ex[n].MultiplyAccumulate(a, b);
+
+                // An f16 tile is 1024 bytes with a 32-byte row stride where an E4M3 tile is 512 with 16
+                // -- same 16x32 element tile, two bytes an element instead of one.
+                if constexpr (W16) {
+                    B16 b = B16::LoadRow(weights, ((col / 16) * (C / 32) + g) * 1024, 32);
+                    ex[n].MultiplyAccumulate(a, b);
+                } else {
+                    B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
+                    ex[n].MultiplyAccumulate(a, b);
+                }
             }
         }
     }
@@ -231,8 +271,16 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             }
         for (uint g = 0; g < hidden_c / 32; ++g) {
             A8 a = A8::Load(hidden + t0 * hidden_c, g * 32, hidden_c);
-            B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
-            acc.MultiplyAccumulate(a, b);
+
+            // The contract weights follow the expand ones, so the base offset scales with the element
+            // size too: hidden_c * C elements, one byte each as E4M3 and two as f16.
+            if constexpr (W16) {
+                B16 b = B16::LoadRow(weights, 2 * hidden_c * C + (sub * (hidden_c / 32) + g) * 1024, 32);
+                acc.MultiplyAccumulate(a, b);
+            } else {
+                B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
+                acc.MultiplyAccumulate(a, b);
+            }
         }
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);

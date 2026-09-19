@@ -1,0 +1,45 @@
+make: Entering directory '/home/bartek/Downloads/AUR/dlss5-amd-hip-linux/hip'
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include tests/test_wmma.hip -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_wmma
+mkdir -p build
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -fPIC -c src/kernels.hip -o build/kernels.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_stages.hip -o build/test_stages.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_stages.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_stages
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_quantize.hip -o build/test_quantize.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_quantize.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_quantize
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_attention.hip -o build/test_attention.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_attention.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_attention
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_residual.hip -o build/test_residual.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_residual.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_residual
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_linear.hip -o build/test_linear.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_linear.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_linear
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_logical_ops.hip -o build/test_logical_ops.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_logical_ops.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_logical_ops
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -c tests/test_ffn_f32.hip -o build/test_ffn_f32.o
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include build/test_ffn_f32.o build/kernels.o -L/opt/rocm/lib -lamdhip64 -Wl,-rpath,/opt/rocm/lib -o test_ffn_f32
+device=AMD Radeon RX 7900 XT arch=11.0
+wmma_f8 16x32x16 max_abs_err=0.007812 mismatches=0 ok
+device=AMD Radeon RX 7900 XT
+ok   launch_ds finite-nonzero
+ok   launch_ds cpu-match
+ok   launch_split_ffwd finite-nonzero
+ok   launch_vit_attention finite-nonzero
+ok   launch_upsample_add cpu-match
+ok   launch_decoder_scatter cpu-match
+ok   launch_post70_merge cpu-match
+ok   launch_linear_skip cpu-match
+ok   pack/unpack roundtrip
+PASS  fails=0
+E4M3 RNE samples=1018 host_bad=0 gpu_bad=0 decode_bad=0
+window attention tokens=64 compared=2048 mismatches=0 max_error=0
+ViT attention tokens=16 compared=512 mismatches=0 max_error=0
+ViT attention tokens=64 compared=2048 mismatches=0 max_error=0
+ViT attention tokens=640 compared=20480 mismatches=0 max_error=0
+zero branches preserve learned skips: compared=4096 mismatches=0
+linear mode=0 max_error=0.000976562
+linear mode=1 max_error=0
+linear mode=2 max_error=0
+linear mode=3 max_error=2.38419e-07
+linear mode=4 max_error=0
+linear mismatches=38
+make: *** [Makefile:53: test] Error 1
+make: Leaving directory '/home/bartek/Downloads/AUR/dlss5-amd-hip-linux/hip'

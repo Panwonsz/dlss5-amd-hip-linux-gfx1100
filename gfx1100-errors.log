@@ -1,0 +1,4 @@
+make: Entering directory '/home/bartek/Downloads/AUR/dlss5-amd-hip-linux/hip'
+mkdir -p build
+/opt/rocm/bin/hipcc -O3 -std=c++17 --offload-arch=gfx1100 -Iinclude -I/opt/rocm/include -fPIC -c src/kernels.hip -o build/kernels.o
+make: Leaving directory '/home/bartek/Downloads/AUR/dlss5-amd-hip-linux/hip'

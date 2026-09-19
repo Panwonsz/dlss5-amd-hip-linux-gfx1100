@@ -1,3 +1,5 @@
+#include <cstdlib>
+
 #include "dlss5_runtime.hpp"
 #include "dlss5_launch.hpp"
 #include "../kernels/ffn_fused.hip"
@@ -23,6 +25,34 @@ void set_launch_stream(hipStream_t s) { g_stream = s; }
         name<<<grid, block, 0, g_stream>>>(__VA_ARGS__);                                            \
     } while (0)
 
+// DLSS5_FFN_GROUPS: how many 16-token tiles one CTA of the C32 FFN covers.
+//
+// This kernel is a third of the network's time -- 70 ms of 220 on a 7900 XT -- and a profile says the
+// cost is not the arithmetic. RDNA3 has no FP8 matrix instruction (that arrived with RDNA4/gfx1201),
+// so every weight fragment is unpacked from E4M3 to f16 before it can feed WMMA, and at GROUPS=2 one
+// CTA pays for the entire weight matrix in order to serve 32 tokens. At 960x576 that is 17,280 CTAs
+// all unpacking the same 8 KB.
+//
+// Raising GROUPS amortises the weights over more tokens, and costs occupancy and 2 KB of LDS per
+// group. Which way that trade falls is a question for the GPU, not for me, so it is a switch: the
+// variants are all compiled in and one launch measures each.
+static int ffn_groups32() {
+    static int groups = -1;
+
+    if (groups < 0) {
+        groups = 2;
+        const char* asked = std::getenv("DLSS5_FFN_GROUPS");
+
+        if (asked != nullptr) {
+            const int value = std::atoi(asked);
+
+            if (value == 1 || value == 2 || value == 4 || value == 8) groups = value;
+        }
+    }
+
+    return groups;
+}
+
 static uint grid_cap(uint n) { return n ? n : 1u; }
 
 void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, float* out, uint tokens,
@@ -38,19 +68,58 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
     default: throw std::runtime_error("FFN channels");
     }
 }
+// The same FFN with f16 weights. A separate entry point on purpose: the network's weights are E4M3, and
+// an environment switch inside launch_ffn_f32 would let one exported variable silently feed the whole
+// graph weights in a format it does not hold. Only a caller that packed f16 itself can reach this.
+void launch_ffn_f32_w16(int c, const float* in, const u8* w16, const float* scales, float* out,
+                        uint tokens, bool chain_residual, bool precise_c32) {
+    if (!tokens || in == out || (c == 32 && !scales)) throw std::runtime_error("FFN extent/alias/scales");
+    uint groups = (tokens + 15) / 16;
+    switch (c) {
+    case 32: LAUNCH((k_ffn_f32<32, false, 2, false, false, false, true>), (tokens + 31) / 32, 128, in,
+                    w16, scales, out, nullptr, tokens, chain_residual, precise_c32); break;
+    case 64: LAUNCH((k_ffn_f32<64, false, 1, false, false, false, true>), groups, 128, in, w16, scales,
+                    out, nullptr, tokens); break;
+    case 128: LAUNCH((k_ffn_f32<128, false, 1, false, false, false, true>), groups, 256, in, w16, scales,
+                     out, nullptr, tokens); break;
+    case 256: LAUNCH((k_ffn_f32<256, false, 1, false, false, false, true>), groups, 512, in, w16, scales,
+                     out, nullptr, tokens); break;
+    default: throw std::runtime_error("FFN channels");
+    }
+}
 void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scales, __half* out_h,
                           uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !scales || !out_h)
         throw std::runtime_error("FFN f16 extent/alias");
-    LAUNCH((k_ffn_f32<32, false, 2, true>), (tokens + 31) / 32, 128, in, w, scales, nullptr,
-           nullptr, tokens, chain_residual, precise_c32, out_h);
+    switch (ffn_groups32()) {
+    case 1: LAUNCH((k_ffn_f32<32, false, 1, true>), (tokens + 15) / 16, 64, in, w, scales, nullptr,
+                   nullptr, tokens, chain_residual, precise_c32, out_h); break;
+    case 4: LAUNCH((k_ffn_f32<32, false, 4, true>), (tokens + 63) / 64, 256, in, w, scales, nullptr,
+                   nullptr, tokens, chain_residual, precise_c32, out_h); break;
+    case 8: LAUNCH((k_ffn_f32<32, false, 8, true>), (tokens + 127) / 128, 512, in, w, scales, nullptr,
+                   nullptr, tokens, chain_residual, precise_c32, out_h); break;
+    default: LAUNCH((k_ffn_f32<32, false, 2, true>), (tokens + 31) / 32, 128, in, w, scales, nullptr,
+                    nullptr, tokens, chain_residual, precise_c32, out_h); break;
+    }
 }
 void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float* scales,
                              __half* out_h, uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || c != 32 || !in_h || !scales || !out_h)
         throw std::runtime_error("FFN f16 in extent/alias");
-    LAUNCH((k_ffn_f32<32, false, 2, true, false, true>), (tokens + 31) / 32, 128, nullptr, w,
-           scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr, in_h);
+    switch (ffn_groups32()) {
+    case 1: LAUNCH((k_ffn_f32<32, false, 1, true, false, true>), (tokens + 15) / 16, 64, nullptr, w,
+                   scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
+                   in_h); break;
+    case 4: LAUNCH((k_ffn_f32<32, false, 4, true, false, true>), (tokens + 63) / 64, 256, nullptr, w,
+                   scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
+                   in_h); break;
+    case 8: LAUNCH((k_ffn_f32<32, false, 8, true, false, true>), (tokens + 127) / 128, 512, nullptr,
+                   w, scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
+                   in_h); break;
+    default: LAUNCH((k_ffn_f32<32, false, 2, true, false, true>), (tokens + 31) / 32, 128, nullptr, w,
+                    scales, nullptr, nullptr, tokens, chain_residual, precise_c32, out_h, nullptr,
+                    in_h); break;
+    }
 }
 void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
                         u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {

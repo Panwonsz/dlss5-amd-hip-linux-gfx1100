@@ -1,0 +1,90 @@
+graph block=00 count=1 n=70778880 nonfinite=0 min=-3.88476562 max=5.609375 sum=-832562.056526 hash=9f3b4ecc
+graph block=01 count=1 n=17694720 nonfinite=0 min=-5.58203125 max=12.1796875 sum=-963317.497192 hash=cc73d96a
+graph block=02 count=1 n=17694720 nonfinite=0 min=-13.671875 max=15 sum=-1643624.79682 hash=a8eb1803
+graph block=03 count=1 n=17694720 nonfinite=0 min=-72.8125 max=38.84375 sum=1152769.70567 hash=303d1c1e
+graph block=04 count=1 n=17694720 nonfinite=0 min=-125.3125 max=154 sum=1464346.14026 hash=484fa0f8
+graph block=05 count=1 n=8847360 nonfinite=0 min=-72 max=44 sum=-1652491.74805 hash=64fca206
+graph block=06 count=1 n=8847360 nonfinite=0 min=-56 max=40 sum=-1632231.22461 hash=d0fd3794
+graph block=07 count=1 n=8847360 nonfinite=0 min=-60 max=36 sum=-1094336.62109 hash=ef76e77c
+graph block=08 count=1 n=8847360 nonfinite=0 min=-69.3125 max=57.71875 sum=-1100410.95847 hash=80111d84
+graph block=09 count=1 n=4423680 nonfinite=0 min=-26 max=30 sum=1286897.91992 hash=5183ad1f
+graph block=10 count=1 n=4423680 nonfinite=0 min=-24 max=32 sum=-25986.8417969 hash=6893e01c
+graph block=11 count=1 n=4423680 nonfinite=0 min=-26 max=32 sum=-337537.078125 hash=ded293f9
+graph block=12 count=1 n=4423680 nonfinite=0 min=-28 max=32 sum=-201872.28125 hash=b694df0b
+graph block=13 count=1 n=4423680 nonfinite=0 min=-36 max=24 sum=221805.429688 hash=6e6f49b9
+graph block=14 count=1 n=4423680 nonfinite=0 min=-27.265625 max=25.5625 sum=51518.7959366 hash=98a09584
+graph block=15 count=1 n=2211840 nonfinite=0 min=-22 max=24 sum=324370.162109 hash=2ca2fd93
+graph block=16 count=1 n=2211840 nonfinite=0 min=-22 max=22 sum=226722.294922 hash=f896554a
+graph block=17 count=1 n=2211840 nonfinite=0 min=-28 max=26 sum=276139.369141 hash=afde9e36
+graph block=18 count=1 n=2211840 nonfinite=0 min=-24 max=24 sum=123145.568359 hash=d73e80e1
+graph block=19 count=1 n=2211840 nonfinite=0 min=-22 max=24 sum=132158.023438 hash=c688c9f7
+graph block=20 count=1 n=2211840 nonfinite=0 min=-22 max=24 sum=132059.0625 hash=62205cd3
+graph block=21 count=1 n=2211840 nonfinite=0 min=-22 max=24 sum=142679.539062 hash=e900d735
+graph block=22 count=1 n=2211840 nonfinite=0 min=-25.078125 max=31.703125 sum=221543.998962 hash=fdb404a3
+graph block=23 count=1 n=1105920 nonfinite=0 min=-15 max=13 sum=-74619.6914062 hash=0259f1bd
+graph block=24 count=1 n=1105920 nonfinite=0 min=-12 max=12 sum=-55185.0996094 hash=997be9b5
+graph block=25 count=1 n=1105920 nonfinite=0 min=-16 max=12 sum=-65200.7539062 hash=cfc0ee05
+graph block=26 count=1 n=1105920 nonfinite=0 min=-12 max=12 sum=-34828.5488281 hash=afafda73
+graph block=27 count=1 n=1105920 nonfinite=0 min=-12 max=12 sum=-46806.6074219 hash=c8e49b04
+graph block=28 count=1 n=1105920 nonfinite=0 min=-12 max=12 sum=-40797.4375 hash=fcf092ab
+graph block=29 count=1 n=1105920 nonfinite=0 min=-12 max=12 sum=-46450.3164062 hash=85f5b0d4
+graph block=30 count=1 n=1105920 nonfinite=0 min=-11.9921875 max=12 sum=-42783.0717697 hash=d3730362
+graph block=31 count=1 n=655360 nonfinite=0 min=-16 max=14 sum=44120.0175781 hash=7f8b0f12
+graph block=32 count=1 n=655360 nonfinite=0 min=-18 max=12 sum=25630.0683594 hash=09b7ff4a
+graph block=33 count=1 n=655360 nonfinite=0 min=-12 max=13 sum=9398.84960938 hash=209c1fd0
+graph block=34 count=1 n=655360 nonfinite=0 min=-15 max=14 sum=9581.9375 hash=a78b946a
+graph block=35 count=1 n=655360 nonfinite=0 min=-15 max=14 sum=22218.1914062 hash=a6ce9135
+graph block=36 count=1 n=655360 nonfinite=0 min=-16 max=15 sum=6346.76367188 hash=adc4dcd8
+graph block=37 count=1 n=655360 nonfinite=0 min=-13 max=10 sum=-12893.2402344 hash=2e215d9d
+graph block=38 count=1 n=655360 nonfinite=0 min=-5.5 max=6.5 sum=5440.45507812 hash=f4ca34eb
+graph block=39 count=1 n=1105920 nonfinite=0 min=-9 max=8 sum=-40573.5273438 hash=964c5927
+graph block=40 count=1 n=1105920 nonfinite=0 min=-10 max=12 sum=-43552.0273438 hash=5757c3bf
+graph block=41 count=1 n=1105920 nonfinite=0 min=-11 max=10 sum=-39136.4082031 hash=dfa8e419
+graph block=42 count=1 n=1105920 nonfinite=0 min=-11 max=10 sum=-40722.8632812 hash=d7d80a9c
+graph block=43 count=1 n=1105920 nonfinite=0 min=-11 max=10 sum=-39880.5585938 hash=6ea397c3
+graph block=44 count=1 n=1105920 nonfinite=0 min=-10 max=10 sum=-33999.3144531 hash=f07ee29d
+graph block=45 count=1 n=1105920 nonfinite=0 min=-9 max=8 sum=-18448.0917969 hash=c7337ec1
+graph block=46 count=1 n=1105920 nonfinite=0 min=-9 max=8 sum=-14608.953125 hash=69c13626
+graph block=47 count=1 n=1105920 nonfinite=0 min=-8 max=9 sum=9071.62304688 hash=0c189610
+graph block=48 count=1 n=2211840 nonfinite=0 min=-15 max=16 sum=-27716.4902344 hash=a9aeb2f8
+graph block=49 count=1 n=2211840 nonfinite=0 min=-15 max=18 sum=-24647.6777344 hash=d0368aa8
+graph block=50 count=1 n=2211840 nonfinite=0 min=-15 max=16 sum=-136745.978516 hash=6e58c034
+graph block=51 count=1 n=2211840 nonfinite=0 min=-15 max=14 sum=-15965.6113281 hash=4b218f2c
+graph block=52 count=1 n=2211840 nonfinite=0 min=-15 max=14 sum=-35684.375 hash=39fa8429
+graph block=53 count=1 n=2211840 nonfinite=0 min=-14 max=14 sum=-66554.5136719 hash=89d2a8db
+graph block=54 count=1 n=2211840 nonfinite=0 min=-14 max=13 sum=-126674.666016 hash=d05b0f0b
+graph block=55 count=1 n=2211840 nonfinite=0 min=-16 max=16 sum=-386282.070312 hash=1580a7c9
+graph block=56 count=1 n=4423680 nonfinite=0 min=-28 max=32 sum=1682773.9375 hash=1d805b77
+graph block=57 count=1 n=4423680 nonfinite=0 min=-28 max=32 sum=1652435.89844 hash=0d818143
+graph block=58 count=1 n=4423680 nonfinite=0 min=-30 max=36 sum=1470951.26172 hash=15458054
+graph block=59 count=1 n=4423680 nonfinite=0 min=-30 max=40 sum=1647702.41992 hash=d839fe64
+graph block=60 count=1 n=4423680 nonfinite=0 min=-48 max=56 sum=1401474.60156 hash=ea149448
+graph block=61 count=1 n=4423680 nonfinite=0 min=-60 max=60 sum=219886.671875 hash=07ce15e6
+graph block=62 count=1 n=8847360 nonfinite=0 min=-96 max=128 sum=4254251.69336 hash=92832920
+graph block=63 count=1 n=8847360 nonfinite=0 min=-112 max=144 sum=4303682.7168 hash=04e7ec3d
+graph block=64 count=1 n=8847360 nonfinite=0 min=-120 max=144 sum=5126752.46484 hash=b2f7c126
+graph block=65 count=1 n=8847360 nonfinite=0 min=-128 max=160 sum=5064853.65625 hash=c5ec7e36
+graph block=66 count=1 n=17694720 nonfinite=0 min=-176.875 max=204.25 sum=1150390.11572 hash=1d731307
+graph block=67 count=1 n=17694720 nonfinite=0 min=-173.875 max=209.5 sum=-555904.483643 hash=c063d503
+graph block=68 count=1 n=17694720 nonfinite=0 min=-181.125 max=218 sum=-3869290.1991 hash=6dcad165
+graph block=69 count=1 n=17694720 nonfinite=0 min=-186.375 max=96.1875 sum=10466429.083 hash=17934f7a
+graph block=70 count=1 n=70778880 nonfinite=0 min=-36.25 max=42.03125 sum=-45722386.5186 hash=a55d3657
+{
+  "input": "/home/bartek/Pictures/test_1080p.png",
+  "output": "/home/bartek/Pictures/dlss5_trace.png",
+  "weights": "/home/bartek/.cache/dlss5-hip/weights/lmxxf-15799b1-amd-consumer-derived-v1/e16bcf15e16e13f527491cdf7845b2fe6521a738d8f7c9c721866a8496e1fc8e",
+  "layout_mode": "amd-consumer-derived",
+  "nvidia_equivalence_verified": false,
+  "blocks": 71,
+  "seed": 0,
+  "model_init_ms": 736.171063996153,
+  "run_wall_ms": [
+    4895.538732002024
+  ],
+  "replay_equal": true,
+  "finite": true,
+  "mean_abs_change": 0.01585737057030201,
+  "library_sha256": "3133dad4524c05f09c8db68d881f293079ffa23e875ce32b8528caa029df4632",
+  "output_sha256": "0a2992451ecea8b4d5f21d6d4cf1ead063be4b99d5dc11fc5a582ea74124659a",
+  "note": "Offline display-encoded image inference; not a game/HDR or NVIDIA reference comparison."
+}

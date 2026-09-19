@@ -21,6 +21,23 @@ int main(int argc, char** argv) {
     std::vector<u8> tiled(w.size());
     pack_tiled_e4m3(tiled.data(), w.data(), 4 * c, c);
     pack_tiled_e4m3(tiled.data() + 4 * c * c, w.data() + 4 * c * c, c, 4 * c);
+
+    // The same weights, stored as f16 in the same tile layout. Deliberately round-tripped through E4M3
+    // first: the matrix unit must see values identical to the E4M3 run, or the timing comparison is
+    // measuring two different computations and means nothing. The output hashes below prove it.
+    auto pack_tiled_f16 = [](u8* dst, const float* src, size_t N, size_t K) {
+        __half* d = reinterpret_cast<__half*>(dst);
+        for (size_t t = 0; t < N / 16; t++)
+            for (size_t g = 0; g < K / 32; g++)
+                for (size_t k = 0; k < 32; k++)
+                    for (size_t j = 0; j < 16; j++)
+                        d[(t * (K / 32) + g) * 512 + k * 16 + j] =
+                            __float2half(from_e4m3(e4m3_byte(src[(t * 16 + j) * K + g * 32 + k])));
+    };
+
+    std::vector<u8> tiled16(w.size() * 2);
+    pack_tiled_f16(tiled16.data(), w.data(), 4 * c, c);
+    pack_tiled_f16(tiled16.data() + 2 * 4 * c * c, w.data() + 4 * c * c, c, 4 * c);
     DeviceBuf dx(x.size() * 4), dw(tiled.size()), ds(sc.size() * 4), dy(size_t(tokens) * c * 4);
     dx.upload(x.data(), x.size() * 4); dw.upload(tiled.data(), tiled.size());
     ds.upload(sc.data(), sc.size() * 4);
@@ -44,5 +61,50 @@ int main(int argc, char** argv) {
     for (float v : out) { hsh ^= uint64_t(as_u32(v)); hsh *= 1099511628211ull; }
     std::printf("out_hash=%016llx min=%g max=%g\n", (unsigned long long)hsh,
                 *std::min_element(out.begin(), out.end()), *std::max_element(out.begin(), out.end()));
+
+    // --- the same kernel, the same numbers, f16 weights ------------------------------------------
+    //
+    // RDNA3 has no FP8 matrix instruction, so an E4M3 weight fragment is filled by load_e4m3(): eight
+    // strided single-byte reads and eight conversions per lane. The f16 path is one load_matrix_sync.
+    // The difference between these two timings is what that costs, and it is the only number that says
+    // whether storing the weights wide is worth 148 MB more VRAM.
+    DeviceBuf dw16(tiled16.size()), dy16(size_t(tokens) * c * 4);
+    dw16.upload(tiled16.data(), tiled16.size());
+
+    auto go16 = [&] {
+        launch_ffn_f32_w16(c, dx.as<float>(), dw16.as<u8>(), ds.as<float>(), dy16.as<float>(), tokens,
+                           false, true);
+    };
+
+    for (int i = 0; i < 5; ++i) go16();
+    hip_check(hipStreamSynchronize(stream), "warm16");
+    hipEventRecord(e0, stream);
+    for (int i = 0; i < iters; ++i) go16();
+    hipEventRecord(e1, stream);
+    hip_check(hipEventSynchronize(e1), "sync16");
+    float ms16 = 0; hipEventElapsedTime(&ms16, e0, e1); ms16 /= iters;
+
+    std::vector<float> out16(size_t(tokens) * c);
+    dy16.download(out16.data(), out16.size() * 4);
+    uint64_t hsh16 = 1469598103934665603ull;
+    for (float v : out16) { hsh16 ^= uint64_t(as_u32(v)); hsh16 *= 1099511628211ull; }
+
+    std::printf("FFN32 f16-weights: %.3f ms/call  out_hash=%016llx\n", ms16, (unsigned long long)hsh16);
+
+    if (hsh16 != hsh) {
+        // Without this the timing above would be compared against a different computation, which is
+        // exactly the sort of confident nonsense this whole exercise is meant to avoid.
+        std::printf("MISMATCH: the f16 run computed something different, so the timing is meaningless. "
+                    "Ignore the comparison.\n");
+        return 1;
+    }
+
+    std::printf("identical output. E4M3 %.3f ms -> f16 %.3f ms = %+.1f%% (%.3f ms)\n", ms, ms16,
+                (ms16 - ms) / ms * 100.0, ms16 - ms);
+    std::printf("%s\n", ms16 < ms * 0.9
+                             ? "The E4M3 load path is a real cost. Converting the weights to f16 once at "
+                               "load would buy this across the whole network, with no quantization."
+                             : "The load path is not the bottleneck. f16 weights buy nothing here -- and "
+                               "neither would INT8, whose only advantage on RDNA3 was a cheaper load.");
     return 0;
 }

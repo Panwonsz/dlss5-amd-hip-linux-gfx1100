@@ -44,6 +44,9 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
                                          bool matrix_residual, uint rw, uint rh, uint rsw,
                                          uint rpx, uint rpy);
 
+// The FFN with f16 weights, for measuring what the E4M3 fragment load costs. The caller packs them.
+void launch_ffn_f32_w16(int c, const float* in, const u8* w16, const float* scales, float* out,
+                        uint tokens, bool chain_residual = false, bool precise_c32 = false);
 void launch_ffn_f32_hout(int c, const float* in, const u8* w, const float* scales, __half* out_h,
                           uint tokens, bool chain_residual, bool precise_c32);
 void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float* scales,
