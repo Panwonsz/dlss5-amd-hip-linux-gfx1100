@@ -68,7 +68,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         A8 a = A8::Load(tile, 0, 32);
         // Four output waves share one converted input tile. In the final
         // partial group, inactive waves read a valid tile and omit stores.
-        B8 b = B8::LoadRowPacked(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512);
+        B8 b = B8::LoadRow(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512, 16);
         if (ordered == 2) {
             partition.MultiplyAccumulate(a,b);
             if ((g+1) % (k/128) == 0) {
@@ -236,7 +236,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                     BW16 b = BW16::LoadRow(weights, ((col / 16) * (C / 32) + g) * 1024, 32);
                     ex[n].MultiplyAccumulate(a, b);
                 } else {
-                    B8 b = B8::LoadRowPacked(weights, ((col / 16) * (C / 32) + g) * 512);
+                    B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
                     ex[n].MultiplyAccumulate(a, b);
                 }
             }
@@ -278,7 +278,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                 BW16 b = BW16::LoadRow(weights, 2 * hidden_c * C + (sub * (hidden_c / 32) + g) * 1024, 32);
                 acc.MultiplyAccumulate(a, b);
             } else {
-                B8 b = B8::LoadRowPacked(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512);
+                B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
                 acc.MultiplyAccumulate(a, b);
             }
         }
@@ -523,15 +523,15 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
      }
     }
    __syncthreads();
-  a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRowPacked(pre,((group*4+wave)*16+g)*512));__syncthreads();
+  a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRow(pre,((group*4+wave)*16+g)*512,16));__syncthreads();
  }
  for(uint i=0;i<a.Length();++i)a.Set(i,H(a.Get(i)));a.StoreF8(mix,wave*16,64);__syncthreads();
  for(uint j=0;j<4;++j){C32 acc=C32::Splat(0.f);uint col=wave*64+j*16;
-  for(uint g=0;g<2;++g)acc.MultiplyAccumulate(A8::Load(mix,g*32,64),B8::LoadRowPacked(expand,group*16384+((col/16)*2+g)*512));
+  for(uint g=0;g<2;++g)acc.MultiplyAccumulate(A8::Load(mix,g*32,64),B8::LoadRow(expand,group*16384+((col/16)*2+g)*512,16));
   for(uint i=0;i<acc.Length();++i)acc.Set(i,ActivatePoly(H(acc.Get(i))));acc.StoreF8(hid,col,256);
  }
  __syncthreads();C32 acc=C32::Splat(0.f);
- for(uint g=0;g<8;++g)acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRowPacked(contract,group*16384+(wave*8+g)*512));
+ for(uint g=0;g<8;++g)acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
   for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens){u8 q=e4m3_byte(H(acc.Get(i)));if constexpr(F8OUT)out_f8[(first+rc.x)*512+group*64+wave*16+rc.y]=q;out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(q);}}
 }
 
