@@ -200,6 +200,18 @@ using A8 = MatrixA<float8_t>;
 using B8 = MatrixB<float8_t>;
 using A16 = MatrixA<f16>;
 using B16 = MatrixB<f16>;
+
+// The weight fragment for the W16 path: whatever storage type THIS compilation pass gives an E4M3
+// matrix, so matrix A and matrix B always agree on element size.
+//
+// On gfx11 that is f16, and loading it is a single vectorised load_matrix_sync -- which is exactly what
+// the W16 experiment exists to measure against load_e4m3's eight strided single-byte reads. In the HOST
+// pass, where __gfx1100__ is not defined and StorageT is the identity, it is float8_t instead: never
+// executed, but it has to compile, because HIP instantiates every __global__ template on the host to
+// build its launch stub. Naming B16 directly here fails that pass with rocWMMA's "Input datatypes must
+// be same size", which is correct -- fp8 and f16 are not the same size, and only the device pass agrees
+// that an fp8 matrix is stored as f16.
+using BW16 = MatrixB<StorageT<float8_t>>;
 using C32 = MatrixC;
 
 } // namespace linalg

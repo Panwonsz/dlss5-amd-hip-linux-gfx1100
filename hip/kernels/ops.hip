@@ -233,7 +233,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                 // An f16 tile is 1024 bytes with a 32-byte row stride where an E4M3 tile is 512 with 16
                 // -- same 16x32 element tile, two bytes an element instead of one.
                 if constexpr (W16) {
-                    B16 b = B16::LoadRow(weights, ((col / 16) * (C / 32) + g) * 1024, 32);
+                    BW16 b = BW16::LoadRow(weights, ((col / 16) * (C / 32) + g) * 1024, 32);
                     ex[n].MultiplyAccumulate(a, b);
                 } else {
                     B8 b = B8::LoadRow(weights, ((col / 16) * (C / 32) + g) * 512, 16);
@@ -275,7 +275,7 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             // The contract weights follow the expand ones, so the base offset scales with the element
             // size too: hidden_c * C elements, one byte each as E4M3 and two as f16.
             if constexpr (W16) {
-                B16 b = B16::LoadRow(weights, 2 * hidden_c * C + (sub * (hidden_c / 32) + g) * 1024, 32);
+                BW16 b = BW16::LoadRow(weights, 2 * hidden_c * C + (sub * (hidden_c / 32) + g) * 1024, 32);
                 acc.MultiplyAccumulate(a, b);
             } else {
                 B8 b = B8::LoadRow(weights, hidden_c * C + (sub * (hidden_c / 32) + g) * 512, 16);
