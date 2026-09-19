@@ -7,11 +7,24 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 using namespace dlss5;
 int main(int argc, char** argv) {
-    const uint c = 32, tokens = argc > 1 ? std::stoul(argv[1]) : 552960u;
     const int iters = argc > 2 ? std::atoi(argv[2]) : 20;
+    const uint c = argc > 3 ? std::stoul(argv[3]) : 32u;
+
+    if (c != 32 && c != 64 && c != 128 && c != 256) {
+        std::printf("C must be 32, 64, 128 or 256\n");
+        return 2;
+    }
+
+    // The network quarters the token count each time it doubles C, so each stage does comparable
+    // arithmetic. Matching that here keeps the four measurements on the same footing instead of making
+    // the wide ones look expensive purely for covering more tokens. "-" for argv[1] takes this default.
+    const uint defaults = 552960u / ((c / 32u) * (c / 32u));
+    const bool explicit_tokens = argc > 1 && std::string(argv[1]) != "-";
+    const uint tokens = explicit_tokens ? std::stoul(argv[1]) : defaults;
     std::vector<float> x(size_t(tokens) * c);
     for (size_t i = 0; i < x.size(); ++i) x[i] = H(float(int((i * 2654435761u) % 1000) - 500) * 0.002f);
     std::vector<float> w(8 * c * c);
@@ -44,7 +57,8 @@ int main(int argc, char** argv) {
     hipStream_t stream; hip_check(hipStreamCreate(&stream), "stream");
     set_launch_stream(stream);
     auto go = [&] {
-        launch_ffn_f32(c, dx.as<float>(), dw.as<u8>(), ds.as<float>(), dy.as<float>(), tokens, false, true);
+        launch_ffn_f32(c, dx.as<float>(), dw.as<u8>(), ds.as<float>(), dy.as<float>(), tokens, false,
+                       c == 32);
     };
     for (int i = 0; i < 5; ++i) go();
     hip_check(hipStreamSynchronize(stream), "warm");
@@ -54,7 +68,7 @@ int main(int argc, char** argv) {
     hipEventRecord(e1, stream);
     hip_check(hipEventSynchronize(e1), "sync");
     float ms = 0; hipEventElapsedTime(&ms, e0, e1); ms /= iters;
-    std::printf("FFN32 tokens=%u iters=%d: %.3f ms/call\n", tokens, iters, ms);
+    std::printf("FFN C=%u tokens=%u iters=%d: %.3f ms/call\n", c, tokens, iters, ms);
     std::vector<float> out(size_t(tokens) * c);
     dy.download(out.data(), out.size() * 4);
     uint64_t hsh = 1469598103934665603ull;
@@ -73,7 +87,7 @@ int main(int argc, char** argv) {
 
     auto go16 = [&] {
         launch_ffn_f32_w16(c, dx.as<float>(), dw16.as<u8>(), ds.as<float>(), dy16.as<float>(), tokens,
-                           false, true);
+                           false, c == 32);
     };
 
     for (int i = 0; i < 5; ++i) go16();
@@ -89,7 +103,8 @@ int main(int argc, char** argv) {
     uint64_t hsh16 = 1469598103934665603ull;
     for (float v : out16) { hsh16 ^= uint64_t(as_u32(v)); hsh16 *= 1099511628211ull; }
 
-    std::printf("FFN32 f16-weights: %.3f ms/call  out_hash=%016llx\n", ms16, (unsigned long long)hsh16);
+    std::printf("FFN C=%u f16-weights: %.3f ms/call  out_hash=%016llx\n", c, ms16,
+                (unsigned long long)hsh16);
 
     if (hsh16 != hsh) {
         // Without this the timing above would be compared against a different computation, which is
@@ -101,10 +116,13 @@ int main(int argc, char** argv) {
 
     std::printf("identical output. E4M3 %.3f ms -> f16 %.3f ms = %+.1f%% (%.3f ms)\n", ms, ms16,
                 (ms16 - ms) / ms * 100.0, ms16 - ms);
-    std::printf("%s\n", ms16 < ms * 0.9
-                             ? "The E4M3 load path is a real cost. Converting the weights to f16 once at "
-                               "load would buy this across the whole network, with no quantization."
-                             : "The load path is not the bottleneck. f16 weights buy nothing here -- and "
-                               "neither would INT8, whose only advantage on RDNA3 was a cheaper load.");
+    std::printf("C=%u: %s\n", c,
+                ms16 < ms * 0.9 ? "the E4M3 load path costs real time at this width"
+                : ms16 > ms * 1.05
+                    ? "f16 weights are SLOWER at this width -- doubled weight traffic outweighs the "
+                      "cheaper load, so a network-wide conversion would have to be per-C"
+                    : "no meaningful difference at this width; the loader is not the limit here");
+    std::printf("weights=%zu KiB as E4M3, %zu KiB as f16\n", size_t(8 * c * c) / 1024,
+                size_t(2 * 8 * c * c) / 1024);
     return 0;
 }
