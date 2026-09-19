@@ -47,8 +47,33 @@ __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) 
         for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(p[(base + i) * ldm + lead]);
     } else {
         // A row_major: p[row * ldm + col], row = lead;  B col_major: p[col * ldm + row], col = lead
+        //
+        // These eight bytes are ADJACENT, so they are read as two dwords rather than eight byte loads.
+        // RDNA3 has no FP8 matrix instruction, so every one of these fragments is filled by hand, and
+        // this branch serves every activation load in the network plus attention's K and V -- which are
+        // activations, not weights, and so were untouched by the f16 weight conversion.
+        //
+        // Alignment holds wherever it is used: base is 0 or 8 and every ldm in this codebase is a
+        // multiple of four, so all lanes agree with the tile base. The check is still there because a
+        // misaligned dword load is a fault rather than a slowdown, and a future caller with an odd
+        // stride should get the slow path, not a crash.
         const u8* q = p + lead * ldm + base;
-        for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(q[i]);
+
+        if ((reinterpret_cast<uintptr_t>(q) & 3u) == 0u) {
+            const u32 lo = reinterpret_cast<const u32*>(q)[0];
+            const u32 hi = reinterpret_cast<const u32*>(q)[1];
+
+            f[0] = e4m3_to_half(lo & 0xffu);
+            f[1] = e4m3_to_half((lo >> 8) & 0xffu);
+            f[2] = e4m3_to_half((lo >> 16) & 0xffu);
+            f[3] = e4m3_to_half(lo >> 24);
+            f[4] = e4m3_to_half(hi & 0xffu);
+            f[5] = e4m3_to_half((hi >> 8) & 0xffu);
+            f[6] = e4m3_to_half((hi >> 16) & 0xffu);
+            f[7] = e4m3_to_half(hi >> 24);
+        } else {
+            for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(q[i]);
+        }
     }
 }
 #define DLSS5_LOAD_FRAG(frag, p, ldm, kind)                                              \
