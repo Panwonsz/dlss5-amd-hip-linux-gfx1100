@@ -18,14 +18,24 @@ __device__ inline void qkv32_barrier_asm() {
 #include <cstdlib>
 #include <vector>
 using namespace dlss5;
+// Both AH16 instantiations live in the same binary so the A/B is one argument and the two out_hash
+// values come from a single build. Bit-identity is the whole claim: staging the A-tile as the f16
+// of the E4M3-rounded input must reproduce the E4M3 tile's output byte for byte.
+// (input_f8 is the second parameter since the F8IN path landed; this bench feeds f32.)
 static void qkv32_launch(const float* in, const u8* w, u8* out, uint m,
-                         const float* scales, hipStream_t stream) {
-    k_qkv_norm_f32<32, 1><<<dim3((m + 15) / 16, 3u), 64, 0, stream>>>(
-        in, w, out, m, 32u, scales, 1.f, true);
+                         const float* scales, hipStream_t stream, bool ah16) {
+    const dim3 grid((m + 15) / 16, 3u);
+    if (ah16)
+        k_qkv_norm_f32<32, 1, false, false, false, true><<<grid, 64, 0, stream>>>(
+            in, nullptr, w, out, m, 32u, scales, 1.f, true);
+    else
+        k_qkv_norm_f32<32, 1, false, false, false, false><<<grid, 64, 0, stream>>>(
+            in, nullptr, w, out, m, 32u, scales, 1.f, true);
 }
 int main(int argc, char** argv) {
     const uint c = 32, m = argc > 1 ? std::stoul(argv[1]) : 2211840u;
     const int iters = argc > 2 ? std::atoi(argv[2]) : 12;
+    const bool ah16 = argc > 3 ? std::atoi(argv[3]) != 0 : true;
     std::vector<float> x(size_t(m) * c);
     for (size_t i = 0; i < x.size(); ++i) x[i] = H(float(int((i * 2654435761u) % 1000) - 500) * 0.002f);
     std::vector<float> w(3 * c * c);
@@ -39,7 +49,7 @@ int main(int argc, char** argv) {
     ds.upload(sc.data(), sc.size() * 4);
     hipStream_t stream; hip_check(hipStreamCreate(&stream), "stream");
     auto go = [&] {
-        qkv32_launch(dx.as<float>(), dw.as<u8>(), dy.as<u8>(), m, ds.as<float>(), stream);
+        qkv32_launch(dx.as<float>(), dw.as<u8>(), dy.as<u8>(), m, ds.as<float>(), stream, ah16);
     };
     for (int i = 0; i < 3; ++i) go();
     hip_check(hipStreamSynchronize(stream), "warm");
@@ -49,7 +59,7 @@ int main(int argc, char** argv) {
     hipEventRecord(e1, stream);
     hip_check(hipEventSynchronize(e1), "sync");
     float ms = 0; hipEventElapsedTime(&ms, e0, e1); ms /= iters;
-    std::printf("QKV32 m=%u iters=%d%s: %.3f ms/call\n", m, iters,
+    std::printf("QKV32 m=%u iters=%d ah16=%d%s: %.3f ms/call\n", m, iters, int(ah16),
 #ifdef QKV32_ASM_BARRIER
                 " [asm-barrier]"
 #else

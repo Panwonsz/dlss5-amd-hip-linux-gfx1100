@@ -260,6 +260,18 @@ template <bool F16> struct HiddenA { using type = MatrixA<float8_t>; };
 template <> struct HiddenA<true> { using type = MatrixA<StorageT<float8_t>>; };
 using B16 = MatrixB<f16>;
 
+// Default for the AH16 template parameter of k_linear_f32 and k_qkv_norm_f32: stage their LDS A-tile
+// as f16 rather than E4M3. On by default for the same reason the FFN's is -- it changes nothing
+// outside the kernel, so there is no upload, no launcher variant and no flag to keep in sync.
+//
+// It is a macro only so that the A/B can be built without editing source: -DDLSS5_AH16=0 rebuilds
+// both kernels on the old path, and the two builds must agree on hip-network70's mean and
+// mean_abs_change. (Replay equality would NOT settle it: the same input giving the same output is
+// satisfied perfectly by a wrong-but-stable tile format.)
+#ifndef DLSS5_AH16
+#define DLSS5_AH16 1
+#endif
+
 // The weight fragment for the W16 path: whatever storage type THIS compilation pass gives an E4M3
 // matrix, so matrix A and matrix B always agree on element size.
 //

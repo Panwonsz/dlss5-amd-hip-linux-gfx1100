@@ -8,8 +8,15 @@ namespace dlss5 {
 // 4 C32 final H(branch + residual*scale) without H(product), 5 direct FP8.
 // ordered: 0 FP32 accumulation, 1 H after each K32, 2 four independent
 // FP32 K partitions combined with H(residual*scale) (fast ViT reduce).
+// AH16: the LDS A-tile holds the f16 of the E4M3-rounded input instead of the E4M3 byte, so each
+// A fragment is one rocwmma::load_matrix_sync rather than load_e4m3's per-lane unpack. Not a
+// numerics change -- the staging rounds to E4M3 either way and every E4M3 code is exact in f16, so
+// the matrix unit is handed the same values. What moves is the conversion: once per element as the
+// tile is written, instead of eight per lane per fragment for each of the four waves that read it.
+// Costs 512 bytes of LDS, in a kernel that uses 512.
 template <bool F8IN, bool F8OUT = false, bool HRID = false, bool HOUT = false,
-          bool F8OUT_RASTER = false, bool F8RES = false, bool HOUT_RASTER = false>
+          bool F8OUT_RASTER = false, bool F8RES = false, bool HOUT_RASTER = false,
+          bool AH16 = DLSS5_AH16>
 __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* weights,
                              float* output, u8* output_f8, uint m, uint n, uint k,
                              const float* residual, const float* scales, int mode, int ordered,
@@ -19,7 +26,10 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
                              const u8* residual_f8 = nullptr, __half* output_h_raster = nullptr) {
     using namespace linalg;
     const uint first = blockIdx.x * 16, col = blockIdx.y * 64 + (threadIdx.x / 32) * 16;
-    __shared__ u8 tile[512];
+    // Element size of the staged A-tile: 1 byte as E4M3, 2 as f16. Aligned because the f16 path
+    // stores eight bytes at a time and a misaligned LDS vector store is a fault, not a slowdown.
+    constexpr uint ASZ = AH16 ? 2u : 1u;
+    __shared__ __align__(16) u8 tile[512 * ASZ];
     C32 acc = C32::Splat(0.f);
 #if DLSS5_GFX11
     // gfx11 f16-operand WMMA does not accumulate onto a fine-grid f32 residual
@@ -49,23 +59,34 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
     C32 partition = C32::Splat(0.f);
     for (uint g = 0; g < k / 32; ++g) {
         {
-            const uint col = (threadIdx.x % 8u) * 4u;
+            // Renamed from `col` to stop it shadowing the output column above: the weight load
+            // below this block reads the outer one, and the two differ.
+            const uint c4 = (threadIdx.x % 8u) * 4u;
             const uint row = first + threadIdx.x / 8u;
+            // Four E4M3 codes, formed exactly as before whichever format the tile holds.
+            u32 q;
             if (F8IN) {
-                *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
-                    row < m ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + col)
+                q = row < m ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + c4)
                             : 0u;
             } else {
                 const float4 v = row < m
-                    ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + col)
+                    ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
                     : make_float4(0.f, 0.f, 0.f, 0.f);
-                *reinterpret_cast<u32*>(tile + (threadIdx.x / 8u) * 32u + col) =
-                    u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                q = u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
                     u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
             }
+            u8* dst = tile + ((threadIdx.x / 8u) * 32u + c4) * ASZ;
+            if constexpr (AH16)
+                *reinterpret_cast<uint2*>(dst) = e4m3x4_to_half4(q);
+            else
+                *reinterpret_cast<u32*>(dst) = q;
         }
         __syncthreads();
-        A8 a = A8::Load(tile, 0, 32);
+        // One declaration for both formats; the row stride scales with the element size. On the
+        // host pass HiddenA<true> is still an fp8 fragment, which is wrong and never runs -- it is
+        // there so B8 below agrees with it on element size and the launch stub compiles.
+        using AT = typename HiddenA<AH16>::type;
+        AT a = AT::Load(tile, 0, 32u * ASZ);
         // Four output waves share one converted input tile. In the final
         // partial group, inactive waves read a valid tile and omit stores.
         B8 b = B8::LoadRow(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512, 16);
@@ -76,7 +97,11 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
                 partition=C32::Splat(0.f);
             }
         } else if (ordered == 1) {
-            C32 part = Multiply(a, b);
+            // Was Multiply(a, b), which deduces ONE DataT from both operands. A and B no longer
+            // share a source format, so it is spelled out; MultiplyAccumulate onto a zeroed C is
+            // what Multiply does and issues the same two mma_sync.
+            C32 part = C32::Splat(0.f);
+            part.MultiplyAccumulate(a, b);
             for (uint i = 0; i < acc.Length(); ++i) acc.Set(i, H(acc.Get(i) + part.Get(i)));
         } else acc.MultiplyAccumulate(a, b);
         __syncthreads();

@@ -31,7 +31,12 @@ __device__ inline float sq_f32(float v) {
     return t;
 }
 
-template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false>
+// AH16: the A-tile is staged as the f16 of the E4M3-rounded input rather than as E4M3 bytes, so the
+// A fragments load with one rocwmma::load_matrix_sync instead of load_e4m3's per-lane unpack. The
+// staging rounds to E4M3 either way and every E4M3 code is exact in f16, so the matrix unit sees the
+// same numbers and the output hash is unchanged (tests/bench_qkv32.hip).
+template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false,
+          bool AH16 = DLSS5_AH16>
 __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
                                u8* output, uint m, uint k, const float* scales, float qgain,
                                bool half_squares, const __half* input_h = nullptr,
@@ -42,12 +47,18 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
     const uint first = blockIdx.x * 16u;
     const uint head0 = head_base + blockIdx.y * NH;
     const uint wave = threadIdx.x / 32u;
-    // Single LDS buffer: the A-tile staging (512B) aliases the start of the
-    // stage buffer. The tile is only read inside the K loop; stage is only
+    // Single LDS buffer: the A-tile staging aliases the start of the stage
+    // buffer. The tile is only read inside the K loop; stage is only
     // written after it (with a barrier between), so the aliasing is safe.
     // Cuts LDS 512+16*COLS*4 -> 16*COLS*4 (e.g. C32/NH1 2560B->2048B).
+    //
+    // AH16 doubles the tile, 512B -> 1KB, and costs no LDS at all: the smallest stage here is
+    // NH=1's 16*32 floats = 2048 B, so the wider tile still fits inside it. Aligned because the
+    // f16 path stores eight bytes at a time.
+    constexpr uint ASZ = AH16 ? 2u : 1u;
     constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 64u : COLS;
-    __shared__ float stage[16 * STAGE_COLS];
+    static_assert(16u * STAGE_COLS * 4u >= 16u * 32u * ASZ, "A-tile no longer fits inside stage");
+    __shared__ __align__(16) float stage[16 * STAGE_COLS];
     u8* tile = reinterpret_cast<u8*>(stage);
     C32 acc = C32::Splat(0.f);
     const uint col = head0 * 32u + wave * 16u;
@@ -64,9 +75,10 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
             for (uint rr = 0; rr < ROWS_PER_THREAD; ++rr) {
                 const uint rlocal = base * ROWS_PER_THREAD + rr;
                 const uint row = first + rlocal;
+                // Four E4M3 codes, formed exactly as before whichever format the tile holds.
+                u32 q;
                 if (F8IN) {
-                    *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
-                        row < m
+                    q = row < m
                             ? *reinterpret_cast<const u32*>(input_f8 + row * k + g * 32u + c4)
                             : 0u;
                 } else if (HIN) {
@@ -78,21 +90,28 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
                     float y = __half2float(__high2half(h0));
                     float z = __half2float(__low2half(h1));
                     float w = __half2float(__high2half(h1));
-                    *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
-                        u32(e4m3_byte(x)) | u32(e4m3_byte(y)) << 8 |
+                    q = u32(e4m3_byte(x)) | u32(e4m3_byte(y)) << 8 |
                         u32(e4m3_byte(z)) << 16 | u32(e4m3_byte(w)) << 24;
                 } else {
                     const float4 v = row < m
                         ? *reinterpret_cast<const float4*>(input + row * k + g * 32u + c4)
                         : make_float4(0.f, 0.f, 0.f, 0.f);
-                    *reinterpret_cast<u32*>(tile + rlocal * 32u + c4) =
-                        u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
+                    q = u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
                         u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
                 }
+                u8* dst = tile + (rlocal * 32u + c4) * ASZ;
+                if constexpr (AH16)
+                    *reinterpret_cast<uint2*>(dst) = e4m3x4_to_half4(q);
+                else
+                    *reinterpret_cast<u32*>(dst) = q;
             }
         }
         __syncthreads();
-        A8 a = A8::Load(tile, 0, 32);
+        // One declaration for both formats; the row stride scales with the element size. On the
+        // host pass HiddenA<true> is still an fp8 fragment -- wrong, never runs, and the only
+        // spelling that lets B8 below agree with it on element size so the launch stub compiles.
+        using AT = typename HiddenA<AH16>::type;
+        AT a = AT::Load(tile, 0, 32u * ASZ);
         B8 b = B8::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 512u, 16);
         acc.MultiplyAccumulate(a, b);
         __syncthreads();

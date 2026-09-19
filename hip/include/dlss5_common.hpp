@@ -67,13 +67,16 @@ __device__ inline u32 dlss5_mask(bool c) { return 0u - u32(c); }
 // Branch-free E4M3 byte -> f16 (exact for every code; 0x7f/0xff -> f16 NaN).
 // Integer-only so the 32 lanes vectorize; a private f16[256] + load_matrix_sync
 // was ~19x slower (tests/probe_frag.hip: 129 vs 2471 GFLOPS).
-__device__ inline __half e4m3_to_half(u32 b) {
+__device__ inline uint16_t e4m3_to_half_bits(u32 b) {
     u32 e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 8;
     u32 normal = ((e + 8u) << 10) | (m << 7);
     u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
     u32 mask = 0u - u32(e != 0u);
     u32 nan = 0u - u32((b & 0x7fu) == 0x7fu);
-    return __ushort_as_half(uint16_t(s | (normal & mask) | (sub & ~mask) | (nan & 0x7e00u)));
+    return uint16_t(s | (normal & mask) | (sub & ~mask) | (nan & 0x7e00u));
+}
+__device__ inline __half e4m3_to_half(u32 b) {
+    return __ushort_as_half(e4m3_to_half_bits(b));
 }
 
 __device__ inline u8 e4m3_byte_nb(float v) {
@@ -105,6 +108,31 @@ __device__ inline float F_nb(float v) {
     return as_f32(out);
 }
 #endif
+
+// Four packed E4M3 codes -> the four f16 that decode them, packed the same way.
+//
+// This is the store side of the AH16 trick, and the same argument as MatrixC::StoreQuantF16: the
+// value is ALREADY on the E4M3 grid when it reaches here, and every E4M3 code is exactly
+// representable in f16, so widening it changes no number the matrix unit sees. What it changes is
+// where the conversion happens -- once per element as the A-tile is staged into LDS, instead of
+// eight times per lane on every fragment fill, for every wave that reads the tile.
+//
+// Takes and returns packed words rather than elements because both callers already have their four
+// codes in one dword and write them with one store.
+__device__ inline uint2 e4m3x4_to_half4(u32 q) {
+#if DLSS5_GFX11
+    return make_uint2(u32(e4m3_to_half_bits(q & 0xffu)) |
+                          (u32(e4m3_to_half_bits((q >> 8) & 0xffu)) << 16),
+                      u32(e4m3_to_half_bits((q >> 16) & 0xffu)) |
+                          (u32(e4m3_to_half_bits(q >> 24)) << 16));
+#else
+    // Host-pass branch. e4m3_to_half_bits is gfx11-only (that architecture has no hardware E4M3
+    // conversion, so the software one lives under #if DLSS5_GFX11), and HIP parses every __global__
+    // body on the host too in order to emit its launch stub. Nothing here ever runs; it only has to
+    // compile. Third time this trap has cost a build -- see BW16, HiddenA, StoreQuantF16.
+    return make_uint2(q, q);
+#endif
+}
 
 // Software E4M3FN RNE (HLSL Ffast / NativeFastFp8).
 __host__ __device__ inline float F_sw(float v) {
