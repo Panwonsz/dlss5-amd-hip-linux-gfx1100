@@ -160,7 +160,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
 // put a number on that, because gfx1100's hardware counters all read 0.00 and the difference cannot be
 // measured any other way.
 template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false, bool F8IN = false,
-          bool HIN = false, bool W16 = false>
+          bool HIN = false, bool W16 = false, bool AH16 = false>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
                           bool precise_c32 = false, __half* output_h = nullptr,
@@ -177,7 +177,13 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
     // during the expand MMA loop and hidden is only written after it, so one
     // barrier makes the aliasing safe. C32 uses GROUPS=2 to halve CTA/weight
     // traffic while keeping 64 waves/CU.
-    __shared__ u8 hidden[16 * GROUPS * hidden_c];
+    // AH16 doubles this: the hidden activations are held as f16 so the contract GEMM's A fragments load
+    // without converting anything. LDS is the occupancy constraint on this kernel (16 waves/SIMD against
+    // a limit of 16), so whether 8 KB still fits is the entire question this answers.
+    //
+    // The input staging still aliases the start, and still stages E4M3 bytes: it is read before any
+    // hidden byte is written, and the f16 buffer is strictly larger, so the aliasing holds either way.
+    __shared__ u8 hidden[16 * GROUPS * hidden_c * (AH16 ? 2 : 1)];
     u8* in = hidden;
     if constexpr (C == 32) {
         // 4-byte input staging for C32: same E4M3 bytes, fewer LDS stores.
@@ -251,7 +257,10 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             for (uint i = 0; i < ex[n].Length(); ++i) ex[n].Set(i,
                 C == 32 && precise_c32 ? ActivatePolyC32(ex[n].Get(i))
                                        : ActivatePoly(ex[n].Get(i)));
-            ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
+            if constexpr (AH16)
+                ex[n].StoreQuantF16(hidden + t0 * hidden_c * 2, (sub * 4 + n) * 32, hidden_c * 2);
+            else
+                ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
         }
     }
     __syncthreads();
@@ -270,7 +279,11 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                 }
             }
         for (uint g = 0; g < hidden_c / 32; ++g) {
-            A8 a = A8::Load(hidden + t0 * hidden_c, g * 32, hidden_c);
+            // One declaration for both formats: the type is selected by AH16 so the MMA below reads the
+            // same `a` either way. Byte offsets scale with the element size.
+            constexpr uint HSZ = AH16 ? 2u : 1u;
+            using AH = typename HiddenA<AH16>::type;
+            AH a = AH::Load(hidden + t0 * hidden_c * HSZ, g * 32 * HSZ, hidden_c * HSZ);
 
             // The contract weights follow the expand ones, so the base offset scales with the element
             // size too: hidden_c * C elements, one byte each as E4M3 and two as f16.

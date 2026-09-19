@@ -71,6 +71,33 @@ void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, fl
 // The same FFN with f16 weights. A separate entry point on purpose: the network's weights are E4M3, and
 // an environment switch inside launch_ffn_f32 would let one exported variable silently feed the whole
 // graph weights in a format it does not hold. Only a caller that packed f16 itself can reach this.
+// The 2x2 of weight format x hidden-activation format, for the bench only. The network's five FFN
+// launchers are untouched: this exists to measure, and a switch that could reach the model would risk
+// feeding it a buffer in a format it does not hold -- the failure mode the single dlss5_w16() exists to
+// prevent.
+#define DLSS5_FFN_BENCH(W16, AH16)                                                                   \
+    switch (c) {                                                                                     \
+    case 32: LAUNCH((k_ffn_f32<32, false, 2, false, false, false, W16, AH16>), (tokens + 31) / 32,    \
+                    128, in, w, scales, out, nullptr, tokens, chain_residual, precise_c32); break;    \
+    case 64: LAUNCH((k_ffn_f32<64, false, 1, false, false, false, W16, AH16>), (tokens + 15) / 16,    \
+                    128, in, w, scales, out, nullptr, tokens); break;                                 \
+    case 128: LAUNCH((k_ffn_f32<128, false, 1, false, false, false, W16, AH16>), (tokens + 15) / 16,  \
+                     256, in, w, scales, out, nullptr, tokens); break;                                \
+    case 256: LAUNCH((k_ffn_f32<256, false, 1, false, false, false, W16, AH16>), (tokens + 15) / 16,  \
+                     512, in, w, scales, out, nullptr, tokens); break;                                \
+    default: throw std::runtime_error("FFN channels");                                                \
+    }
+
+void launch_ffn_f32_bench(int c, const float* in, const u8* w, const float* scales, float* out,
+                          uint tokens, bool chain_residual, bool precise_c32, bool w16, bool a16) {
+    if (!tokens || in == out || (c == 32 && !scales)) throw std::runtime_error("FFN extent/alias/scales");
+
+    if (w16 && a16) { DLSS5_FFN_BENCH(true, true) }
+    else if (w16)   { DLSS5_FFN_BENCH(true, false) }
+    else if (a16)   { DLSS5_FFN_BENCH(false, true) }
+    else            { DLSS5_FFN_BENCH(false, false) }
+}
+
 void launch_ffn_f32_w16(int c, const float* in, const u8* w16, const float* scales, float* out,
                         uint tokens, bool chain_residual, bool precise_c32) {
     if (!tokens || in == out || (c == 32 && !scales)) throw std::runtime_error("FFN extent/alias/scales");

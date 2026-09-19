@@ -194,6 +194,23 @@ struct MatrixC {
         }
     }
 
+    // f16 of the E4M3-ROUNDED value, which is what keeps this bit-identical.
+    //
+    // StoreF16 would write the accumulator's own f16, which is more accurate than the E4M3 the hidden
+    // buffer holds today and therefore a different picture. Every E4M3 code is exactly representable in
+    // f16, so rounding first and widening second reproduces exactly what load_e4m3 used to hand the
+    // matrix unit -- one conversion here instead of ninety-six VALU ops on every fragment fill.
+    template <typename Ptr>
+    __device__ void StoreQuantF16(Ptr buf, uint byte_off, uint stride_bytes) const {
+        f16* p = reinterpret_cast<f16*>(reinterpret_cast<char*>(buf) + byte_off);
+        uint ldm = stride_bytes / 2u;
+
+        for (uint i = 0; i < Length(); i++) {
+            uint2 rc = GetCoordinate(i);
+            p[rc.x * ldm + rc.y] = e4m3_to_half(e4m3_byte(Get(i)));
+        }
+    }
+
     template <typename Ptr>
     __device__ void StoreF16(Ptr buf, uint byte_off, uint stride_bytes) const {
         f16* p = reinterpret_cast<f16*>(reinterpret_cast<char*>(buf) + byte_off);
@@ -224,6 +241,14 @@ __device__ inline MatrixC Multiply(const MatrixA<DataT>& a, const MatrixB<DataT>
 using A8 = MatrixA<float8_t>;
 using B8 = MatrixB<float8_t>;
 using A16 = MatrixA<f16>;
+
+// The A fragment for an f16 hidden buffer, named by STORAGE type for the same reason BW16 is: in the
+// host pass StorageT is the identity, so MatrixA<f16> there would be a f16 fragment against B8's fp8 one
+// and rocWMMA's "Input datatypes must be same size" would fire. On device it resolves to f16 and loads
+// with a plain load_matrix_sync; in the host pass it resolves to float8_t, matches B, compiles, and never
+// runs. This is the second time that trap has cost a build -- see BW16.
+template <bool F16> struct HiddenA { using type = MatrixA<float8_t>; };
+template <> struct HiddenA<true> { using type = MatrixA<StorageT<float8_t>>; };
 using B16 = MatrixB<f16>;
 
 // The weight fragment for the W16 path: whatever storage type THIS compilation pass gives an E4M3

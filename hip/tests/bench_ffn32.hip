@@ -116,6 +116,50 @@ int main(int argc, char** argv) {
 
     std::printf("identical output. E4M3 %.3f ms -> f16 %.3f ms = %+.1f%% (%.3f ms)\n", ms, ms16,
                 (ms16 - ms) / ms * 100.0, ms16 - ms);
+    // The full 2x2. Every cell must produce the same hash -- the f16 weights are the dequantised E4M3
+    // values and the f16 hidden buffer holds the E4M3-rounded ones, so all four compute the same thing.
+    // A16 doubles LDS, so if it helps alone and hurts beside W16, occupancy is the reason.
+    {
+        std::printf("\n%-28s%10s  %s\n", "weights / hidden", "ms/call", "out_hash");
+
+        struct Cell { const char* name; bool w16, a16; };
+        const Cell cells[] = { { "E4M3    / E4M3", false, false },
+                               { "f16     / E4M3", true, false },
+                               { "E4M3    / f16", false, true },
+                               { "f16     / f16", true, true } };
+        float first_ms = 0.f;
+
+        for (const Cell& cell : cells) {
+            DeviceBuf dyc(size_t(tokens) * c * 4);
+            const u8* wsel = cell.w16 ? dw16.as<u8>() : dw.as<u8>();
+
+            auto run = [&] {
+                launch_ffn_f32_bench(c, dx.as<float>(), wsel, ds.as<float>(), dyc.as<float>(), tokens,
+                                     false, c == 32, cell.w16, cell.a16);
+            };
+
+            for (int i = 0; i < 5; ++i) run();
+            hip_check(hipStreamSynchronize(stream), "warm cell");
+            hipEventRecord(e0, stream);
+            for (int i = 0; i < iters; ++i) run();
+            hipEventRecord(e1, stream);
+            hip_check(hipEventSynchronize(e1), "sync cell");
+            float cms = 0; hipEventElapsedTime(&cms, e0, e1); cms /= iters;
+
+            std::vector<float> co(size_t(tokens) * c);
+            dyc.download(co.data(), co.size() * 4);
+            uint64_t ch = 1469598103934665603ull;
+            for (float v : co) { ch ^= uint64_t(as_u32(v)); ch *= 1099511628211ull; }
+
+            if (first_ms == 0.f) first_ms = cms;
+            std::printf("%-28s%10.3f  %016llx%s%s\n", cell.name, cms, (unsigned long long)ch,
+                        ch == hsh ? "" : "   HASH MISMATCH -- timing meaningless",
+                        cms < first_ms ? "" : "");
+        }
+
+        std::printf("%-28s%10s  (relative to E4M3/E4M3)\n", "", "");
+    }
+
     std::printf("C=%u: %s\n", c,
                 ms16 < ms * 0.9 ? "the E4M3 load path costs real time at this width"
                 : ms16 > ms * 1.05

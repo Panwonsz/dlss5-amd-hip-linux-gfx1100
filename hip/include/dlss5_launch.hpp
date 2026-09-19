@@ -66,6 +66,11 @@ inline bool dlss5_w16() {
     return on;
 }
 
+// The 2x2 of weight format (w16) x hidden-activation format (a16), for benchmarks. Not for the network:
+// w16 requires f16-packed weights from the caller, exactly as launch_ffn_f32_w16 does.
+void launch_ffn_f32_bench(int c, const float* in, const u8* w, const float* scales, float* out,
+                          uint tokens, bool chain_residual, bool precise_c32, bool w16, bool a16);
+
 // The FFN with f16 weights, for measuring what the E4M3 fragment load costs. The caller packs them.
 void launch_ffn_f32_w16(int c, const float* in, const u8* w16, const float* scales, float* out,
                         uint tokens, bool chain_residual = false, bool precise_c32 = false);
