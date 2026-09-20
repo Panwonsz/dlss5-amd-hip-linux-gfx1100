@@ -65,12 +65,17 @@ int main(int argc,char**argv){try{
  for(size_t i=0;i<w.size();++i)w[i]=(int(i*7%31)-15)*.015625f;
  for(size_t i=0;i<res.size();++i)res[i]=(int(i%43)-21)*.0023f;
  for(uint i=0;i<n;++i)sc[i]=.1f+i*.002f;
+ // reference_linear is the frozen pre-optimization kernel and reads E4M3 unconditionally; the
+ // candidate reads whatever DLSS5_W16 says. Two uploads of the same numbers, so the comparison
+ // still means what it meant -- and under DLSS5_W16 it additionally proves the two formats agree.
  std::vector<u8> pw(w.size());pack_tiled_e4m3(pw.data(),w.data(),n,k);
- DeviceBuf di(in.size()*4),dw(pw.size()),dr(res.size()*4),ds(n*4),da(res.size()*4+64),db(res.size()*4+64);
- di.upload(in.data(),in.size()*4);dw.upload(pw.data(),pw.size());dr.upload(res.data(),res.size()*4);ds.upload(sc.data(),n*4);
+ DeviceBuf dwref(pw.size());dwref.upload(pw.data(),pw.size());
+ DeviceBuf dw=upload_tiled_weights(w.data(),n,k);
+ DeviceBuf di(in.size()*4),dr(res.size()*4),ds(n*4),da(res.size()*4+64),db(res.size()*4+64);
+ di.upload(in.data(),in.size()*4);dr.upload(res.data(),res.size()*4);ds.upload(sc.data(),n*4);
  hip_check(hipMemset(da.p,0xa5,da.bytes),"guard");hip_check(hipMemset(db.p,0xa5,db.bytes),"guard");
  const float* rp=cases%2?dr.as<float>():nullptr;bool matrix=cases%3==0;
- auto ref=[&]{reference_linear<<<dim3((m+15)/16,n/16),32>>>(di.as<float>(),dw.as<u8>(),da.as<float>(),m,n,k,rp,ds.as<float>(),mode,ordered,matrix);};
+ auto ref=[&]{reference_linear<<<dim3((m+15)/16,n/16),32>>>(di.as<float>(),dwref.as<u8>(),da.as<float>(),m,n,k,rp,ds.as<float>(),mode,ordered,matrix);};
  auto opt=[&]{launch_linear_f32(di.as<float>(),dw.as<u8>(),db.as<float>(),m,n,k,rp,ds.as<float>(),mode,ordered,matrix);};
  ref();opt();hip_check(hipDeviceSynchronize(),"run");std::vector<u8>a(da.bytes),b(db.bytes);da.download(a.data(),a.size());db.download(b.data(),b.size());
  if(a!=b){printf("shape=%u,%u,%u mode=%d ordered=%d\n",m,n,k,mode,ordered);throw std::runtime_error("linear bytes/guard mismatch");}

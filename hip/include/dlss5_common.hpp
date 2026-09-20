@@ -5,6 +5,7 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_fp8.h>
 #include <cstdint>
+#include <cstdlib>
 #include <cstddef>
 #include <cmath>
 #ifndef __HIP_DEVICE_COMPILE__
@@ -263,6 +264,57 @@ inline void pack_tiled_e4m3(u8* dst, const float* src, size_t N, size_t K) {
                 for (size_t j = 0; j < 16; j++)
                     dst[(t * (K / 32) + g) * 512 + k * 16 + j] =
                         e4m3_byte(src[(t * 16 + j) * K + g * 32 + k]);
+}
+
+// The same tiles in f16: 1024 bytes with a 32-byte row stride, and deliberately ROUND-TRIPPED
+// through E4M3 first.
+//
+// Not full f16 precision. The point is a performance change with a provably identical picture, so
+// the matrix unit must see the values it already saw. __float2half(src[...]) would be slightly MORE
+// accurate and would change the output, which forfeits the only check available -- hip-network70's
+// statistics matching across the two settings.
+inline void pack_tiled_half(__half* dst, const float* src, size_t N, size_t K) {
+    for (size_t t = 0; t < N / 16; t++)
+        for (size_t g = 0; g < K / 32; g++)
+            for (size_t k = 0; k < 32; k++)
+                for (size_t j = 0; j < 16; j++)
+                    dst[(t * (K / 32) + g) * 512 + k * 16 + j] =
+                        __float2half(from_e4m3(e4m3_byte(src[(t * 16 + j) * K + g * 32 + k])));
+}
+
+// DLSS5_W16: weights are uploaded AND read as f16 instead of E4M3, everywhere the four hot kernels
+// read them -- the FFN's `fw`, `k_linear_f32`'s `p0`, `p1` and the ViT's `ex`/`ct`/`pw`, and
+// `k_qkv_norm_f32`'s `qw`. Seven uploads, eighteen launchers.
+//
+// **On by default**, because it is worth 55 ms of 153 and the alternative default is a machine that
+// silently runs 60% slow when someone forgets to export a variable. `DLSS5_W16=0` is the escape
+// hatch; it costs ~250 MB of VRAM, which is the reason the escape hatch exists at all.
+//
+// RDNA3 has no FP8 matrix instruction, so load_e4m3 fills each weight fragment with eight strided
+// single-byte reads and eight conversions where the f16 path issues one vectorised
+// load_matrix_sync. The absolute saving is constant across C (~0.69 ms/call on the FFN), which is
+// what identifies it as per-load overhead rather than bandwidth or arithmetic.
+//
+// This ONE function drives every upload and every dispatch, and it has to stay that way. If any two
+// of them disagree, E4M3 bytes are read as f16 -- a stable, plausible, entirely wrong picture -- and
+// the network's only self-check is replay equality, which such a mismatch passes without complaint.
+// It lives here, beside the two packers it chooses between, so that the choice and the formats
+// cannot drift into separate headers. The gate is hip-network70's `mean` and `mean_abs_change`:
+// pack_tiled_half round-trips through E4M3, so the f16 weights are the dequantised E4M3 values and
+// every digit must match across the two settings.
+//
+// Anything that packs its own weights must ask this before choosing a packer -- see
+// upload_tiled_weights() in dlss5_runtime.hpp, which is the supported way to do it.
+inline bool dlss5_w16() {
+    static const bool on = [] {
+        const char* v = std::getenv("DLSS5_W16");
+        // ONLY the exact string "0" turns it off. Unset, empty, or anything unparseable leaves the
+        // fast path on. The asymmetry is deliberate now that the default is on: `atoi` would read
+        // "off", "no" and "flase" as zero and silently cost 55 ms, and a mistyped opt-OUT that
+        // quietly does nothing is far cheaper to notice than a mistyped opt-out that works.
+        return !(v != nullptr && v[0] == '0' && v[1] == '\0');
+    }();
+    return on;
 }
 
 } // namespace dlss5

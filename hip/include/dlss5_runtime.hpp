@@ -155,4 +155,20 @@ inline DeviceBuf upload_tiled_e4m3(const float* src, size_t N, size_t K) {
     return b;
 }
 
+inline DeviceBuf upload_tiled_half(const float* src, size_t N, size_t K) {
+    std::vector<__half> tiled(N * K);
+    pack_tiled_half(tiled.data(), src, N, K);
+    DeviceBuf b(tiled.size() * 2);
+    b.upload(tiled.data(), tiled.size() * 2);
+    return b;
+}
+
+// Weights for the four kernels that read the DLSS5_W16 format. Use this rather than picking a
+// packer by hand: it is the single place the upload side consults the flag, which is what keeps it
+// from disagreeing with the dispatch side. (Weights for other kernels -- stage.hip's split tiles,
+// launch_linear_half's genuine f16 -- are not governed by the flag and keep their own uploads.)
+inline DeviceBuf upload_tiled_weights(const float* src, size_t N, size_t K) {
+    return dlss5_w16() ? upload_tiled_half(src, N, K) : upload_tiled_e4m3(src, N, K);
+}
+
 } // namespace dlss5

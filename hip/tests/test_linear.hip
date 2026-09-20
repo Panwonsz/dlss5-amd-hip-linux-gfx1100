@@ -12,7 +12,7 @@ int main() {
     for(size_t i=0;i<w.size();++i) w[i]=from_e4m3(e4m3_byte(float(int((i*3+i/19)%17)-8)*.03125f));
     for(size_t i=0;i<skip.size();++i) skip[i]=float(int(i%13)-6)*.211f;
     for(size_t i=0;i<sc.size();++i) sc[i]=H(float(int(i%11)-5)*.073f);
-    DeviceBuf di(in.size()*4),dw=upload_tiled_e4m3(w.data(),n,k),ds(skip.size()*4),dc(sc.size()*4),dout(out.size()*4);
+    DeviceBuf di(in.size()*4),dw=upload_tiled_weights(w.data(),n,k),ds(skip.size()*4),dc(sc.size()*4),dout(out.size()*4);
     di.upload(in.data(),in.size()*4);ds.upload(skip.data(),skip.size()*4);dc.upload(sc.data(),sc.size()*4);
     unsigned bad=0;
     for(int mode=0;mode<5;++mode){

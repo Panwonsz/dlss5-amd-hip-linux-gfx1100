@@ -28,27 +28,6 @@ std::vector<float> load(const std::string& dir,const std::string& name,size_t co
  for(float x:v)if(!std::isfinite(x))throw std::runtime_error("nonfinite table: "+p.string());
  return v;
 }
-// The same tiled layout as pack_tiled_e4m3, in f16, and deliberately ROUND-TRIPPED through E4M3 first.
-//
-// Not full f16 precision: the point is a performance change with a provably identical picture, so the
-// matrix unit must see the values it already saw. __float2half(v[...]) would be slightly MORE accurate
-// and would change the output, which forfeits the only check available -- hip-network70's statistics
-// matching between the two settings.
-void pack_tiled_half(__half* dst,const float* src,size_t N,size_t K){
- for(size_t t=0;t<N/16;t++)for(size_t g=0;g<K/32;g++)for(size_t k=0;k<32;k++)for(size_t j=0;j<16;j++)
-  dst[(t*(K/32)+g)*512+k*16+j]=__float2half(from_e4m3(e4m3_byte(src[(t*16+j)*K+g*32+k])));
-}
-// upload_tiled_e4m3's f16 sibling, for the buffers k_linear_f32 and k_qkv_norm_f32 read under
-// DLSS5_W16_LIN. Same tiles, same order, two bytes an element -- and the same E4M3 round trip, so
-// the values are unchanged and hip-network70's statistics must not move.
-DeviceBuf upload_tiled_half(const float* v,uint n,uint k){
- std::vector<__half> t(size_t(n)*k);pack_tiled_half(t.data(),v,n,k);
- DeviceBuf b(t.size()*2);b.upload(t.data(),t.size()*2);return b;
-}
-// One call site per buffer, so the format decision is never spelled out twice.
-DeviceBuf upload_tiled_lin(const float* v,uint n,uint k){
- return dlss5_w16_lin()?upload_tiled_half(v,n,k):upload_tiled_e4m3(v,n,k);
-}
 DeviceBuf half_matrix(const float* v,uint n,uint k){
  std::vector<__half> t(size_t(n)*k);
  for(uint r=0;r<n;++r)for(uint c=0;c<k;++c)t[((r/16)*(k/32)+c/32)*512+(c%32)*16+r%16]=__float2half(v[size_t(r)*k+c]);
@@ -73,23 +52,23 @@ struct Block {
   std::string p=id==70?"post70":"block"+std::to_string(id);size_t m=size_t(c)*c;
   if(c==512){auto f=load(dir,p+"-ffwd",524288);fw=upload_tiled_e4m3(f.data(),512,512);
    std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
-   auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_lin(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
+   auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_weights(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
   }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);size_t off=c==32?512:0;
    // The FFN's weights, in whichever format the kernels will read them. ONE switch decides both, and
    // the contract half sits after the expand half at 4*m elements -- one byte each as E4M3, two as f16,
    // which is why the kernel's f16 offset is 2*hidden_c*C.
    if(dlss5_w16()){std::vector<__half> t(8*m);pack_tiled_half(t.data(),f.data()+off,4*c,c);pack_tiled_half(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size()*2);fw.upload(t.data(),t.size()*2);}
    else{std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());}
-   if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_lin(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
+   if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_weights(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
   }
   auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
-  // qw feeds k_qkv_norm_f32, p1 feeds k_linear_f32; both follow DLSS5_W16_LIN. The complete set it
-  // governs is these two, p0 above (twice), and the ViT's ex/ct/pw -- six uploads. Block::fw at
-  // c==512 and the Block ex/ct beside it are the C512 split tiles for stage.hip, a different
-  // kernel, and stay E4M3; so does Vit::qw, which is genuine f16 via half_matrix for a different
-  // kernel again. Getting that partition wrong in either direction is the mismatch the flag's
-  // comment in dlss5_launch.hpp warns about.
-  qw=upload_tiled_lin(a.data(),3*c,c);p1=upload_tiled_lin(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+  // qw feeds k_qkv_norm_f32, p1 feeds k_linear_f32; both follow DLSS5_W16. The complete set it
+  // governs is these two, p0 above (twice), the ViT's ex/ct/pw, and Block::fw in the else branch --
+  // seven uploads. Block::fw at c==512 and the Block ex/ct beside it are the C512 split tiles for
+  // stage.hip, a different kernel, and stay E4M3; so does Vit::qw, which is genuine f16 via
+  // half_matrix for a different kernel again. Getting that partition wrong in either direction is
+  // the mismatch dlss5_w16()'s comment in dlss5_common.hpp warns about.
+  qw=upload_tiled_weights(a.data(),3*c,c);p1=upload_tiled_weights(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
  }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
@@ -157,8 +136,8 @@ struct Vit {
  DeviceBuf ex,ct,cs,qw,qs,pw,ps;
  void create(const std::string&dir,int id){std::string p="block"+std::to_string(id);
   auto e=load(dir,p+"-expand",4194304),c=load(dir,p+"-contract",4195328),q=load(dir,p+"-qkv",3145760),o=load(dir,p+"-projection",1049600);
-  ex=upload_tiled_lin(e.data(),4096,1024);ct=upload_tiled_lin(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
-  qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_lin(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
+  ex=upload_tiled_weights(e.data(),4096,1024);ct=upload_tiled_weights(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
+  qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_weights(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
  }
   void run(const float* in,float* out,Scratch&s){
    // The expand output is already on the E4M3 grid; keeping the bytes lets the

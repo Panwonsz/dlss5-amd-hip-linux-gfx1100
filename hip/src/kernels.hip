@@ -233,7 +233,7 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
 // weight format. Five widths times two input formats times two weight formats is forty dispatch
 // lines spelled out; this is the same reason DLSS5_FFN_F8 and its siblings exist, and it matters
 // more here, because a W16 that reached some widths and not others would be exactly the
-// upload/dispatch mismatch dlss5_w16_lin() is written to prevent.
+// upload/dispatch mismatch dlss5_w16() is written to prevent.
 //
 // f32in / f8in / h_in are passed through unchanged; whichever is null selects nothing.
 #define DLSS5_QKV_PAIR(C, F8IN, HIN, W16, f32in, f8in, h_in)                                       \
@@ -276,20 +276,20 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
 void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
                          const float* scales, float qgain, bool half_squares) {
     if (!m || !c || c % 32 || !scales) throw std::runtime_error("QKV norm extent/scales");
-    if (dlss5_w16_lin()) { DLSS5_QKV_NORM_F32(true) } else { DLSS5_QKV_NORM_F32(false) }
+    if (dlss5_w16()) { DLSS5_QKV_NORM_F32(true) } else { DLSS5_QKV_NORM_F32(false) }
 }
 void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
                               const float* scales, float qgain, bool half_squares) {
     if (!m || c == 32 || !in || !out || !scales)
         throw std::runtime_error("QKV norm f8 extent");
-    if (dlss5_w16_lin()) { DLSS5_QKV_NORM_F8IN(true) } else { DLSS5_QKV_NORM_F8IN(false) }
+    if (dlss5_w16()) { DLSS5_QKV_NORM_F8IN(true) } else { DLSS5_QKV_NORM_F8IN(false) }
 }
 void launch_qkv_norm_f32_hin(int c, const __half* in, const u8* w, u8* out, uint m,
                              const float* scales, float qgain, bool half_squares) {
     if (!m || c != 32 || !in || !out || !scales)
         throw std::runtime_error("QKV norm f16 extent");
     // Same NH=3 CTA as the f32 path; the f16 input is the exact H(acc) grid.
-    if (dlss5_w16_lin())
+    if (dlss5_w16())
         LAUNCH((k_qkv_norm_f32<32, 3, false, true, false, DLSS5_AH16, true>),
                dim3((m + 15) / 16, 1u), 192, nullptr, nullptr, w, out, m, c, scales, qgain,
                half_squares, in);
@@ -350,12 +350,12 @@ void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint
 // The ten k_linear_f32 launchers below differ only in their seven format flags and which pointers
 // they pass; all ten use the same grid and block. W16 is the eighth axis, and it has to reach every
 // one of them -- a launcher left on the E4M3 path while its weights upload as f16 is the
-// upload/dispatch mismatch dlss5_w16_lin() exists to prevent, and replay equality would not catch
+// upload/dispatch mismatch dlss5_w16() exists to prevent, and replay equality would not catch
 // it. Writing the branch once is what makes "every one of them" checkable by reading one place.
 #define DLSS5_LINEAR(F8IN, F8OUT, HRID, HOUT, RAST, F8RES, HRAST, ...)                             \
     do {                                                                                           \
         const dim3 g_((m + 15) / 16, (n + 63) / 64);                                               \
-        if (dlss5_w16_lin())                                                                       \
+        if (dlss5_w16())                                                                       \
             LAUNCH((k_linear_f32<F8IN, F8OUT, HRID, HOUT, RAST, F8RES, HRAST, DLSS5_AH16, true>),  \
                    g_, 128, __VA_ARGS__);                                                          \
         else                                                                                       \

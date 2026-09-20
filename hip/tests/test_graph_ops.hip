@@ -15,7 +15,7 @@ static std::vector<float> download(DeviceBuf&d,size_t n){std::vector<float> v(n)
 static void partitions(){
  const uint m=16,n=32,k=4096;std::vector<float> a(m*k),b(n*k),r(m*n),sc(n,.731f);
  std::mt19937 rng(51);for(auto&v:a)v=f(float(int(rng()%31)-15)/32);for(auto&v:b)v=f(float(int(rng()%31)-15)/128);for(auto&v:r)v=h(float(int(rng()%31)-15)/16);
- auto da=upload(a),db=upload_tiled_e4m3(b.data(),n,k),dr=upload(r),ds=upload(sc);DeviceBuf out(m*n*4);
+ auto da=upload(a),db=upload_tiled_weights(b.data(),n,k),dr=upload(r),ds=upload(sc);DeviceBuf out(m*n*4);
  // ordered=2 means independent four-partition FP32 reduction, not K32 half rounding.
  launch_linear_f32(da.as<float>(),db.as<u8>(),out.as<float>(),m,n,k,dr.as<float>(),ds.as<float>(),1,2);hip_check(hipDeviceSynchronize(),"partitions");auto y=download(out,m*n);
  for(uint t=0;t<m;++t)for(uint j=0;j<n;++j){float total=h(r[t*n+j]*sc[j]);for(uint p=0;p<4;++p){float part=0;for(uint q=p*(k/4);q<(p+1)*(k/4);++q)part+=a[t*k+q]*b[j*k+q];total+=part;}same(y[t*n+j],f(h(total)),"ViT partition");}

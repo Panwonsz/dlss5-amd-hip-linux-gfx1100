@@ -45,52 +45,9 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
                                          bool matrix_residual, uint rw, uint rh, uint rsw,
                                          uint rpx, uint rpy);
 
-// DLSS5_W16: the FFN's weights are uploaded AND read as f16 instead of E4M3.
-//
-// Measured on a 7900 XT, same kernel and bit-identical output: -44.6% at C=32 rising to -53.5% at
-// C=256. RDNA3 has no FP8 matrix instruction, so load_e4m3 fills each weight fragment with eight
-// strided single-byte reads and eight conversions where the f16 path issues one vectorised
-// load_matrix_sync. The absolute saving is constant across C (~0.69 ms/call), which is what identifies
-// it as per-load overhead rather than anything to do with bandwidth or arithmetic.
-//
-// This ONE function drives both the upload in network.hip and the dispatch in kernels.hip, and it has to
-// stay that way. If the two ever disagree, E4M3 bytes are read as f16 -- a stable, plausible, entirely
-// wrong picture -- and the network's only self-check is replay equality, which such a mismatch passes
-// without complaint. Compare hip-network70's `mean` and `mean_abs_change` across the two settings
-// instead: the f16 weights are the dequantised E4M3 values, so those must match digit for digit.
-inline bool dlss5_w16() {
-    static const bool on = [] {
-        const char* asked = std::getenv("DLSS5_W16");
-        return asked != nullptr && std::atoi(asked) != 0;
-    }();
-    return on;
-}
-
-// DLSS5_W16_LIN: the same treatment for the weights read by k_linear_f32 and k_qkv_norm_f32 --
-// per block `p0`, `p1` and `qw`, and the ViT's `ex`, `ct` and `pw`. About 103 MB of E4M3, so this
-// costs that again in VRAM, on top of DLSS5_W16's ~148 MB.
-//
-// Deliberately a SECOND switch rather than an extension of the first. The FFN's share of the model
-// is already measured and this one is not; one flag covering both would move them together and
-// leave neither attributable. Fold them once this has a number.
-//
-// Everything said about dlss5_w16() applies here with the same force, and over more buffers: this
-// one function drives six uploads in network.hip and thirteen launchers in kernels.hip, and if any
-// of them disagrees the kernel reads E4M3 bytes as f16 and produces a stable, plausible, wrong
-// picture that replay equality accepts without complaint. The gate is hip-network70's `mean` and
-// `mean_abs_change`, which must not move: pack_tiled_half round-trips through E4M3, so the f16
-// weights are the dequantised E4M3 values and every digit must match.
-//
-// It also means the launchers below now expect whichever format this returns. The tests pack E4M3
-// and do not set the variable; running them with it set would feed them a buffer in a format they
-// do not hold. Same caveat the FFN path already carries.
-inline bool dlss5_w16_lin() {
-    static const bool on = [] {
-        const char* asked = std::getenv("DLSS5_W16_LIN");
-        return asked != nullptr && std::atoi(asked) != 0;
-    }();
-    return on;
-}
+// The DLSS5_W16 switch and the two packers it chooses between live together in dlss5_common.hpp.
+// They were three headers apart when this was two flags, which is exactly the drift its own comment
+// warns about; dlss5_w16() is declared there, beside pack_tiled_e4m3 and pack_tiled_half.
 
 // The 2x2 of weight format (w16) x hidden-activation format (a16), for benchmarks. Not for the network:
 // w16 requires f16-packed weights from the caller, exactly as launch_ffn_f32_w16 does.
