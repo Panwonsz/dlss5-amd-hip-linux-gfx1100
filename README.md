@@ -24,11 +24,11 @@ The archive contains the prebuilt HIP library, Windows bridge, add-on, ReShade l
 - The prototype uses CPU readback/upload and HIP execution at a split vkd3d submission boundary. **The game still waits for neural rendering.** It is not an asynchronous performance fix.
 - General gameplay stability, HDR behavior and broad game compatibility are not certified. F6 toggles the live path's bypass when the hook is active; it cannot fix a missing hook or failed initialization.
 
-The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~63–66 ms GPU time per inference** on the current development build — `0.2.1` measured ~98–105 ms and `0.1.0-poc` 210–216 ms. That is network-only timing, **not in-game FPS**. Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
+The offline bench (network only, fixed 1080p input, real converted weights, RX 7900 XT `gfx1100`, warm runs).
 
 ## Changelog
 
-Unless a scenario is specified, timings are the offline bench (network only, fixed 1920×1080 input, real converted weights, RX 9070 XT `gfx1201`); "bit-exact" means the output did not change by a single bit against the reference 71-block network, which stays the judge.
+Unless a scenario is specified, timings are the offline bench (network only, fixed 1920×1080 input, real converted weights, RX 7900 XT `gfx1100`); "bit-exact" means the output did not change by a single bit against the reference 71-block network, which stays the judge.
 
 | Version | Date | What changed | Result |
 |---|---|---|---|
