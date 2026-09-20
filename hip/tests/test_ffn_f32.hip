@@ -1,12 +1,13 @@
 #include "dlss5_launch.hpp"
 #include "dlss5_runtime.hpp"
+#include "ulp_compare.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
 using namespace dlss5;
 int main(){
-    unsigned bad=0;
+    UlpTally tally;
     for(unsigned c:{32u,64u,128u,256u}){
         const unsigned n=32,hidden=4*c;
         std::vector<float> x(n*c),w(8*c*c),sc(c),out(n*c);
@@ -26,12 +27,14 @@ int main(){
             for(unsigned j=0;j<hidden;++j){float a=0;for(unsigned k=0;k<c;++k)a+=from_e4m3(e4m3_byte(x[t*c+k]))*w[j*c+k];mid[j]=from_e4m3(e4m3_byte(ActivatePoly(a)));}
             for(unsigned j=0;j<c;++j){float a=c==32?x[t*c+j]*sc[j]:0;
                 for(unsigned k=0;k<hidden;++k)a+=mid[k]*w[hidden*c+j*hidden+k];
-                float e=c==32?H(a):from_e4m3(e4m3_byte(a));float error=std::fabs(e-out[t*c+j]);
-                if(!std::isfinite(out[t*c+j])||error>1e-5)++bad;
-                maxerr=std::max(maxerr,error);
+                // C32 ends in H(), the wider widths quantize to E4M3; one step is measured in
+                // whichever grid the value actually lands on.
+                float e=c==32?H(a):from_e4m3(e4m3_byte(a));
+                tally.check(out[t*c+j],e,c==32?Grid::F16:Grid::E4M3);
+                maxerr=std::max(maxerr,std::fabs(e-out[t*c+j]));
             }
         }
         std::printf("FFN C%u max_error=%g\n",c,maxerr);
     }
-    std::printf("FFN mismatches=%u\n",bad);return bad?1:0;
+    return tally.report("FFN");
 }

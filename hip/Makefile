@@ -42,7 +42,7 @@ $(BUILD)/%.o: src/%.hip include/*.hpp include/*.h Makefile
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c $< -o $@
 
-$(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o include/*.hpp
+$(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o include/*.hpp tests/ulp_compare.hpp
 	$(HIPCC) $(CXXFLAGS) -c $< -o $(BUILD)/$@.o
 	$(HIPCC) $(CXXFLAGS) $(BUILD)/$@.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
