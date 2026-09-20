@@ -75,8 +75,8 @@ inline bool dlss5_w16() {
 // leave neither attributable. Fold them once this has a number.
 //
 // Everything said about dlss5_w16() applies here with the same force, and over more buffers: this
-// one function drives six uploads in network.hip and three launchers in kernels.hip, and if any of
-// them disagrees the kernel reads E4M3 bytes as f16 and produces a stable, plausible, wrong
+// one function drives six uploads in network.hip and thirteen launchers in kernels.hip, and if any
+// of them disagrees the kernel reads E4M3 bytes as f16 and produces a stable, plausible, wrong
 // picture that replay equality accepts without complaint. The gate is hip-network70's `mean` and
 // `mean_abs_change`, which must not move: pack_tiled_half round-trips through E4M3, so the f16
 // weights are the dequantised E4M3 values and every digit must match.

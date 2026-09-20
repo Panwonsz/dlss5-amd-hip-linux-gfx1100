@@ -283,6 +283,16 @@ using B16 = MatrixB<f16>;
 // be same size", which is correct -- fp8 and f16 are not the same size, and only the device pass agrees
 // that an fp8 matrix is stored as f16.
 using BW16 = MatrixB<StorageT<float8_t>>;
+
+// B's counterpart to HiddenA: selects the weight fragment type from the W16 flag so a kernel names
+// one variable and one code path for both formats. The alternative -- an `if constexpr` around the
+// whole accumulate, or a generic lambda over it -- puts the accumulation order in two places or in
+// a template, and on k_linear_f32 the lambda measurably perturbed instruction selection (two
+// v_dual_add_f32 became four v_add_f32) in one variant out of ten. Same numbers either way, but a
+// change with no reason to exist is a change that cannot be checked.
+template <bool F16> struct WeightB { using type = MatrixB<float8_t>; };
+template <> struct WeightB<true> { using type = BW16; };
+
 using C32 = MatrixC;
 
 } // namespace linalg

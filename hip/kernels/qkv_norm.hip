@@ -114,16 +114,15 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         __syncthreads();
         // One declaration for both formats; the row stride scales with the element size. On the
         // host pass HiddenA<true> is still an fp8 fragment -- wrong, never runs, and the only
-        // spelling that lets B8 below agree with it on element size so the launch stub compiles.
+        // spelling that lets the B fragment below agree with it on element size so the launch stub
+        // compiles.
         using AT = typename HiddenA<AH16>::type;
         AT a = AT::Load(tile, 0, 32u * ASZ);
-        if constexpr (W16) {
-            BW16 b = BW16::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 1024u, 32);
-            acc.MultiplyAccumulate(a, b);
-        } else {
-            B8 b = B8::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 512u, 16);
-            acc.MultiplyAccumulate(a, b);
-        }
+        // One declaration for both weight formats, as on the A side above.
+        constexpr uint BSZ = W16 ? 2u : 1u;
+        using BT = typename WeightB<W16>::type;
+        BT b = BT::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 512u * BSZ, 16 * BSZ);
+        acc.MultiplyAccumulate(a, b);
         __syncthreads();
     }
     const uint norm_heads = head0 < 2u * HEADS

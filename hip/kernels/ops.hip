@@ -14,9 +14,14 @@ namespace dlss5 {
 // the matrix unit is handed the same values. What moves is the conversion: once per element as the
 // tile is written, instead of eight per lane per fragment for each of the four waves that read it.
 // Costs 512 bytes of LDS, in a kernel that uses 512.
+// W16: the weights arrive as f16 rather than E4M3, so the B fragments load with one
+// load_matrix_sync too. AH16 removed the conversion from the A side of this GEMM; this is the other
+// half, and the caller must supply pack_tiled_half weights to match (`DLSS5_W16_LIN`,
+// dlss5_launch.hpp). An f16 tile is 1024 bytes with a 32-byte row stride where an E4M3 tile is 512
+// with 16 -- the same 16x32 elements, two bytes each.
 template <bool F8IN, bool F8OUT = false, bool HRID = false, bool HOUT = false,
           bool F8OUT_RASTER = false, bool F8RES = false, bool HOUT_RASTER = false,
-          bool AH16 = DLSS5_AH16>
+          bool AH16 = DLSS5_AH16, bool W16 = false>
 __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* weights,
                              float* output, u8* output_f8, uint m, uint n, uint k,
                              const float* residual, const float* scales, int mode, int ordered,
@@ -87,9 +92,16 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
         // there so B8 below agrees with it on element size and the launch stub compiles.
         using AT = typename HiddenA<AH16>::type;
         AT a = AT::Load(tile, 0, 32u * ASZ);
-        // Four output waves share one converted input tile. In the final
-        // partial group, inactive waves read a valid tile and omit stores.
-        B8 b = B8::LoadRow(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512, 16);
+        // Four output waves share one converted input tile, but each loads its own weight tile. In
+        // the final partial group, inactive waves read a valid tile and omit stores.
+        //
+        // One declaration for both weight formats, so the three `ordered` reductions below stay a
+        // single code path: the accumulation order is what tests/test_linear.hip pins, and it
+        // should not be duplicated by a change that is only about how bytes are unpacked.
+        constexpr uint BSZ = W16 ? 2u : 1u;
+        using BT = typename WeightB<W16>::type;
+        BT b = BT::LoadRow(weights, (((col < n ? col : 0) / 16) * (k / 32) + g) * 512 * BSZ,
+                           16 * BSZ);
         if (ordered == 2) {
             partition.MultiplyAccumulate(a,b);
             if ((g+1) % (k/128) == 0) {

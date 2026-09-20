@@ -73,19 +73,23 @@ struct Block {
   std::string p=id==70?"post70":"block"+std::to_string(id);size_t m=size_t(c)*c;
   if(c==512){auto f=load(dir,p+"-ffwd",524288);fw=upload_tiled_e4m3(f.data(),512,512);
    std::vector<u8> e(131072),t(131072);for(uint g=0;g<8;++g){pack_tiled_e4m3(e.data()+g*16384,f.data()+262144+g*16384,256,64);pack_tiled_e4m3(t.data()+g*16384,f.data()+393216+g*16384,64,256);}ex.alloc(e.size());ex.upload(e.data(),e.size());ct.alloc(t.size());ct.upload(t.data(),t.size());
-   auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_e4m3(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
+   auto fproj=load(dir,p+"-ffwd-projection",262656);p0=upload_tiled_lin(fproj.data(),c,c);s0=floats(fproj.data()+m,c);
   }else {auto f=load(dir,p+"-ffn",c==32?8736:9*m+c);size_t off=c==32?512:0;
    // The FFN's weights, in whichever format the kernels will read them. ONE switch decides both, and
    // the contract half sits after the expand half at 4*m elements -- one byte each as E4M3, two as f16,
    // which is why the kernel's f16 offset is 2*hidden_c*C.
    if(dlss5_w16()){std::vector<__half> t(8*m);pack_tiled_half(t.data(),f.data()+off,4*c,c);pack_tiled_half(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size()*2);fw.upload(t.data(),t.size()*2);}
    else{std::vector<u8> t(8*m);pack_tiled_e4m3(t.data(),f.data()+off,4*c,c);pack_tiled_e4m3(t.data()+4*m,f.data()+off+4*m,c,4*c);fw.alloc(t.size());fw.upload(t.data(),t.size());}
-   if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_e4m3(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
+   if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_lin(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
   }
   auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
-  // qw is the only buffer k_qkv_norm_f32 reads, so DLSS5_W16_LIN reaches it here and nowhere else.
-  // p0, p1 and the ViT's ex/ct/pw feed k_linear_f32 and are still E4M3 -- that half comes next.
-  qw=upload_tiled_lin(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+  // qw feeds k_qkv_norm_f32, p1 feeds k_linear_f32; both follow DLSS5_W16_LIN. The complete set it
+  // governs is these two, p0 above (twice), and the ViT's ex/ct/pw -- six uploads. Block::fw at
+  // c==512 and the Block ex/ct beside it are the C512 split tiles for stage.hip, a different
+  // kernel, and stay E4M3; so does Vit::qw, which is genuine f16 via half_matrix for a different
+  // kernel again. Getting that partition wrong in either direction is the mismatch the flag's
+  // comment in dlss5_launch.hpp warns about.
+  qw=upload_tiled_lin(a.data(),3*c,c);p1=upload_tiled_lin(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
  }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
@@ -153,8 +157,8 @@ struct Vit {
  DeviceBuf ex,ct,cs,qw,qs,pw,ps;
  void create(const std::string&dir,int id){std::string p="block"+std::to_string(id);
   auto e=load(dir,p+"-expand",4194304),c=load(dir,p+"-contract",4195328),q=load(dir,p+"-qkv",3145760),o=load(dir,p+"-projection",1049600);
-  ex=upload_tiled_e4m3(e.data(),4096,1024);ct=upload_tiled_e4m3(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
-  qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_e4m3(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
+  ex=upload_tiled_lin(e.data(),4096,1024);ct=upload_tiled_lin(c.data(),1024,4096);cs=floats(c.data()+4194304,1024);
+  qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_lin(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
  }
   void run(const float* in,float* out,Scratch&s){
    // The expand output is already on the E4M3 grid; keeping the bytes lets the
