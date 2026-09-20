@@ -205,6 +205,14 @@ extern "C" void dlss5_shutdown(void) {
 
 extern "C" const char* dlss5_last_error(void) { return g_err.c_str(); }
 
+extern "C" double dlss5_last_gpu_ms(void) {
+    // The GPU interval of the last dlss5_run, as Network70's own events measured it. Subtracting it
+    // from the wall time of the call separates the model from this wrapper's host-side work --
+    // validation, the output vector, the copy -- which no GPU-side benchmark has ever covered.
+    std::lock_guard<std::mutex> lock(g_mu);
+    return g_net ? double(g_net->last_gpu_ms()) : 0.0;
+}
+
 extern "C" const char* dlss5_formats(void) {
     // dlss5_w16() reads the environment once, on first call, and dlss5_kernel_formats() is compiled
     // into kernels.o -- so this reports the weight format this process will actually use and the

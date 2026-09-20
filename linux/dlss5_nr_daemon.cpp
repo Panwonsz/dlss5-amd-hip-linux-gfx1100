@@ -432,6 +432,7 @@ struct Model
     PFN_LastError lastError = nullptr;
     PFN_Shutdown shutdown = nullptr;
     const char* (*formats)() = nullptr;
+    double (*lastGpuMs)() = nullptr;
 
     bool Load(const std::string& path)
     {
@@ -449,6 +450,7 @@ struct Model
         shutdown = (PFN_Shutdown) dlsym(handle, "dlss5_shutdown");
         // Optional: absent in libraries built before 2026-09-21, and not worth failing over.
         formats = (const char* (*)()) dlsym(handle, "dlss5_formats");
+        lastGpuMs = (double (*)()) dlsym(handle, "dlss5_last_gpu_ms");
 
         if (init == nullptr || run == nullptr)
         {
@@ -460,6 +462,7 @@ struct Model
     }
 
     const char* Error() const { return lastError != nullptr ? lastError() : "unknown"; }
+    double GpuMs() const { return lastGpuMs != nullptr ? lastGpuMs() : -1.0; }
     const char* Formats() const { return formats != nullptr ? formats() : "unknown (library predates dlss5_formats)"; }
 };
 
@@ -570,6 +573,11 @@ void Serve(int client, Model& model, bool verbose)
 
         staged.resize(request.bytes);
 
+        // The answer's latency is what the fade consumes, and it is not what this loop used to
+        // time. The old timer started AFTER the payload read and stopped BEFORE the reply write,
+        // so two transfers of ~33 MB and ~25 MB over loopback were invisible in it.
+        const auto t_read = std::chrono::steady_clock::now();
+
         if (!ReadExactly(client, staged.data(), staged.size()))
             break;
 
@@ -584,7 +592,15 @@ void Serve(int client, Model& model, bool verbose)
                                          request.width);
                        });
 
+        const auto t_decoded = std::chrono::steady_clock::now();
+
         const int rc = model.run(input.data(), answer.data(), uint32_t(frames));
+
+        const auto t_model = std::chrono::steady_clock::now();
+        // The GPU interval the model itself measured. model wall time minus this is the library's
+        // own host-side work -- validation scans, the per-call output vector, the row copy -- which
+        // every GPU-side benchmark in this repo steps over.
+        const double gpu_ms = model.GpuMs();
 
         if (rc != 0)
         {
@@ -606,8 +622,10 @@ void Serve(int client, Model& model, bool verbose)
                                          request.width);
                        });
 
+        const auto t_encoded = std::chrono::steady_clock::now();
+
         const auto millis = uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - started)
+                                         t_encoded - started)
                                          .count());
 
         Response ok { kResponseMagic, 0, request.bytes, millis };
@@ -615,11 +633,23 @@ void Serve(int client, Model& model, bool verbose)
         if (!WriteExactly(client, &ok, sizeof ok) || !WriteExactly(client, staged.data(), staged.size()))
             break;
 
+        const auto t_written = std::chrono::steady_clock::now();
         frames++;
 
         if (verbose || frames <= 3 || frames % 100 == 0)
-            std::printf("frame %llu  %ux%u format %u  %u ms\n", (unsigned long long) frames,
-                        request.width, request.height, request.format, millis);
+        {
+            auto el = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            const double model_ms = el(t_decoded, t_model);
+            std::printf("frame %llu  %ux%u format %u  %u ms"
+                        "  [read %.1f  decode %.1f  model %.1f (gpu %.1f, host %.1f)"
+                        "  encode %.1f  write %.1f  total %.1f]\n",
+                        (unsigned long long) frames, request.width, request.height, request.format,
+                        millis, el(t_read, started), el(started, t_decoded), model_ms, gpu_ms,
+                        gpu_ms >= 0 ? model_ms - gpu_ms : -1.0, el(t_model, t_encoded),
+                        el(t_encoded, t_written), el(t_read, t_written));
+        }
 
         std::fflush(stdout);
     }

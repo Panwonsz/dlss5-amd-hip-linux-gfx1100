@@ -42,6 +42,10 @@ DLSS5_CAPI_EXPORT const char *dlss5_last_error(void);
    Callers resolve it with dlsym and tolerate its absence in older builds. */
 DLSS5_CAPI_EXPORT const char *dlss5_formats(void);
 
+/* GPU milliseconds of the last dlss5_run. Wall time minus this is host-side
+   work inside the library. Resolved with dlsym; absent in older builds. */
+DLSS5_CAPI_EXPORT double dlss5_last_gpu_ms(void);
+
 /* V2 uses a separate table, preserving the V1 ABI. Host pointers are packed
    1080p RGBA/RGB and a full motion rectangle (XY float32). flags bit0 selects
    display-sRGB; otherwise mode1 linear game color. reset invalidates history.
