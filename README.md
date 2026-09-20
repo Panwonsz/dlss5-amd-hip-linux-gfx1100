@@ -2,7 +2,7 @@
 
 > **This is a slow, experimental proof of concept. It needs substantial optimization and is not ready for normal gameplay.** Expect very low frame rates, high latency and possible rendering problems. It is not an official NVIDIA DLSS implementation or a claim of equivalent image quality.
 
-A native Linux HIP/rocWMMA implementation of the complete 71-block DLSS5 network for AMD `gfx1201`, with a ReShade add-on, Wine bridge and modified vkd3d-proton submission path. NVIDIA DLLs and weights are **not included**.
+A native Linux HIP/rocWMMA implementation of the complete 71-block DLSS5 network for AMD `gfx1100`, with a ReShade add-on, Wine bridge and modified vkd3d-proton submission path. NVIDIA DLLs and weights are **not included**.
 
 ## Download and install
 
@@ -17,14 +17,14 @@ The archive contains the prebuilt HIP library, Windows bridge, add-on, ReShade l
 
 ## Requirements and limitations
 
-- Linux x86_64, Python 3.10+, ROCm/HIP 7 and a compatible Wine/Proton runner. Binaries are built for **gfx1201**, not all AMD GPUs or distributions.
+- Linux x86_64, Python 3.10+, ROCm/HIP 7 and a compatible Wine/Proton runner. Binaries are built for **gfx1100**, not all AMD GPUs or distributions.
 - An in-game DX12 FSR/FidelityFX hook. **No anti-cheat games, Magpie support or frame generation in this release.**
 - The network operates at 1920×1080 internally; the live hook resizes other supported frame sizes. Motion history is reset for each live frame, so this is **not temporally complete**.
 - Some weight layouts are reconstructed from AMD-consumer evidence. Opting in does not establish NVIDIA numerical or visual equivalence.
 - The prototype uses CPU readback/upload and HIP execution at a split vkd3d submission boundary. **The game still waits for neural rendering.** It is not an asynchronous performance fix.
 - General gameplay stability, HDR behavior and broad game compatibility are not certified. F6 toggles the live path's bypass when the hook is active; it cannot fix a missing hook or failed initialization.
 
-The offline bench (network only, fixed 1080p input, real converted weights, RX 9070 XT `gfx1201`, warm runs) measures **~63–66 ms GPU time per inference** on the current development build — `0.2.1` measured ~98–105 ms and `0.1.0-poc` 210–216 ms. That is network-only timing, **not in-game FPS**. Kernel work is tracked in the [Changelog](#changelog); data transfers and memory use remain open targets.
+The offline bench (network only, fixed 1080p input, real converted weights, RX 7900 XT `gfx1100`.
 
 ## Changelog
 
