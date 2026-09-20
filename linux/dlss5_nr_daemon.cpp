@@ -431,6 +431,7 @@ struct Model
     PFN_Run run = nullptr;
     PFN_LastError lastError = nullptr;
     PFN_Shutdown shutdown = nullptr;
+    const char* (*formats)() = nullptr;
 
     bool Load(const std::string& path)
     {
@@ -446,6 +447,8 @@ struct Model
         run = (PFN_Run) dlsym(handle, "dlss5_run");
         lastError = (PFN_LastError) dlsym(handle, "dlss5_last_error");
         shutdown = (PFN_Shutdown) dlsym(handle, "dlss5_shutdown");
+        // Optional: absent in libraries built before 2026-09-21, and not worth failing over.
+        formats = (const char* (*)()) dlsym(handle, "dlss5_formats");
 
         if (init == nullptr || run == nullptr)
         {
@@ -457,6 +460,7 @@ struct Model
     }
 
     const char* Error() const { return lastError != nullptr ? lastError() : "unknown"; }
+    const char* Formats() const { return formats != nullptr ? formats() : "unknown (library predates dlss5_formats)"; }
 };
 
 std::atomic<bool> g_stop { false };
@@ -732,7 +736,10 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::printf("model ready, %ux%u\n", kModelWidth, kModelHeight);
+    // The daemon outlives the game and the next launch reuses it, so a DLSS5_W16 set in a Steam
+    // launch option reaches a process that may have been started hours ago with the other value.
+    // Print what this process actually loaded; the log is then evidence rather than intent.
+    std::printf("model ready, %ux%u %s\n", kModelWidth, kModelHeight, model.Formats());
 
     std::signal(SIGPIPE, SIG_IGN);
 

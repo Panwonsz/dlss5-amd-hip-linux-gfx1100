@@ -205,6 +205,15 @@ extern "C" void dlss5_shutdown(void) {
 
 extern "C" const char* dlss5_last_error(void) { return g_err.c_str(); }
 
+extern "C" const char* dlss5_formats(void) {
+    // dlss5_w16() reads the environment once, on first call, and dlss5_kernel_formats() is compiled
+    // into kernels.o -- so this reports the weight format this process will actually use and the
+    // activation formats its kernels were built with, not what the caller's environment says now.
+    static const std::string s = std::string("weights=") + (dlss5::dlss5_w16() ? "f16" : "e4m3")
+                               + " kernels[" + dlss5::dlss5_kernel_formats() + "]";
+    return s.c_str();
+}
+
 extern "C" int dlss5_find_device(const char* name) {
     std::lock_guard<std::mutex> lock(g_mu);
     try {

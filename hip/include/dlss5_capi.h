@@ -35,6 +35,13 @@ DLSS5_CAPI_EXPORT int dlss5_run(const float *rgba1080, float *rgb1080, dlss5_u32
 DLSS5_CAPI_EXPORT void dlss5_shutdown(void);
 DLSS5_CAPI_EXPORT const char *dlss5_last_error(void);
 
+/* The formats THIS library was built and configured with, e.g.
+   "weights=f16 kernels[ah16=1 qkv16=0]". For logs and bug reports: the daemon
+   outlives the game and is reused by the next launch, so an environment
+   variable set for a run is not evidence about the process actually answering.
+   Callers resolve it with dlsym and tolerate its absence in older builds. */
+DLSS5_CAPI_EXPORT const char *dlss5_formats(void);
+
 /* V2 uses a separate table, preserving the V1 ABI. Host pointers are packed
    1080p RGBA/RGB and a full motion rectangle (XY float32). flags bit0 selects
    display-sRGB; otherwise mode1 linear game color. reset invalidates history.
