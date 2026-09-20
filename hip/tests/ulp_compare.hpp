@@ -9,15 +9,15 @@
 // whenever it lands on a rounding tie.
 //
 // A flat absolute threshold cannot tell those apart from a genuine bug, which is why both tests
-// reported dozens of failures on every gfx1100 build the repository has ever had. So measure the
-// distance in the OUTPUT'S OWN grid instead, against a per-grid budget (see ulp_budget below).
+// reported dozens of failures on every gfx1100 build the repository has ever had. So for a value
+// that ends in a quantization, measure the distance in the OUTPUT'S OWN grid: one step, and only
+// one, is the documented consequence of the accumulation order.
 //
 // This is not a loosened tolerance:
-//   - anything past the budget fails on every architecture, as does any non-finite value;
-//   - divergences within it are counted and printed, so a regression shows up as the number moving;
-//   - `worst_steps` is printed unconditionally, so drift is visible even on a passing run;
-//   - off gfx11 the budget is not granted at all -- on gfx1201 the two orders do agree exactly, so
-//     a single step there is a failure.
+//   - two steps fails on every architecture, as does any non-finite value;
+//   - one-step divergences are counted and printed, so a regression is the number moving;
+//   - `worst_steps` prints unconditionally, so drift shows even on a passing run;
+//   - off gfx11 one step is not granted at all -- on gfx1201 the two orders agree exactly.
 #pragma once
 #include "dlss5_common.hpp"
 #include <cstdio>
@@ -66,33 +66,41 @@ inline bool device_is_gfx11() {
     return std::string(p.gcnArchName).rfind("gfx11", 0) == 0;
 }
 
-// How many steps the accumulation order can move a result, per grid.
+// Step distance applies to the QUANTIZED outputs only, and the first version of this header got
+// that wrong by extending it to F32 as well. The measurement that corrects it: on gfx1100 the
+// largest absolute error across every mode is 0.000976562 -- one f16 ulp -- and yet step distance
+// reported a worst case of 320. Both cannot describe the same numbers.
 //
-// F16 and E4M3 are the quantized outputs: the kernel and the reference differ by far less than an
-// f32 ulp before the final rounding, so the only way that becomes visible is a value sitting on a
-// rounding tie and falling the other way. That is exactly one step, never two.
+// The reason is cancellation. F32 here is test_linear's mode 3, the accumulator stored unrounded,
+// and these are sums of signed products: a result that lands near zero sits thousands of f32 ulps
+// from the reference while being 2.4e-07 away in absolute terms. Relative distance is not a
+// meaningful error measure for a cancelling sum, so that mode keeps an absolute bound -- which it
+// always passed. It was never the broken one.
 //
-// F32 is the unrounded accumulator (mode 3), and a one-step rule would be wrong there: the kernel
-// sums 96 products in WMMA tile order against a reference that sums them in index order, and
-// reordered floating-point summation is allowed to drift by O(n)*eps. A handful of ulps is expected
-// and is not evidence of anything. `worst_steps` is printed on every run, so the number to watch is
-// that, not this budget -- if it starts climbing, something has changed even while the test passes.
-inline long long ulp_budget(Grid g) { return g == Grid::F32 ? 4 : 1; }
+// F16 and E4M3 are different in kind. There the kernel and the reference differ by far less than an
+// f32 ulp *before* the final rounding, and the only way that becomes visible at all is a value
+// sitting on a rounding tie and falling the other way. That is exactly one step, never two, which
+// makes one step a statement about the arithmetic rather than a tolerance picked to fit.
+inline float abs_bound_f32() { return 1e-5f; }
 
 struct UlpTally {
-    unsigned hard = 0;   // non-finite, or past the budget: a defect anywhere
-    unsigned soft = 0;   // within budget: the documented gfx11 accumulation-order difference
-    long long worst = 0;
+    unsigned hard = 0;   // non-finite, past the bound, or more than one step: a defect anywhere
+    unsigned soft = 0;   // one step on a quantized output: the gfx11 accumulation-order difference
+    long long worst = 0; // worst step count seen on a quantized output
     float max_abs = 0.f;
 
     void check(float got, float want, Grid g) {
         float e = std::fabs(got - want);
         if (e > max_abs) max_abs = e;
         if (!std::isfinite(got)) { ++hard; return; }
+        if (g == Grid::F32) {           // cancelling sum: absolute bound, not steps
+            if (e > abs_bound_f32()) ++hard;
+            return;
+        }
         long long s = ulp_steps(got, want, g);
         if (s > worst) worst = s;
         if (s == 0) return;
-        if (s <= ulp_budget(g)) ++soft; else ++hard;
+        if (s == 1) ++soft; else ++hard;
     }
 
     // Exit status. One step is tolerated only where the accumulation orders genuinely differ.
