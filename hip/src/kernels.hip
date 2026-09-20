@@ -228,101 +228,75 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
     LAUNCH(k_normalize_qkv, (count + 255) / 256, 256, in, scales, out, tokens, c, qgain, half_squares);
 }
 
+// The C64..C512 dispatch pair, written once. Every width does the same two launches -- the heads
+// that get normalized, then the V-only tail -- and differ only in C, the input format and now the
+// weight format. Five widths times two input formats times two weight formats is forty dispatch
+// lines spelled out; this is the same reason DLSS5_FFN_F8 and its siblings exist, and it matters
+// more here, because a W16 that reached some widths and not others would be exactly the
+// upload/dispatch mismatch dlss5_w16_lin() is written to prevent.
+//
+// f32in / f8in / h_in are passed through unchanged; whichever is null selects nothing.
+#define DLSS5_QKV_PAIR(C, F8IN, HIN, W16, f32in, f8in, h_in)                                       \
+    {                                                                                              \
+        uint heads = (C) / 32u;                                                                    \
+        LAUNCH((k_qkv_norm_f32<C, 2, F8IN, HIN, false, DLSS5_AH16, W16>),                          \
+               dim3((m + 15) / 16, heads), 128, f32in, f8in, w, out, m, c, scales, qgain,          \
+               half_squares, h_in);                                                                \
+        LAUNCH((k_qkv_norm_f32<C, 2, F8IN, HIN, true, DLSS5_AH16, W16>),                           \
+               dim3((m + 15) / 16, heads / 2u), 128, f32in, f8in, w, out, m, c, scales, qgain,     \
+               half_squares, h_in, 2u * heads);                                                    \
+    }
+
+#define DLSS5_QKV_NORM_F32(W16)                                                                    \
+    switch (c) {                                                                                   \
+    case 32:                                                                                       \
+        /* NH=3: one CTA computes Q+K+V for 16 rows, so the f32/FP8 input tile is                  \
+           staged once instead of once per Q/K/V CTA. */                                           \
+        LAUNCH((k_qkv_norm_f32<32, 3, false, false, false, DLSS5_AH16, W16>),                      \
+               dim3((m + 15) / 16, 1u), 192, in, nullptr, w, out, m, c, scales, qgain,             \
+               half_squares);                                                                      \
+        break;                                                                                     \
+    case 64: DLSS5_QKV_PAIR(64, false, false, W16, in, nullptr, nullptr) break;                    \
+    case 128: DLSS5_QKV_PAIR(128, false, false, W16, in, nullptr, nullptr) break;                  \
+    case 256: DLSS5_QKV_PAIR(256, false, false, W16, in, nullptr, nullptr) break;                  \
+    case 512: DLSS5_QKV_PAIR(512, false, false, W16, in, nullptr, nullptr) break;                  \
+    default: throw std::runtime_error("QKV norm extent");                                          \
+    }
+
+#define DLSS5_QKV_NORM_F8IN(W16)                                                                   \
+    switch (c) {                                                                                   \
+    case 64: DLSS5_QKV_PAIR(64, true, false, W16, nullptr, in, nullptr) break;                     \
+    case 128: DLSS5_QKV_PAIR(128, true, false, W16, nullptr, in, nullptr) break;                   \
+    case 256: DLSS5_QKV_PAIR(256, true, false, W16, nullptr, in, nullptr) break;                   \
+    case 512: DLSS5_QKV_PAIR(512, true, false, W16, nullptr, in, nullptr) break;                   \
+    default: throw std::runtime_error("QKV norm f8 channels");                                     \
+    }
+
 // GEMM + normalize + quantize in one launch (bit-identical to the split pair).
 void launch_qkv_norm_f32(int c, const float* in, const u8* w, u8* out, uint m,
                          const float* scales, float qgain, bool half_squares) {
     if (!m || !c || c % 32 || !scales) throw std::runtime_error("QKV norm extent/scales");
-    switch (c) {
-    case 32:
-        // NH=3: one CTA computes Q+K+V for 16 rows, so the f32/FP8 input tile is
-        // staged once instead of once per Q/K/V CTA.
-        LAUNCH((k_qkv_norm_f32<32, 3, false>), dim3((m + 15) / 16, 1u), 192, in, nullptr, w, out,
-               m, c, scales, qgain, half_squares);
-        break;
-    case 64: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<64, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
-                out, m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<64, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    case 128: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<128, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
-                out, m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<128, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    case 256: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<256, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
-                out, m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<256, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    case 512: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<512, 2, false>), dim3((m + 15) / 16, heads), 128, in, nullptr, w,
-                out, m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<512, 2, false, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                in, nullptr, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    default:
-        throw std::runtime_error("QKV norm extent");
-    }
+    if (dlss5_w16_lin()) { DLSS5_QKV_NORM_F32(true) } else { DLSS5_QKV_NORM_F32(false) }
 }
 void launch_qkv_norm_f32_f8in(int c, const u8* in, const u8* w, u8* out, uint m,
                               const float* scales, float qgain, bool half_squares) {
     if (!m || c == 32 || !in || !out || !scales)
         throw std::runtime_error("QKV norm f8 extent");
-    switch (c) {
-    case 64: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<64, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
-                m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<64, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    case 128: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<128, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
-                m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<128, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    case 256: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<256, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
-                m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<256, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    case 512: {
-        uint heads = c / 32u;
-        LAUNCH((k_qkv_norm_f32<512, 2, true>), dim3((m + 15) / 16, heads), 128, nullptr, in, w, out,
-                m, c, scales, qgain, half_squares);
-        LAUNCH((k_qkv_norm_f32<512, 2, true, false, true>), dim3((m + 15) / 16, heads / 2u), 128,
-                nullptr, in, w, out, m, c, scales, qgain, half_squares, nullptr, 2u * heads);
-        break;
-    }
-    default:
-        throw std::runtime_error("QKV norm f8 channels");
-    }
+    if (dlss5_w16_lin()) { DLSS5_QKV_NORM_F8IN(true) } else { DLSS5_QKV_NORM_F8IN(false) }
 }
 void launch_qkv_norm_f32_hin(int c, const __half* in, const u8* w, u8* out, uint m,
                              const float* scales, float qgain, bool half_squares) {
     if (!m || c != 32 || !in || !out || !scales)
         throw std::runtime_error("QKV norm f16 extent");
     // Same NH=3 CTA as the f32 path; the f16 input is the exact H(acc) grid.
-    LAUNCH((k_qkv_norm_f32<32, 3, false, true>), dim3((m + 15) / 16, 1u), 192, nullptr, nullptr,
-           w, out, m, c, scales, qgain, half_squares, in);
+    if (dlss5_w16_lin())
+        LAUNCH((k_qkv_norm_f32<32, 3, false, true, false, DLSS5_AH16, true>),
+               dim3((m + 15) / 16, 1u), 192, nullptr, nullptr, w, out, m, c, scales, qgain,
+               half_squares, in);
+    else
+        LAUNCH((k_qkv_norm_f32<32, 3, false, true, false, DLSS5_AH16, false>),
+               dim3((m + 15) / 16, 1u), 192, nullptr, nullptr, w, out, m, c, scales, qgain,
+               half_squares, in);
 }
 void launch_reframe_f32(const float* src, float* dst, uint w, uint h, uint sw, uint sh,
                         uint px, uint py, uint c, int crop, int quantize) {

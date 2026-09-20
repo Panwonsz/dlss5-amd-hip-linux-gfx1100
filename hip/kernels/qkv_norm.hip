@@ -35,8 +35,13 @@ __device__ inline float sq_f32(float v) {
 // A fragments load with one rocwmma::load_matrix_sync instead of load_e4m3's per-lane unpack. The
 // staging rounds to E4M3 either way and every E4M3 code is exact in f16, so the matrix unit sees the
 // same numbers and the output hash is unchanged (tests/bench_qkv32.hip).
+// W16: the weights arrive as f16 rather than E4M3, so the B fragments load with one
+// load_matrix_sync too. AH16 removed the conversion from the A side of this GEMM; this is the
+// other half of the same wave, and the caller must supply pack_tiled_half weights to match
+// (`DLSS5_W16_LIN`, dlss5_launch.hpp). An f16 tile is 1024 bytes with a 32-byte row stride where
+// an E4M3 tile is 512 with 16 -- the same 16x32 elements, two bytes each.
 template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false,
-          bool AH16 = DLSS5_AH16>
+          bool AH16 = DLSS5_AH16, bool W16 = false>
 __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
                                u8* output, uint m, uint k, const float* scales, float qgain,
                                bool half_squares, const __half* input_h = nullptr,
@@ -112,8 +117,13 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         // spelling that lets B8 below agree with it on element size so the launch stub compiles.
         using AT = typename HiddenA<AH16>::type;
         AT a = AT::Load(tile, 0, 32u * ASZ);
-        B8 b = B8::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 512u, 16);
-        acc.MultiplyAccumulate(a, b);
+        if constexpr (W16) {
+            BW16 b = BW16::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 1024u, 32);
+            acc.MultiplyAccumulate(a, b);
+        } else {
+            B8 b = B8::LoadRow(weights, ((col / 16u) * (k / 32u) + g) * 512u, 16);
+            acc.MultiplyAccumulate(a, b);
+        }
         __syncthreads();
     }
     const uint norm_heads = head0 < 2u * HEADS

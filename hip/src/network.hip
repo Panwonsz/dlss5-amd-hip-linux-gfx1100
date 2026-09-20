@@ -38,6 +38,17 @@ void pack_tiled_half(__half* dst,const float* src,size_t N,size_t K){
  for(size_t t=0;t<N/16;t++)for(size_t g=0;g<K/32;g++)for(size_t k=0;k<32;k++)for(size_t j=0;j<16;j++)
   dst[(t*(K/32)+g)*512+k*16+j]=__float2half(from_e4m3(e4m3_byte(src[(t*16+j)*K+g*32+k])));
 }
+// upload_tiled_e4m3's f16 sibling, for the buffers k_linear_f32 and k_qkv_norm_f32 read under
+// DLSS5_W16_LIN. Same tiles, same order, two bytes an element -- and the same E4M3 round trip, so
+// the values are unchanged and hip-network70's statistics must not move.
+DeviceBuf upload_tiled_half(const float* v,uint n,uint k){
+ std::vector<__half> t(size_t(n)*k);pack_tiled_half(t.data(),v,n,k);
+ DeviceBuf b(t.size()*2);b.upload(t.data(),t.size()*2);return b;
+}
+// One call site per buffer, so the format decision is never spelled out twice.
+DeviceBuf upload_tiled_lin(const float* v,uint n,uint k){
+ return dlss5_w16_lin()?upload_tiled_half(v,n,k):upload_tiled_e4m3(v,n,k);
+}
 DeviceBuf half_matrix(const float* v,uint n,uint k){
  std::vector<__half> t(size_t(n)*k);
  for(uint r=0;r<n;++r)for(uint c=0;c<k;++c)t[((r/16)*(k/32)+c/32)*512+(c%32)*16+r%16]=__float2half(v[size_t(r)*k+c]);
@@ -72,7 +83,9 @@ struct Block {
    if(c==32)fs=floats(f.data()+8704,32);else{p0=upload_tiled_e4m3(f.data()+8*m,c,c);s0=floats(f.data()+9*m,c);}
   }
   auto a=load(dir,p+"-attention",4*m+(c/32)*4096+c/32+c);
-  qw=upload_tiled_e4m3(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+  // qw is the only buffer k_qkv_norm_f32 reads, so DLSS5_W16_LIN reaches it here and nowhere else.
+  // p0, p1 and the ViT's ex/ct/pw feed k_linear_f32 and are still E4M3 -- that half comes next.
+  qw=upload_tiled_lin(a.data(),3*c,c);p1=upload_tiled_e4m3(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
  }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.

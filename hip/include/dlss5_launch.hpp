@@ -66,6 +66,32 @@ inline bool dlss5_w16() {
     return on;
 }
 
+// DLSS5_W16_LIN: the same treatment for the weights read by k_linear_f32 and k_qkv_norm_f32 --
+// per block `p0`, `p1` and `qw`, and the ViT's `ex`, `ct` and `pw`. About 103 MB of E4M3, so this
+// costs that again in VRAM, on top of DLSS5_W16's ~148 MB.
+//
+// Deliberately a SECOND switch rather than an extension of the first. The FFN's share of the model
+// is already measured and this one is not; one flag covering both would move them together and
+// leave neither attributable. Fold them once this has a number.
+//
+// Everything said about dlss5_w16() applies here with the same force, and over more buffers: this
+// one function drives six uploads in network.hip and three launchers in kernels.hip, and if any of
+// them disagrees the kernel reads E4M3 bytes as f16 and produces a stable, plausible, wrong
+// picture that replay equality accepts without complaint. The gate is hip-network70's `mean` and
+// `mean_abs_change`, which must not move: pack_tiled_half round-trips through E4M3, so the f16
+// weights are the dequantised E4M3 values and every digit must match.
+//
+// It also means the launchers below now expect whichever format this returns. The tests pack E4M3
+// and do not set the variable; running them with it set would feed them a buffer in a format they
+// do not hold. Same caveat the FFN path already carries.
+inline bool dlss5_w16_lin() {
+    static const bool on = [] {
+        const char* asked = std::getenv("DLSS5_W16_LIN");
+        return asked != nullptr && std::atoi(asked) != 0;
+    }();
+    return on;
+}
+
 // The 2x2 of weight format (w16) x hidden-activation format (a16), for benchmarks. Not for the network:
 // w16 requires f16-packed weights from the caller, exactly as launch_ffn_f32_w16 does.
 void launch_ffn_f32_bench(int c, const float* in, const u8* w, const float* scales, float* out,
