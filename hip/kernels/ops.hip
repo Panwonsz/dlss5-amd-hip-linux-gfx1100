@@ -605,7 +605,11 @@ __global__ void k_post_merge_f32(const float* low,const float* pre,const float* 
   uint ch=i%32,p=i/32,lp=((p/w)/2)*(w/2)+(p%w)/2;
   float lo=main8_low?from_e4m3(e4m3_byte(low[lp*32+ch])):low[lp*32+ch];
   float v=H(H(lo*scales[ch])+from_e4m3(e4m3_byte(pre[i]))*scales[32+ch]);
-  out[i]=v;
+  // Both stores are optional. post70 is the only caller that passes out_h, and it takes the f16
+  // path through Block::run, where the f32 raster is handed to window() as `in` and then never
+  // read -- 283 MB a frame written for nobody. Callers that do want the f32 raster (test_graph_ops,
+  // test_configured_path, any future non-f16 consumer) pass `out` and are unaffected.
+  if(out)out[i]=v;
   if(out_h)out_h[i]=__float2half_rn(v);
 }
 __global__ void k_head_f32(const float* feat,const float* weights,const float* color,float* out,uint n){

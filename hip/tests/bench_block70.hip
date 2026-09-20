@@ -139,24 +139,35 @@ int main(int argc, char** argv) {
                 "SUM", total);
 
     // ---- the merge's two stores, separately ----------------------------------------------------
-    // k_post_merge_f32 writes out[i] unconditionally and out_h[i] only when out_h is non-null, so
-    // the f32-only launcher isolates the f16 store's cost. This matters because block 70 takes the
-    // in_h path, where Block::run passes the merged f32 buffer to window() as `in` and the c==32
-    // branch then reads only in_h -- i.e. the 283 MB f32 store looks DEAD in the default path.
-    // Measuring the f16 store's cost gives a per-byte anchor to price that store from. It is an
-    // inference either way, and the only thing that settles it is deleting the store and timing it.
+    // k_post_merge_f32 stores either output only when given a pointer for it, so all three
+    // combinations are measurable. That matters because block 70 takes the in_h path, where
+    // Block::run hands window() the merged f32 buffer as `in` and the c==32 branch reads only
+    // in_h -- the f32 store is dead there, and network.hip now passes nullptr for it.
+    //
+    // An earlier version of this section did NOT measure the f16-only case. It differenced the two
+    // launchers and scaled the result by byte count, which priced the f16 store at 1863 GB/s on an
+    // 800 GB/s card. A marginal-byte model that returns 2.3x the physical peak is broken, and the
+    // 0.153 ms it predicted was three times too small. The row that matters is measured now.
     std::printf("\nthe merge's two stores (diagnostic, not part of the sum):\n");
-    double before = total;
-    double merge_f32 = time_it("launch_post_merge_f32 (f32 store only)", [&] {
+    const double before = total;
+    double merge_f32 = time_it("f32 store only", [&] {
         launch_post_merge_f32(lo.as<float>(), pre.as<float>(), post_sc.as<float>(),
                               merged.as<float>(), W, Ht, true);
     });
+    double merge_f16 = time_it("f16 store only  <- what 70 now runs", [&] {
+        launch_post_merge_f32_h(lo.as<float>(), pre.as<float>(), post_sc.as<float>(),
+                                nullptr, merged_h.as<__half>(), W, Ht, true);
+    });
+    double merge_none = time_it("neither store (the read side alone)", [&] {
+        launch_post_merge_f32_h(lo.as<float>(), pre.as<float>(), post_sc.as<float>(),
+                                nullptr, nullptr, W, Ht, true);
+    });
     total = before;
-    std::printf("  %-36s %7.3f ms   for %.0f MB -> %.0f GB/s\n", "f16 store costs", merge_h - merge_f32,
-                double(N * 32 * 2) / 1048576.0,
-                double(N * 32 * 2) / ((merge_h - merge_f32) * 1e-3) / 1e9);
-    std::printf("  %-36s %7.3f ms   if the 283 MB f32 store prices the same and is truly dead\n",
-                "so removing the f32 store might save", 2.0 * (merge_h - merge_f32));
+    std::printf("  %-36s %7.3f ms   (%.1f%% of block 70)\n",
+                "dropping the dead f32 store saves", merge_h - merge_f16,
+                100.0 * (merge_h - merge_f16) / total);
+    std::printf("  %-36s %7.3f ms   <- the floor: reads + arithmetic, no stores at all\n",
+                "if that looks small, the read side is", merge_none);
 
     // ---- what follows block 70, for context ----------------------------------------------------
     // The profile's separate "head + download" row, 2.5 ms. Not part of block 70's interval.

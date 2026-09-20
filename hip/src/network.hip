@@ -235,8 +235,15 @@ struct Network70::Impl {
    for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
     const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
     for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
-  launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),dst,s.out16.as<__half>(),W,Ht,true);std::swap(src,dst);
-  blocks[70].run(src,dst,s,nullptr,false,s.out16.as<__half>(),false,true,false);std::swap(src,dst);mark(70,src,N*32);
+  // The merge emits ONLY f16. Block 70 is entered with in_h set, so Block::run takes the use_h path
+  // and window()'s c==32 branch reads in_h alone -- the f32 raster this used to write was handed to
+  // run() as `in` and never touched. The `in` argument is nullptr rather than a stale buffer on
+  // purpose: if the path below ever changes to read it, that must fault, not silently read the
+  // decoder's last low-res output and produce a plausible wrong picture. (See the stale-object
+  // section of the plan: the page fault was the lucky outcome, the silent version is the bad one.)
+  // Dropping the store also drops a swap; src still points at the low-res decoder output here.
+  launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),nullptr,s.out16.as<__half>(),W,Ht,true);
+  blocks[70].run(nullptr,dst,s,nullptr,false,s.out16.as<__half>(),false,true,false);std::swap(src,dst);mark(70,src,N*32);
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
   hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
