@@ -23,7 +23,8 @@ int main(int argc, char** argv) {
     hip_check(hipSetDevice(0), "device");
     hipDeviceProp_t prop{};
     hip_check(hipGetDeviceProperties(&prop, 0), "props");
-    std::printf("bench-attention device=%s arch=%s iters=%d\n\n", prop.name, prop.gcnArchName, iters);
+    std::printf("bench-attention device=%s arch=%s qkv=%s iters=%d\n\n", prop.name,
+                prop.gcnArchName, DLSS5_QKV16 ? "f16" : "e4m3", iters);
 
     struct Group { const char* what; uint c, w, h, count; };
     // blocks 0 and 70; 1-4 and 66-69; 5-8 and 62-65; 9-14 and 56-61; 15-22 and 48-55; 23-30 and 40-47
@@ -44,7 +45,9 @@ int main(int argc, char** argv) {
 
     // One allocation, sized for the largest case, reused by every group.
     const size_t nmax = 1928ull * 1160;
-    DeviceBuf qkv(nmax * 3 * 32), out(nmax * 32), bias(16ull * 4096 * 4);
+    // The qkv buffer doubles under DLSS5_QKV16; the seed fill below covers whichever size.
+    DeviceBuf qkv(nmax * 3 * 32 * (DLSS5_QKV16 ? 2 : 1)), out(nmax * 32),
+        bias(16ull * 4096 * 4);
     {
         std::vector<u8> seed(1u << 20);
         for (size_t i = 0; i < seed.size(); ++i) seed[i] = u8((i * 131u + i / 97u) & 0x7fu);

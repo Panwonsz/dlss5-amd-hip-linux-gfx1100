@@ -33,8 +33,9 @@ int main(int argc, char** argv) {
     hip_check(hipSetDevice(0), "device");
     hipDeviceProp_t prop{};
     hip_check(hipGetDeviceProperties(&prop, 0), "props");
-    std::printf("bench-block0 device=%s arch=%s weights=%s tokens=%u iters=%d\n",
-                prop.name, prop.gcnArchName, dlss5_w16() ? "f16" : "e4m3", n, iters);
+    std::printf("bench-block0 device=%s arch=%s weights=%s qkv=%s tokens=%u iters=%d\n",
+                prop.name, prop.gcnArchName, dlss5_w16() ? "f16" : "e4m3",
+                DLSS5_QKV16 ? "f16" : "e4m3", n, iters);
 
     // ---- weights, in whichever format the kernels will read them ------------------------------
     auto fill = [](std::vector<float>& v, unsigned salt) {
@@ -73,7 +74,9 @@ int main(int argc, char** argv) {
 
     // ---- buffers -------------------------------------------------------------------------------
     DeviceBuf rgb(rgb_bytes), color(size_t(n) * 16), tiles(size_t(n) * 16);
-    DeviceBuf a(nsc * 4), a16(nsc * 2), bh(nsc * 2), q8(nsc * 3), att8(nsc), ah(nsc * 2);
+    // q8 doubles under DLSS5_QKV16, exactly as Scratch::q8 does.
+    DeviceBuf a(nsc * 4), a16(nsc * 2), bh(nsc * 2), q8(nsc * 3 * (DLSS5_QKV16 ? 2 : 1)),
+        att8(nsc), ah(nsc * 2);
     DeviceBuf skip0(size_t(n) * 32 * 4);
 
     std::vector<float> host_pageable(rgb_bytes / 4, 0.5f);

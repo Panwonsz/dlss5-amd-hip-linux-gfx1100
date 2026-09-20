@@ -135,6 +135,43 @@ __device__ inline uint2 e4m3x4_to_half4(u32 q) {
 #endif
 }
 
+// DLSS5_QKV16 lives here rather than in dlss5_linalg.hpp because it sizes a host-side
+// allocation (Scratch::q8) as well as selecting a fragment type, and network.hip does not
+// include the linalg header. Same reason dlss5_w16() sits beside its two packers.
+//
+// DLSS5_QKV16: k_qkv_norm_f32 writes the Q/K/V scratch buffer as the f16 of the E4M3-rounded value,
+// and k_window_attention reads it that way -- so its Q, K and V fragments load with one
+// load_matrix_sync each instead of load_e4m3's per-lane unpack. The same AH16 argument as the FFN's
+// hidden buffer and the linear/qkv A-tiles, applied across two kernels rather than within one.
+//
+// 82% of attention's fragment fills come from that buffer (Q once per wave, K and V all 64 tokens
+// per wave, four waves), and attention is 18.10 ms of a 98 ms frame. The other 18% is the p8 LDS
+// buffer, which is worth less and costs bank conflicts to align -- see the plan document.
+//
+// **Default OFF**, unlike AH16. The risk here is not occupancy but bandwidth: K and V are each read
+// four times over, so doubling the buffer doubles the traffic on a kernel already at roughly 30% of
+// the card's bandwidth, and whether that outweighs removing the conversions is a question for the
+// GPU. Build with -DDLSS5_QKV16=1 to measure; flip this default once it has a number, exactly as
+// DLSS5_W16 was flipped.
+//
+// It costs the q8 scratch: n*3 bytes becomes n*6, ~215 MB -> ~430 MB. The ViT shares that
+// allocation but writes and reads it with its own kernel pair (k_normalize_qkv, k_vit_attention_f8)
+// and never crosses formats with the window path, so only the size matters there.
+#ifndef DLSS5_QKV16
+#define DLSS5_QKV16 0
+#endif
+
+// Scalar sibling of e4m3x4_to_half4, for call sites that have one code rather than four packed.
+// Same host branch, same reason: e4m3_to_half_bits lives under #if DLSS5_GFX11 and HIP parses every
+// __global__ body on the host too.
+__device__ inline uint16_t e4m3_to_half_u16(u32 b) {
+#if DLSS5_GFX11
+    return e4m3_to_half_bits(b);
+#else
+    return uint16_t(b);
+#endif
+}
+
 // Software E4M3FN RNE (HLSL Ffast / NativeFastFp8).
 __host__ __device__ inline float F_sw(float v) {
     u32 bits = as_u32(v), a = bits & 0x7fffffffu;

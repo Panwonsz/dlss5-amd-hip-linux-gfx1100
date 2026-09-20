@@ -21,7 +21,19 @@ __device__ inline uint window_pixel(uint window, uint token, uint width) {
 // 2-way bank conflicts instead of 32-way. Phase 2 writes the E4M3 bytes directly
 // (e4m3_byte is the identity on E4M3-grid values, so the separate re-quant pass
 // is numerically redundant) as 16B stores; phase 3 is pure MMAs.
-template <int C>
+// QKV16: the qkv buffer holds the f16 of the E4M3-rounded value, so Q, K and V load with one
+// load_matrix_sync each rather than load_e4m3's eight conversions per lane. Those three are 82% of
+// this kernel's fragment fills -- each of the four waves reads its own Q and ALL 64 K and V tokens
+// -- and this kernel is 18.10 ms of a 98 ms frame (tests/bench_attention.hip).
+//
+// The p8 softmax buffer stays E4M3: it is the other 18%, and widening it would need a row stride of
+// a multiple of 8 halves for 16-byte-aligned fragment loads, which puts the rows at least 4 banks
+// apart where 68 halves puts them 2 -- trading phase 2's bank behaviour for phase 3's conversions.
+// Not obviously a win, and LDS here is the occupancy limit (12,800 B allows exactly 5 blocks/CU
+// against the 6 that 218 VGPRs would permit).
+//
+// k_qkv_norm_f32 must agree; DLSS5_QKV16 in dlss5_linalg.hpp drives both.
+template <int C, bool QKV16 = DLSS5_QKV16>
 __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, const float* bias,
                                                              u8* output, uint width,
                                    uint height, uint packed, bool direct_f8 = false) {
@@ -38,10 +50,17 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     __shared__ u8 p8[64 * 64];
     for (uint window = blockIdx.x; window < nwin; window += gridDim.x) {
 
-    A8 q = A8::Load(qkv, (window * 64u + qtok) * uint(STRIDE) + head * 32u, uint(STRIDE));
+    // One spelling for both formats; every offset into qkv scales with the element size.
+    constexpr uint QSZ = QKV16 ? 2u : 1u;
+    using QT = typename HiddenA<QKV16>::type;
+    using KVT = typename WeightB<QKV16>::type;
+
+    QT q = QT::Load(qkv, ((window * 64u + qtok) * uint(STRIDE) + head * 32u) * QSZ,
+                    uint(STRIDE) * QSZ);
     for (uint k0 = 0; k0 < 64; k0 += 16) {
-        B8 k = B8::LoadCol(qkv, (window * 64u + k0) * uint(STRIDE) + uint(C) + head * 32u,
-                           uint(STRIDE));
+        KVT k = KVT::LoadCol(
+            qkv, ((window * 64u + k0) * uint(STRIDE) + uint(C) + head * 32u) * QSZ,
+            uint(STRIDE) * QSZ);
         C32 s = Multiply(q, k);
         for (uint i = 0; i < s.Length(); i++) {
             uint2 rc = s.GetCoordinate(i);
@@ -82,10 +101,11 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     C32 av0 = C32::Splat(0.f);
     C32 av1 = C32::Splat(0.f);
     for (uint k0 = 0; k0 < 64; k0 += 32) {
-        A8 p = A8::Load(p8, qtok * 64u + k0, 64);
-        const uint vbase = (window * 64u + k0) * uint(STRIDE) + 2u * uint(C) + head * 32u;
-        B8 v0 = B8::LoadRow(qkv, vbase, uint(STRIDE));
-        B8 v1 = B8::LoadRow(qkv, vbase + 16u, uint(STRIDE));
+        A8 p = A8::Load(p8, qtok * 64u + k0, 64);   // p8 stays E4M3, see the note above
+        const uint vbase =
+            ((window * 64u + k0) * uint(STRIDE) + 2u * uint(C) + head * 32u) * QSZ;
+        KVT v0 = KVT::LoadRow(qkv, vbase, uint(STRIDE) * QSZ);
+        KVT v1 = KVT::LoadRow(qkv, vbase + 16u * QSZ, uint(STRIDE) * QSZ);
         av0.MultiplyAccumulate(p, v0);
         av1.MultiplyAccumulate(p, v1);
     }

@@ -40,8 +40,12 @@ __device__ inline float sq_f32(float v) {
 // other half of the same wave, and the caller must supply pack_tiled_half weights to match
 // (`DLSS5_W16_LIN`, dlss5_launch.hpp). An f16 tile is 1024 bytes with a 32-byte row stride where
 // an E4M3 tile is 512 with 16 -- the same 16x32 elements, two bytes each.
+// QOUT16: the Q/K/V buffer is written as the f16 of the E4M3-rounded value rather than the E4M3
+// byte, so k_window_attention's Q, K and V fragments load without converting. Exact for the same
+// reason AH16 is -- every E4M3 code is representable in f16, and the value is already on that grid
+// when it reaches the store. See DLSS5_QKV16 in dlss5_linalg.hpp.
 template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false,
-          bool AH16 = DLSS5_AH16, bool W16 = false>
+          bool AH16 = DLSS5_AH16, bool W16 = false, bool QOUT16 = DLSS5_QKV16>
 __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
                                u8* output, uint m, uint k, const float* scales, float qgain,
                                bool half_squares, const __half* input_h = nullptr,
@@ -163,23 +167,51 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
         inv = rsqrtf(fmaxf(sum, 6.198883056640625e-5f));
         if (headg < HEADS)
             inv *= scales[headg] * qgain;
+        // The eight dwords of E4M3 codes are formed identically either way; only the store differs.
         u32 w[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (uint ch = 0; ch < 16u; ++ch)
             w[ch >> 2] |= u32(e4m3_byte(s0[ch] * inv)) << ((ch & 3u) * 8u);
         for (uint ch = 0; ch < 16u; ++ch)
             w[4u + (ch >> 2)] |= u32(e4m3_byte(s1[ch] * inv)) << ((ch & 3u) * 8u);
-        u8* out = output + (size_t)(first + row) * (3u * C) + headg * 32u;
+        // Spelled out per format rather than scaled by a constexpr 1: reassociating the pointer
+        // arithmetic changed the E4M3 path's codegen (one 64-bit add folded into v_and_or_b32,
+        // one instruction fewer and provably the same address) and that path is supposed to be
+        // untouched. A free instruction is not worth losing the before/after identity check.
+        u8* out;
+        if constexpr (QOUT16)
+            out = output + ((size_t)(first + row) * (3u * C) + headg * 32u) * 2u;
+        else
+            out = output + (size_t)(first + row) * (3u * C) + headg * 32u;
         uint4* o4 = reinterpret_cast<uint4*>(out);
-        o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
-        o4[1] = make_uint4(w[4], w[5], w[6], w[7]);
+        if constexpr (QOUT16) {
+            // 32 codes -> 32 halves: four 16-byte stores instead of two. Rows are 64-byte aligned
+            // here (3C and headg*32 are both multiples of 32, doubled), so uint4 stays legal.
+            for (uint j = 0; j < 4u; ++j) {
+                uint2 a = e4m3x4_to_half4(w[j * 2u]), b = e4m3x4_to_half4(w[j * 2u + 1u]);
+                o4[j] = make_uint4(a.x, a.y, b.x, b.y);
+            }
+        } else {
+            o4[0] = make_uint4(w[0], w[1], w[2], w[3]);
+            o4[1] = make_uint4(w[4], w[5], w[6], w[7]);
+        }
     }
     if (wave >= norm_waves) {
         const uint headg = head0 + wave / 2u;
-        u8* out = output + (size_t)first * (3u * C) + headg * 32u + (wave % 2u) * 16u;
+        u8* out;
+        if constexpr (QOUT16)
+            out = output + ((size_t)first * (3u * C) + headg * 32u + (wave % 2u) * 16u) * 2u;
+        else
+            out = output + (size_t)first * (3u * C) + headg * 32u + (wave % 2u) * 16u;
         for (uint i = 0; i < acc.Length(); ++i) {
             uint2 rc = acc.GetCoordinate(i);
-            if (first + rc.x < m)
-                out[(size_t)rc.x * (3u * C) + rc.y] = e4m3_byte(acc.Get(i));
+            if (first + rc.x < m) {
+                const u8 q = e4m3_byte(acc.Get(i));
+                if constexpr (QOUT16)
+                    reinterpret_cast<uint16_t*>(out)[(size_t)rc.x * (3u * C) + rc.y] =
+                        e4m3_to_half_u16(q);
+                else
+                    out[(size_t)rc.x * (3u * C) + rc.y] = q;
+            }
         }
     }
 }

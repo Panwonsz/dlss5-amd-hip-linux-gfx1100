@@ -85,9 +85,11 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < x.size(); ++i) xh[i] = __float2half(x[i]);
     std::vector<float> sc(c / 32);
     for (uint i = 0; i < sc.size(); ++i) sc[i] = H(float(int(i % 7) - 3) * 0.3f);
+    // The output buffer follows DLSS5_QKV16 too -- and so does out_hash, which is then over a
+    // different representation. Never compare hashes across that flag.
     DeviceBuf dxh(xh.size() * 2);
     DeviceBuf dx(x.size() * 4), dw(w16 ? tiled16.size() : tiled.size()), ds(sc.size() * 4),
-        dy(size_t(m) * 3 * c);
+        dy(size_t(m) * 3 * c * (DLSS5_QKV16 ? 2 : 1));
     dx.upload(x.data(), x.size() * 4); dxh.upload(xh.data(), xh.size() * 2);
     if (w16) dw.upload(tiled16.data(), tiled16.size());
     else dw.upload(tiled.data(), tiled.size());
@@ -105,15 +107,15 @@ int main(int argc, char** argv) {
     hipEventRecord(e1, stream);
     hip_check(hipEventSynchronize(e1), "sync");
     float ms = 0; hipEventElapsedTime(&ms, e0, e1); ms /= iters;
-    std::printf("QKV32 m=%u iters=%d nh=%d ah16=%d w16=%d%s: %.3f ms/call\n", m, iters, nh,
-                int(ah16), int(w16),
+    std::printf("QKV32 m=%u iters=%d nh=%d ah16=%d w16=%d qout=%s%s: %.3f ms/call\n", m, iters,
+                nh, int(ah16), int(w16), DLSS5_QKV16 ? "f16" : "e4m3",
 #ifdef QKV32_ASM_BARRIER
                 " [asm-barrier]"
 #else
                 ""
 #endif
                 , ms);
-    std::vector<u8> out(size_t(m) * 3 * c);
+    std::vector<u8> out(size_t(m) * 3 * c * (DLSS5_QKV16 ? 2 : 1));
     dy.download(out.data(), out.size());
     uint64_t hsh = 1469598103934665603ull;
     for (u8 v : out) { hsh ^= v; hsh *= 1099511628211ull; }
