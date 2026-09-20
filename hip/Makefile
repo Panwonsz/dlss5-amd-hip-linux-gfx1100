@@ -23,7 +23,7 @@ MINGW_CC ?= $(firstword $(wildcard \
   /home/guentra/dlssnr-linux-hip/toolchain/llvm-mingw-20260826-ucrt-ubuntu-22.04-x86_64/bin/x86_64-w64-mingw32-gcc \
   $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)))
 
-.PHONY: all clean test game test-api bench-ffn32 bench-qkv32 bench-block0 bench-attention
+.PHONY: all clean test game test-api bench-ffn32 bench-qkv32 bench-block0 bench-block70 bench-attention
 
 bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_ffn32.hip -o $(BUILD)/bench_ffn32.o
@@ -33,6 +33,11 @@ bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.fl
 bench-block0: tests/bench_block0.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_block0.hip -o $(BUILD)/bench_block0.o
 	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_block0.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
+
+# Block 70's interval, kernel by kernel, at real sizes. ./bench-block70 [iters]
+bench-block70: tests/bench_block70.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
+	$(HIPCC) $(CXXFLAGS) -c tests/bench_block70.hip -o $(BUILD)/bench_block70.o
+	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_block70.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
 # k_window_attention at every width the network runs. ./bench-attention [iters]
 bench-attention: tests/bench_attention.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
