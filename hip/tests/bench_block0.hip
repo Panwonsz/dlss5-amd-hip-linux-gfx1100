@@ -33,9 +33,12 @@ int main(int argc, char** argv) {
     hip_check(hipSetDevice(0), "device");
     hipDeviceProp_t prop{};
     hip_check(hipGetDeviceProperties(&prop, 0), "props");
-    std::printf("bench-block0 device=%s arch=%s weights=%s qkv=%s tokens=%u iters=%d\n",
+    // The formats come from the LINKED kernels, not from this file's macros -- a stale
+    // build/kernels.o once made this line assert e4m3 while the kernels wrote f16, and the
+    // mismatched buffer size page-faulted three rows later.
+    std::printf("bench-block0 device=%s arch=%s weights=%s kernels[%s] tokens=%u iters=%d\n",
                 prop.name, prop.gcnArchName, dlss5_w16() ? "f16" : "e4m3",
-                DLSS5_QKV16 ? "f16" : "e4m3", n, iters);
+                dlss5_kernel_formats(), n, iters);
 
     // ---- weights, in whichever format the kernels will read them ------------------------------
     auto fill = [](std::vector<float>& v, unsigned salt) {

@@ -23,8 +23,9 @@ int main(int argc, char** argv) {
     hip_check(hipSetDevice(0), "device");
     hipDeviceProp_t prop{};
     hip_check(hipGetDeviceProperties(&prop, 0), "props");
-    std::printf("bench-attention device=%s arch=%s qkv=%s iters=%d\n\n", prop.name,
-                prop.gcnArchName, DLSS5_QKV16 ? "f16" : "e4m3", iters);
+    // Reported by the linked kernels rather than this translation unit; see bench_block0.hip.
+    std::printf("bench-attention device=%s arch=%s kernels[%s] iters=%d\n\n", prop.name,
+                prop.gcnArchName, dlss5_kernel_formats(), iters);
 
     struct Group { const char* what; uint c, w, h, count; };
     // blocks 0 and 70; 1-4 and 66-69; 5-8 and 62-65; 9-14 and 56-61; 15-22 and 48-55; 23-30 and 40-47

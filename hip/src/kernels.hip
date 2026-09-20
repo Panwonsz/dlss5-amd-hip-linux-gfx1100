@@ -1,5 +1,8 @@
 #include <cstdlib>
 
+#define DLSS5_STR2(x) #x
+#define DLSS5_STR(x) DLSS5_STR2(x)
+
 #include "dlss5_runtime.hpp"
 #include "dlss5_launch.hpp"
 #include "../kernels/ffn_fused.hip"
@@ -54,6 +57,10 @@ static int ffn_groups32() {
 }
 
 static uint grid_cap(uint n) { return n ? n : 1u; }
+
+const char* dlss5_kernel_formats() {
+    return "ah16=" DLSS5_STR(DLSS5_AH16) " qkv16=" DLSS5_STR(DLSS5_QKV16);
+}
 
 void launch_ffn_f32(int c, const float* in, const u8* w, const float* scales, float* out, uint tokens,
                     bool chain_residual, bool precise_c32) {

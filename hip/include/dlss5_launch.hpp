@@ -45,6 +45,15 @@ void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, 
                                          bool matrix_residual, uint rw, uint rh, uint rsw,
                                          uint rpx, uint rpy);
 
+// The activation formats the LINKED KERNELS were compiled with, as opposed to whatever the caller's
+// own translation unit thinks. Defined in kernels.hip, so it travels with build/kernels.o.
+//
+// This exists because a stale kernels.o once page-faulted a bench: the host TU was built with
+// DLSS5_QKV16=0 and sized its buffer accordingly, the kernels it linked were built with 1 and wrote
+// twice that, and the bench's own header line cheerfully printed the host's value. Verify the
+// binary, not the intent -- including when the binary is half of your own build.
+const char* dlss5_kernel_formats();
+
 // The DLSS5_W16 switch and the two packers it chooses between live together in dlss5_common.hpp.
 // They were three headers apart when this was two flags, which is exactly the drift its own comment
 // warns about; dlss5_w16() is declared there, beside pack_tiled_e4m3 and pack_tiled_half.

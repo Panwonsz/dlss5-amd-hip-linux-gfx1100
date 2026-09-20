@@ -4,6 +4,18 @@ INCLUDES := -Iinclude -I/opt/rocm/include
 LDFLAGS := -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib
 CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
 BUILD ?= build
+
+# Every object depends on this stamp, which holds the exact compiler and flags. Without it, changing
+# -DDLSS5_QKV16 (or ARCH, or anything else) leaves a stale build/kernels.o in place and links a host
+# translation unit against kernels compiled for a different memory layout -- which page-faults if you
+# are lucky and silently computes the wrong picture if you are not.
+BUILDFLAGS := $(HIPCC) $(CXXFLAGS)
+$(BUILD)/.flags: FORCE
+	@mkdir -p $(BUILD)
+	@[ -f $@ ] && [ "$$(cat $@)" = "$(BUILDFLAGS)" ] || { printf '%s' "$(BUILDFLAGS)" > $@; \
+	  echo "build flags changed -> rebuilding"; }
+.PHONY: FORCE
+FORCE:
 TESTS := test_wmma test_stages test_quantize test_attention test_residual test_linear test_logical_ops test_ffn_f32
 
 MINGW_CC ?= $(firstword $(wildcard \
@@ -13,23 +25,23 @@ MINGW_CC ?= $(firstword $(wildcard \
 
 .PHONY: all clean test game test-api bench-ffn32 bench-qkv32 bench-block0 bench-attention
 
-bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp
+bench-ffn32: tests/bench_ffn32.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_ffn32.hip -o $(BUILD)/bench_ffn32.o
 	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_ffn32.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
 # Block 0's interval, kernel by kernel, at real sizes. ./bench-block0 [iters]
-bench-block0: tests/bench_block0.hip $(BUILD)/kernels.o include/*.hpp
+bench-block0: tests/bench_block0.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_block0.hip -o $(BUILD)/bench_block0.o
 	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_block0.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
 # k_window_attention at every width the network runs. ./bench-attention [iters]
-bench-attention: tests/bench_attention.hip $(BUILD)/kernels.o include/*.hpp
+bench-attention: tests/bench_attention.hip $(BUILD)/kernels.o include/*.hpp $(BUILD)/.flags
 	$(HIPCC) $(CXXFLAGS) -c tests/bench_attention.hip -o $(BUILD)/bench_attention.o
 	$(HIPCC) $(CXXFLAGS) $(BUILD)/bench_attention.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
 # Standalone: it includes kernels/qkv_norm.hip itself and needs no kernels.o.
 #   ./bench-qkv32 <tokens> <iters> <ah16> <w16> <nh>   -- nh=3 is what the network runs.
-bench-qkv32: tests/bench_qkv32.hip kernels/qkv_norm.hip include/*.hpp
+bench-qkv32: tests/bench_qkv32.hip kernels/qkv_norm.hip include/*.hpp $(BUILD)/.flags
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -I. tests/bench_qkv32.hip $(LDFLAGS) -o $@
 
@@ -40,19 +52,19 @@ game: libdlss5_hip.so dlss5_hip.dll
 test_wmma: tests/test_wmma.hip include/dlss5_linalg.hpp include/dlss5_common.hpp include/dlss5_runtime.hpp
 	$(HIPCC) $(CXXFLAGS) tests/test_wmma.hip $(LDFLAGS) -o $@
 
-$(BUILD)/kernels.o: src/kernels.hip include/*.hpp kernels/*.hip Makefile
+$(BUILD)/kernels.o: src/kernels.hip include/*.hpp kernels/*.hip Makefile $(BUILD)/.flags
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c src/kernels.hip -o $@
 
-$(BUILD)/network.o: src/network.hip include/*.hpp Makefile
+$(BUILD)/network.o: src/network.hip include/*.hpp Makefile $(BUILD)/.flags
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c src/network.hip -o $@
 
-$(BUILD)/%.o: src/%.hip include/*.hpp include/*.h Makefile
+$(BUILD)/%.o: src/%.hip include/*.hpp include/*.h Makefile $(BUILD)/.flags
 	mkdir -p $(BUILD)
 	$(HIPCC) $(CXXFLAGS) -fPIC -c $< -o $@
 
-$(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o include/*.hpp tests/ulp_compare.hpp
+$(filter-out test_wmma,$(TESTS)): %: tests/%.hip $(BUILD)/kernels.o include/*.hpp tests/ulp_compare.hpp $(BUILD)/.flags
 	$(HIPCC) $(CXXFLAGS) -c $< -o $(BUILD)/$@.o
 	$(HIPCC) $(CXXFLAGS) $(BUILD)/$@.o $(BUILD)/kernels.o $(LDFLAGS) -o $@
 
@@ -114,4 +126,4 @@ test-model:
 	$(BUILD)/test_frame_api "$(WEIGHTS)"
 
 clean:
-	rm -f $(TESTS) hip-network70 libdlss5_hip.so dlss5_hip.dll $(BUILD)/*.o $(BUILD)/test_capi
+	rm -f $(BUILD)/.flags $(TESTS) hip-network70 libdlss5_hip.so dlss5_hip.dll $(BUILD)/*.o $(BUILD)/test_capi

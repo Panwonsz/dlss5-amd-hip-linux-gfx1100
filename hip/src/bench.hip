@@ -74,8 +74,9 @@ int main(int argc,char** argv) {
     // weights= is on this line because a timing without its configuration is not a timing. An
     // evening went into suspecting a regression that was an unset DLSS5_W16: the same binary reads
     // 186 ms on E4M3 weights and 132 on f16, and nothing in the output said which had run.
-    std::printf("HIP DLSS5 device=%s arch=%s vram=%.2f GiB weights=%s\n",prop.name,prop.gcnArchName,
-                double(prop.totalGlobalMem)/(1024*1024*1024),dlss5_w16()?"f16":"e4m3");
+    std::printf("HIP DLSS5 device=%s arch=%s vram=%.2f GiB weights=%s kernels[%s]\n",prop.name,
+                prop.gcnArchName,double(prop.totalGlobalMem)/(1024*1024*1024),
+                dlss5_w16()?"f16":"e4m3",dlss5_kernel_formats());
     if(weights.empty()) {
         const int c=64;const uint n=4096;
         std::vector<float> fw(8ull*c*c);for(size_t i=0;i<fw.size();++i)fw[i]=float(int(i%17)-8)*.015625f;
