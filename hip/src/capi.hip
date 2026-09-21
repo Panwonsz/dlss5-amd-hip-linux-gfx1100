@@ -6,6 +6,7 @@
 #include <string>
 #include <cstdio>
 #include <cstring>
+#include <cstdint>
 #include <cstdlib>
 #include <cmath>
 #include <vector>
@@ -33,6 +34,9 @@ struct FrameBuffers {
     }
 };
 static std::unique_ptr<FrameBuffers> g_frame;
+// The network writes 1152 rows; the V1 caller wants the first 1080. Held here rather than allocated
+// per call, and released by dlss5_shutdown so an unload does not leave 25 MB behind.
+static std::vector<float> g_out1152;
 
 /* Did this library's own initialisation run in THIS process?
 
@@ -52,6 +56,25 @@ static void run_log(const char* s) {
         return;
     fprintf(f, "%s\n", s);
     fclose(f);
+}
+
+/* Every frame, dlss5_run validated 15M floats one branch at a time, allocated and zeroed a 25 MB
+   output vector, and copied the result out a row at a time. On the Ryzen 5 5600 that was 10-12 ms per
+   answer -- about 8% of the in-game latency, and unlike model time it hands nothing back to the game,
+   so all of it converts into a fresher image rather than into frame rate.
+
+   The check itself stays. A float is non-finite exactly when its exponent field is all ones, which is
+   the same predicate std::isfinite tests; accumulating it with OR instead of branching on it lets the
+   compiler vectorise the scan. The one behavioural difference is that it no longer stops at the first
+   bad value, which costs nothing on valid data and makes the timing deterministic. */
+static bool all_finite(const float* p, size_t n) {
+    uint32_t bad = 0;
+    for (size_t i = 0; i < n; ++i) {
+        uint32_t u;
+        ::memcpy(&u, p + i, 4);
+        bad |= uint32_t((u & 0x7F800000u) == 0x7F800000u);
+    }
+    return bad == 0;
 }
 
 static const char* set_err(const char* s) {
@@ -154,16 +177,19 @@ extern "C" int dlss5_run(const float* rgba1080, float* rgb1080, dlss5_u32 seed) 
     if (!rgba1080 || !rgb1080 || rgba1080 == rgb1080)
         return set_err("null buffer"), -1;
     try {
-        for (size_t i=0;i<1920ull*1080*4;++i)
-            if (!std::isfinite(rgba1080[i])) throw std::runtime_error("nonfinite network input");
+        if (!all_finite(rgba1080, 1920ull * 1080 * 4))
+            throw std::runtime_error("nonfinite network input");
         dlss5::hip_check(hipSetDevice(g_gpu), "hipSetDevice");
-        std::vector<float> out1152(1920ull * 1152 * 3);
-        g_net->run(rgba1080, out1152.data(), seed);
-        for (float v:out1152)
-            if (!std::isfinite(v)) throw std::runtime_error("nonfinite network output");
-        for (unsigned y = 0; y < 1080; y++)
-            std::memcpy(rgb1080 + size_t(y) * 1920 * 3, out1152.data() + size_t(y) * 1920 * 3,
-                        1920 * 3 * 4);
+        // Held across calls rather than allocated per frame: 25 MB of fresh pages, zeroed by the
+        // vector's value-initialisation and then immediately overwritten by the network. g_mu
+        // serialises every caller, so one buffer is enough.
+        if (g_out1152.size() != 1920ull * 1152 * 3) g_out1152.resize(1920ull * 1152 * 3);
+        g_net->run(rgba1080, g_out1152.data(), seed);
+        if (!all_finite(g_out1152.data(), g_out1152.size()))
+            throw std::runtime_error("nonfinite network output");
+        // Source and destination advance by the same 1920*3 stride, so the 1080 rows the caller
+        // wants are one contiguous block at the front of the 1152-row buffer -- one memcpy, not 1080.
+        std::memcpy(rgb1080, g_out1152.data(), 1920ull * 1080 * 3 * 4);
         static int nlog;
         if (nlog < 4) {
             float md = 0.f, acc = 0.f;
@@ -201,6 +227,7 @@ extern "C" void dlss5_shutdown(void) {
     delete g_net;
     g_net = nullptr;
     g_frame.reset();
+    std::vector<float>().swap(g_out1152);
 }
 
 extern "C" const char* dlss5_last_error(void) { return g_err.c_str(); }
