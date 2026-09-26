@@ -6,3 +6,4 @@ __pycache__/
 third_party/
 /linux/build/
 hip/bench-ffn32
+hip/bench-attention
