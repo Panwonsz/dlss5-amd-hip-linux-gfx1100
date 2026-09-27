@@ -12,6 +12,19 @@ __device__ inline float fast_exp_raw(float x) {
     return __half2float(__ushort_as_half(e));
 }
 
+// port 6a9040e rcp: v_rcp_f32 + two Newton-Raphson FMAs in place of IEEE 1/x for the
+// window softmax row sum. Checked bit-identical to 1.f/x on gfx1100 over the sum range
+// with test_norm_inverse.hip before use. Host pass: plain division (never runs).
+__device__ inline float attn_norm_inverse(float x) {
+#if defined(__HIP_DEVICE_COMPILE__)
+    float r = __builtin_amdgcn_rcpf(x);
+    r = __builtin_fmaf(r, __builtin_fmaf(-x, r, 1.f), r);
+    return __builtin_fmaf(r, __builtin_fmaf(-x, r, 1.f), r);
+#else
+    return 1.f / x;
+#endif
+}
+
 __device__ inline uint window_pixel(uint window, uint token, uint width) {
     return ((window / (width / 8)) * 8 + token / 8) * width + (window % (width / 8)) * 8 + token % 8;
 }
@@ -84,7 +97,7 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
             sum += __half2float(__low2half(h[1]));
             sum += __half2float(__high2half(h[1]));
         }
-        float inv = 1.f / fmaxf(sum, 1e-20f);
+        float inv = attn_norm_inverse(fmaxf(sum, 1e-20f));
         // 4 x 16B stores per row (16 E4M3 bytes): rows are 16B-aligned, banks
         // 8-way instead of 32-way.
         uint4* row = reinterpret_cast<uint4*>(p8 + qi * 64);
