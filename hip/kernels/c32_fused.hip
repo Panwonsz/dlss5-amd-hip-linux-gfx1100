@@ -35,12 +35,56 @@ __device__ inline void c32f_wave_sync() {
 #endif
 }
 
+// Build switches (A/B with HIPCC="/opt/rocm/bin/hipcc -D..."; the Makefile's flag stamp rebuilds):
+//  DLSS5_C32_LDSBAR=1  block barriers as `s_waitcnt lgkmcnt(0); s_barrier` -- this kernel exchanges
+//                      data between waves only through LDS, so the global-memory acquire/release that
+//                      __syncthreads() carries is not needed.
+//  DLSS5_C32_H16=1     FFN hidden held as f16 (of the E4M3 value) instead of E4M3 bytes, so the
+//                      contract GEMM's A fragments load without the per-element E4M3 decode. The
+//                      buffer overlays the whole LDS block during the FFN; the residual is re-read
+//                      from global instead of an LDS copy. LDS grows to 64 * DLSS5_C32_H16_STRIDE * 2.
+#ifndef DLSS5_C32_LDSBAR
+#define DLSS5_C32_LDSBAR 0
+#endif
+#ifndef DLSS5_C32_H16
+#define DLSS5_C32_H16 0
+#endif
+#ifndef DLSS5_C32_H16_STRIDE
+#define DLSS5_C32_H16_STRIDE 136
+#endif
+
+__device__ inline void c32f_block_sync() {
+#if defined(__HIP_DEVICE_COMPILE__) && DLSS5_C32_LDSBAR
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
+// One input element (token tok of this window, channel ch) exactly as the prologue reads it.
+template <bool RIN>
+__device__ inline __half c32f_input(const __half* in_h, uint window, uint tok, uint ch, uint w, uint h,
+                                    uint sw, uint px, uint py) {
+    if constexpr (RIN) {
+        const uint x = (window % (sw / 8u)) * 8u + (tok & 7u);
+        const uint y = (window / (sw / 8u)) * 8u + (tok >> 3u);
+        return (x >= px && y >= py && x < w + px && y < h + py)
+                   ? in_h[(size_t(y - py) * w + (x - px)) * 32u + ch]
+                   : __ushort_as_half((unsigned short)0);
+    } else {
+        return in_h[(size_t(window) * 64u + tok) * 32u + ch];
+    }
+}
+
+// OUTM: 1 = window-major f16 `out_ah` (the split path's ah); 2 = the cropped f32 raster `out_f32`
+// directly (what launch_reframe_f32_hin would make of ah), so the group-final / trace reframe launch
+// is gone; 0 = neither (only the f16 raster sibling for the next block).
 // RIN (raster in): in_h is the previous block's cropped f16 raster (row stride w) instead of the
 // window-major pack. The prologue reads it in place with exactly k_reframe_hin_hout's mapping and
 // zero padding, so the per-block reframe launch is gone. Output raster and input raster may be the
 // same buffer: every CTA reads and writes only its own window's pixels, reads before barrier 1 and
 // writes after the last MMA.
-template <bool W16, bool CHAIN, bool WRITE_AH, bool RASTER, bool RIN>
+template <bool W16, bool CHAIN, int OUTM, bool RASTER, bool RIN>
 __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8* ffn_w,
                                                    const float* ffn_s, const u8* qkv_w,
                                                    const float* qscale, float qgain,
@@ -48,7 +92,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                                                    const float* proj_s, __half* out_ah,
                                                    __half* out_raster, uint w, uint h, uint sw,
                                                    uint px, uint py, __half* dbg_bh, u8* dbg_q8,
-                                                   u8* dbg_att8) {
+                                                   u8* dbg_att8, float* out_f32) {
     using namespace linalg;
     using BT = typename WeightB<W16>::type;
     constexpr uint BSZ = W16 ? 2u : 1u;   // bytes per weight element
@@ -60,7 +104,12 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     constexpr uint PACKED_BYTES = 3u * 64u * PS;   // 6912
     constexpr uint SCRATCH_BYTES = 64u * RS * 4u;  // 9216 (hidden 8448, raw 9216, scores 8704)
 
-    __shared__ __align__(16) u8 lds[PACKED_BYTES + SCRATCH_BYTES];
+    constexpr uint HS16 = DLSS5_C32_H16_STRIDE;  // f16 hidden row stride (halves), DLSS5_C32_H16
+    constexpr uint BASE_BYTES = PACKED_BYTES + SCRATCH_BYTES;
+    constexpr uint H16_BYTES = 64u * HS16 * 2u;
+    constexpr uint LDS_TOTAL = (DLSS5_C32_H16 && H16_BYTES > BASE_BYTES) ? H16_BYTES : BASE_BYTES;
+    static_assert(HS16 >= 128u && HS16 % 8u == 0u, "f16 hidden rows: 128 halves + padding, 16 B aligned");
+    __shared__ __align__(16) u8 lds[LDS_TOTAL];
     // packed rows 0-63: input E4M3, then Q, then the attention output; 64-127: K; 128-191: V.
     u8* packed = lds;
     // FFN output E4M3 (the QKV GEMM's A), in the V rows until V overwrites them.
@@ -72,6 +121,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     float* raw = reinterpret_cast<float*>(scratch);
     __half* scores = reinterpret_cast<__half*>(scratch);
     u8* p8 = scratch;  // aliases scores after the row sums (barrier 4)
+    // DLSS5_C32_H16: f16 hidden over the whole LDS block (live only between barrier 1b and 2).
+    __half* hidden16 = reinterpret_cast<__half*>(lds);
 
     const uint window = blockIdx.x;
     const uint tid = threadIdx.x;
@@ -97,7 +148,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             hv = *reinterpret_cast<const uint2*>(in_h + (size_t(window) * 64u + tok) * 32u + c4);
         }
         const __half2* hp = reinterpret_cast<const __half2*>(&hv);
-        if constexpr (!CHAIN) {
+        if constexpr (!CHAIN && !DLSS5_C32_H16) {
             *reinterpret_cast<__half2*>(in16 + tok * 34u + c4) = hp[0];
             *reinterpret_cast<__half2*>(in16 + tok * 34u + c4 + 2u) = hp[1];
         }
@@ -108,18 +159,32 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             u32(e4m3_byte(__half2float(__high2half(hp[1])))) << 24;
     }
     // Barrier 1: each wave's rows were staged by all four waves.
-    __syncthreads();
+    c32f_block_sync();
 
     // ---- FFN expand: 16 rows x 128 hidden per wave, ActivatePolyC32, E4M3 -----------------------
     {
         const A8 a = A8::Load(packed + first * PS, 0, PS);
+        if constexpr (DLSS5_C32_H16) {
+            // Barrier 1b: hidden16 overlays packed, which the other waves may not have loaded yet.
+            c32f_block_sync();
+        }
         for (uint ct = 0; ct < 8u; ++ct) {
             C32 ex = C32::Splat(0.f);
             const BT b = BT::LoadRow(ffn_w, ct * TILE, TSTR);
             ex.MultiplyAccumulate(a, b);
             for (uint i = 0; i < ex.Length(); ++i) {
                 const uint2 c = ex.GetCoordinate(i);
-                hidden[(first + c.x) * HS + ct * 16u + c.y] = e4m3_byte(ActivatePolyC32(ex.Get(i)));
+                const u8 q = e4m3_byte(ActivatePolyC32(ex.Get(i)));
+                if constexpr (DLSS5_C32_H16) {
+                    // StoreQuantF16's value: the f16 of the E4M3-rounded activation.
+#if DLSS5_GFX11
+                    hidden16[(first + c.x) * HS16 + ct * 16u + c.y] = e4m3_to_half(q);
+#else
+                    hidden16[(first + c.x) * HS16 + ct * 16u + c.y] = __float2half(from_e4m3(q));
+#endif
+                } else {
+                    hidden[(first + c.x) * HS + ct * 16u + c.y] = q;
+                }
             }
         }
     }
@@ -131,7 +196,15 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         const uint2 c = acc0.GetCoordinate(i);
         const uint row = first + c.x;
         float iv0, iv1;
-        if constexpr (CHAIN) {
+        if constexpr (DLSS5_C32_H16) {
+            // packed and in16 are overlaid by hidden16: re-read the residual from global.
+            iv0 = __half2float(c32f_input<RIN>(in_h, window, row, c.y, w, h, sw, px, py));
+            iv1 = __half2float(c32f_input<RIN>(in_h, window, row, 16u + c.y, w, h, sw, px, py));
+            if constexpr (CHAIN) {
+                iv0 = from_e4m3(e4m3_byte(iv0));
+                iv1 = from_e4m3(e4m3_byte(iv1));
+            }
+        } else if constexpr (CHAIN) {
             // from_e4m3(e4m3_byte(input)) -- the byte is already in packed.
             iv0 = from_e4m3(packed[row * PS + c.y]);
             iv1 = from_e4m3(packed[row * PS + 16u + c.y]);
@@ -143,14 +216,16 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         acc1.Set(i, iv1 * ffn_s[16u + c.y]);
     }
     for (uint g = 0; g < 4u; ++g) {
-        const A8 a = A8::Load(hidden + first * HS, g * 32u, HS);
+        using AH = typename HiddenA<DLSS5_C32_H16 != 0>::type;
+        const AH a = DLSS5_C32_H16 ? AH::Load(hidden16, (first * HS16 + g * 32u) * 2u, HS16 * 2u)
+                                   : AH::Load(hidden + first * HS, g * 32u, HS);
         const BT b0 = BT::LoadRow(ffn_w, 4096u * BSZ + (0u * 4u + g) * TILE, TSTR);
         const BT b1 = BT::LoadRow(ffn_w, 4096u * BSZ + (1u * 4u + g) * TILE, TSTR);
         acc0.MultiplyAccumulate(a, b0);
         acc1.MultiplyAccumulate(a, b1);
     }
-    // Barrier 2: ffn8 (V rows) overlaps in16, which every wave read above.
-    __syncthreads();
+    // Barrier 2: ffn8 (V rows) overlaps in16 (or hidden16), which every wave read above.
+    c32f_block_sync();
 
     // bh = H(FFN) in f16 (kept for the projection residual); ffn8 = its E4M3 (QKV input).
     __half saved0[8], saved1[8];
@@ -233,7 +308,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         }
     }
     // Barrier 3: QK reads every wave's K rows, PV every wave's V rows; scores overwrite raw.
-    __syncthreads();
+    c32f_block_sync();
 
     // ---- window attention (k_window_attention<32>, direct_f8) ------------------------------------
     {
@@ -273,7 +348,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         }
     }
     // Barrier 4: p8 rows (64 B) overlap other waves' not-yet-summed scores rows (136 B).
-    __syncthreads();
+    c32f_block_sync();
     if (lane < 16u) {
         uint4* row = reinterpret_cast<uint4*>(p8 + (first + lane) * 64u);
         for (int q4 = 0; q4 < 4; q4++) row[q4] = p8r[q4];
@@ -328,16 +403,22 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             v0 = H(v0);
             v1 = H(v1);
             const __half h0 = __float2half_rn(v0), h1 = __float2half_rn(v1);
-            if constexpr (WRITE_AH) {
+            if constexpr (OUTM == 1) {
                 out_ah[(size_t(window) * 64u + row) * 32u + c.y] = h0;
                 out_ah[(size_t(window) * 64u + row) * 32u + 16u + c.y] = h1;
             }
-            if constexpr (RASTER) {
+            if constexpr (RASTER || OUTM == 2) {
                 const uint wx = wx0 + (row % 8u), wy = wy0 + (row / 8u);
                 if (wx >= px && wy >= py && wx < w + px && wy < h + py) {
                     const size_t o = (size_t(wy - py) * w + (wx - px)) * 32u;
-                    out_raster[o + c.y] = h0;
-                    out_raster[o + 16u + c.y] = h1;
+                    if constexpr (RASTER) {
+                        out_raster[o + c.y] = h0;
+                        out_raster[o + 16u + c.y] = h1;
+                    }
+                    if constexpr (OUTM == 2) {  // launch_reframe_f32_hin's value: float(half)
+                        out_f32[o + c.y] = __half2float(h0);
+                        out_f32[o + 16u + c.y] = __half2float(h1);
+                    }
                 }
             }
         }

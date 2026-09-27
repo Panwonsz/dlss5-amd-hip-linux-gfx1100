@@ -55,9 +55,13 @@ static bool c32_env(const char* name){const char* e=std::getenv(name);return e&&
 static bool c32_fused_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_FUSED");return !(e&&std::string(e)=="0");}();return on;}
 static bool c32_check_on(){static const bool on=c32_env("DLSS5_C32_CHECK");return on;}
 static bool c32_bypass=false;
+// DLSS5_C32_F32OUT=1: the fused kernel writes the cropped f32 raster itself (no reframe launch).
+// Default ON since 2026-09-27 (trace IDENTICAL, -1.5 ms). ONLY the exact string "0" turns it off.
+static bool c32_f32out_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_F32OUT");return !(e&&std::string(e)=="0");}();return on;}
 struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
  bool rin_=false; // C32 fused raster-in: set by run() around its window() call
+ float* f32out_=nullptr;bool f32done_=false; // C32 fused f32 raster: target, and whether it was written
  DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1;
  void create(const std::string&dir,int id,uint channels,uint width,uint height,uint shift,bool raw_output){
   c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;
@@ -123,9 +127,11 @@ struct Block {
      }
      if(c32_fused_on()){
       launch_c32_fused(in_h,fw.as<u8>(),fs.as<float>(),qw.as<u8>(),qs.as<float>(),1.f,bias.as<float>(),
-                       p1.as<u8>(),s1.as<float>(),write_f32_out?s.ah.as<__half>():nullptr,
+                       p1.as<u8>(),s1.as<float>(),
+                       (write_f32_out&&!f32out_)?s.ah.as<__half>():nullptr,
                        emit_h?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain,
-                       nullptr,nullptr,nullptr,rin_);
+                       nullptr,nullptr,nullptr,rin_,(write_f32_out&&f32out_)?f32out_:nullptr);
+      f32done_=write_f32_out&&f32out_;
       return;
      }
     }
@@ -174,9 +180,11 @@ struct Block {
    // C32 fused raster-in: hand the previous block's f16 raster straight to the fused kernel,
    // which reads it with k_reframe_hin_hout's mapping; the reframe launch is skipped.
    if(c==32&&in_h&&c32_fused_on()&&!c32_check_on()&&(write_f32_out||emit_h)){
-    rin_=true;window(in,s.a.as<float>(),s,nullptr,emit_f8,in_h,emit_h,write_f32_out);rin_=false;
+    rin_=true;f32out_=c32_f32out_on()?out:nullptr;f32done_=false;
+    window(in,s.a.as<float>(),s,nullptr,emit_f8,in_h,emit_h,write_f32_out);rin_=false;f32out_=nullptr;
     if(!write_f32_out) return;
-    launch_reframe_f32_hin(s.ah.as<__half>(),out,w,h,sw,sh,px,py,c,1,0);
+    if(!f32done_) launch_reframe_f32_hin(s.ah.as<__half>(),out,w,h,sw,sh,px,py,c,1,0);
+    f32done_=false;
     return;
    }
    if(use_h){
@@ -271,9 +279,12 @@ struct Network70::Impl {
   hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
   launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
+  blocks[0].f32out_=c32_f32out_on()?skip[0].as<float>():nullptr;blocks[0].f32done_=false;
   blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false);
+  blocks[0].f32out_=nullptr;
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
-   launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);mark(0,skip[0].as<float>(),N*32);
+   if(!blocks[0].f32done_)launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);
+   blocks[0].f32done_=false;mark(0,skip[0].as<float>(),N*32);
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
   launch_pool_f32_h(skip[0].as<float>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576);
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
