@@ -112,6 +112,14 @@ void launch_ffn(int c, const u8* in, const u8* w, u8* out, uint tokens);
 void launch_qkv(int c, const u8* in, const u8* w, u8* out, uint tokens);
 void launch_project(int c, const u8* in, const u8* w, const float* scales, u8* out, uint tokens,
                     const u8* residual = nullptr);
+// port 6a9040e: C32 window block in one kernel (DLSS5_C32_FUSED=1). out_ah: window-major f16
+// output (nullptr to skip); out_raster: cropped f16 raster for the next block (nullptr to skip).
+// dbg_*: DLSS5_C32_CHECK only -- the split path's bh / q8 / att8, written for comparison.
+void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, const u8* qkv_w,
+                      const float* qscale, float qgain, const float* bias, const u8* proj_w,
+                      const float* proj_s, __half* out_ah, __half* out_raster, uint w, uint h,
+                      uint sw, uint sh, uint px, uint py, bool chain, __half* dbg_bh = nullptr,
+                      u8* dbg_q8 = nullptr, u8* dbg_att8 = nullptr);
 void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, uint h,
                       uint packed = 0, bool direct_f8 = false);
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,

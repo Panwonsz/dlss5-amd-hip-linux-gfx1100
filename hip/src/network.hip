@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -43,6 +45,16 @@ struct Scratch {
   DeviceBuf a,b,bh,ah,d,q,q8,att8,hidden,hidden8,d8,f8,out8,a8,out16,a16;
   void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3*(DLSS5_QKV16?2:1));att8.alloc(n);hidden.alloc(640ull*4096*4);hidden8.alloc(640ull*4096);d8.alloc(n);f8.alloc(n);out8.alloc(n);a8.alloc(n);out16.alloc(n*2);a16.alloc(n*2);}
 };
+// port 6a9040e: DLSS5_C32_FUSED=1 runs every C32 window block as one kernel (kernels/c32_fused.hip).
+// DLSS5_C32_CHECK=1 runs the split path (which the network keeps using) AND the fused kernel on the
+// same input, and prints per block which stage (bh, q8, att8, ah) differs first.
+// Read once; unset or anything but "1" keeps the split four-kernel path.
+static bool c32_env(const char* name){const char* e=std::getenv(name);return e&&std::string(e)=="1";}
+// Default ON since 2026-09-27: DLSS5_C32_CHECK all stages ok on blocks 0-4/66-70, every graph
+// block hash identical, -4.1 ms on gfx1100. ONLY the exact string "0" selects the split path.
+static bool c32_fused_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_FUSED");return !(e&&std::string(e)=="0");}();return on;}
+static bool c32_check_on(){static const bool on=c32_env("DLSS5_C32_CHECK");return on;}
+static bool c32_bypass=false;
 struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
  DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1;
@@ -72,9 +84,49 @@ struct Block {
  }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
+  // DLSS5_C32_CHECK: compare the fused kernel's intermediates with the split path's, same input.
+  void c32_check(const __half* in_h,Scratch&s){
+   static DeviceBuf dbh,dq8,datt,dah;static int nblock=0;
+   const size_t n=size_t(sw)*sh;
+   if(dbh.bytes<n*64)dbh.alloc(n*64);if(dq8.bytes<n*96)dq8.alloc(n*96);if(datt.bytes<n*32)datt.alloc(n*32);if(dah.bytes<n*64)dah.alloc(n*64);
+   launch_c32_fused(in_h,fw.as<u8>(),fs.as<float>(),qw.as<u8>(),qs.as<float>(),1.f,bias.as<float>(),p1.as<u8>(),s1.as<float>(),
+                    dah.as<__half>(),nullptr,w,h,sw,sh,px,py,chain,dbh.as<__half>(),dq8.as<u8>(),datt.as<u8>());
+   hip_check(hipStreamSynchronize(get_launch_stream()),"c32 check sync");
+   std::fprintf(stderr,"c32check #%d %ux%u chain=%d:",nblock++,w,h,int(chain));
+   auto cmp=[&](const char* name,const void* split,const void* fused,size_t count,size_t esz,size_t row){
+    std::vector<unsigned char> a(count*esz),b(count*esz);
+    hip_check(hipMemcpy(a.data(),split,a.size(),hipMemcpyDeviceToHost),"c32 check split");
+    hip_check(hipMemcpy(b.data(),fused,b.size(),hipMemcpyDeviceToHost),"c32 check fused");
+    size_t bad=0,first=0;
+    for(size_t i=0;i<count;++i)if(std::memcmp(&a[i*esz],&b[i*esz],esz)){if(!bad)first=i;++bad;}
+    if(!bad){std::fprintf(stderr," %s=ok",name);return;}
+    float va,vb;
+    if(esz==2){uint16_t ha,hb;std::memcpy(&ha,&a[first*2],2);std::memcpy(&hb,&b[first*2],2);va=half_to_float(ha);vb=half_to_float(hb);}
+    else{va=from_e4m3(a[first]);vb=from_e4m3(b[first]);}
+    std::fprintf(stderr," %s=%zu/%zu bad (first token %zu ch %zu: split %.9g fused %.9g)",name,bad,count,first/row,first%row,va,vb);
+   };
+   cmp("bh",s.bh.p,dbh.p,n*32,2,32);
+   if(DLSS5_QKV16)std::fprintf(stderr," q8=skipped(QKV16)");else cmp("q8",s.q8.p,dq8.p,n*96,1,96);
+   cmp("att8",s.att8.p,datt.p,n*32,1,32);
+   cmp("ah",s.ah.p,dah.p,n*32,2,32);
+   std::fprintf(stderr,"\n");
+  }
   void window(const float* in,float* out,Scratch&s,const u8* in_f8=nullptr,bool emit_f8=false,
               const __half* in_h=nullptr,bool emit_h=false,bool write_f32_out=true){
    uint n=sw*sh;float* f=s.b.as<float>();
+    // port 6a9040e: the fused C32 block, bit-identical to the split path below.
+    if(c==32&&in_h&&!c32_bypass&&(write_f32_out||emit_h)){
+     if(c32_check_on()){
+      c32_bypass=true;window(in,out,s,in_f8,emit_f8,in_h,emit_h,write_f32_out);c32_bypass=false;
+      c32_check(in_h,s);return;
+     }
+     if(c32_fused_on()){
+      launch_c32_fused(in_h,fw.as<u8>(),fs.as<float>(),qw.as<u8>(),qs.as<float>(),1.f,bias.as<float>(),
+                       p1.as<u8>(),s1.as<float>(),write_f32_out?s.ah.as<__half>():nullptr,
+                       emit_h?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain);
+      return;
+     }
+    }
     if(c==512){
      if(in_h)launch_split_f32_hin_f8(in_h,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
      else if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);

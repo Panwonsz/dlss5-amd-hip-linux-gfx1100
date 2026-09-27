@@ -16,6 +16,7 @@
 #include "../kernels/stage.hip"
 #include "../kernels/fused.hip"
 #include "../kernels/ops.hip"
+#include "../kernels/c32_fused.hip"
 
 namespace dlss5 {
 
@@ -759,5 +760,38 @@ void launch_post_merge_f32(const float* lo,const float* pre,const float* scales,
 void launch_post_merge_f32_h(const float* lo,const float* pre,const float* scales,float* out,__half* out_h,uint w,uint h,bool main8_low){LAUNCH(k_post_merge_f32,(w*h*32+255)/256,256,lo,pre,scales,out,w,h,main8_low,out_h);}
 void launch_head_f32(const float* in,const float* w,const float* color,float* out,uint n){LAUNCH(k_head_f32,(n+63)/64,64,in,w,color,out,n);}
 void launch_trace_f32(const float* in,uint n,float* stats,uint* bits){LAUNCH(k_trace_f32,1,256,in,n,stats,bits);}
+
+// port 6a9040e: the C32 window block as one kernel (kernels/c32_fused.hip). Bit-identical to
+// k_ffn_f32<32> + k_qkv_norm_f32<32,3> + k_window_attention<32> + k_linear_f32 mode 4.
+#define DLSS5_C32F(W16, CH, AH, RA)                                                                \
+    LAUNCH((k_c32_fused<W16, CH, AH, RA>), windows, 128, in_h, ffn_w, ffn_s, qkv_w, qscale, qgain, \
+           bias, proj_w, proj_s, out_ah, out_raster, w, h, sw, px, py, dbg_bh, dbg_q8, dbg_att8)
+void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, const u8* qkv_w,
+                      const float* qscale, float qgain, const float* bias, const u8* proj_w,
+                      const float* proj_s, __half* out_ah, __half* out_raster, uint w, uint h,
+                      uint sw, uint sh, uint px, uint py, bool chain, __half* dbg_bh, u8* dbg_q8,
+                      u8* dbg_att8) {
+    if (!in_h || !ffn_w || !ffn_s || !qkv_w || !qscale || !bias || !proj_w || !proj_s ||
+        !w || !h || sw % 8 || sh % 8 || w + px > sw || h + py > sh || (!out_ah && !out_raster))
+        throw std::runtime_error("c32 fused geometry/buffers");
+    const uint windows = (sw / 8u) * (sh / 8u);
+    const int sel = (dlss5_w16() ? 8 : 0) | (chain ? 4 : 0) | (out_ah ? 2 : 0) | (out_raster ? 1 : 0);
+    switch (sel) {
+    case 1: DLSS5_C32F(false, false, false, true); break;
+    case 2: DLSS5_C32F(false, false, true, false); break;
+    case 3: DLSS5_C32F(false, false, true, true); break;
+    case 5: DLSS5_C32F(false, true, false, true); break;
+    case 6: DLSS5_C32F(false, true, true, false); break;
+    case 7: DLSS5_C32F(false, true, true, true); break;
+    case 9: DLSS5_C32F(true, false, false, true); break;
+    case 10: DLSS5_C32F(true, false, true, false); break;
+    case 11: DLSS5_C32F(true, false, true, true); break;
+    case 13: DLSS5_C32F(true, true, false, true); break;
+    case 14: DLSS5_C32F(true, true, true, false); break;
+    case 15: DLSS5_C32F(true, true, true, true); break;
+    default: throw std::runtime_error("c32 fused variant");
+    }
+}
+#undef DLSS5_C32F
 
 } // namespace dlss5
