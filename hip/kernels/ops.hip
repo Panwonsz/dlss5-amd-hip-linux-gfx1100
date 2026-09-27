@@ -67,7 +67,10 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
             // Renamed from `col` to stop it shadowing the output column above: the weight load
             // below this block reads the outer one, and the two differ.
             const uint c4 = (threadIdx.x % 8u) * 4u;
-            const uint row = first + threadIdx.x / 8u;
+            // port 243deb6: 16 input rows at 128 threads (1 row each) or 64 (2 each). n < 64
+            // launches 64 threads: only waves 0/1 have output columns there.
+            for (uint rlocal = threadIdx.x / 8u; rlocal < 16u; rlocal += blockDim.x / 8u) {
+            const uint row = first + rlocal;
             // Four E4M3 codes, formed exactly as before whichever format the tile holds.
             u32 q;
             if (F8IN) {
@@ -80,11 +83,12 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
                 q = u32(e4m3_byte(v.x)) | u32(e4m3_byte(v.y)) << 8 |
                     u32(e4m3_byte(v.z)) << 16 | u32(e4m3_byte(v.w)) << 24;
             }
-            u8* dst = tile + ((threadIdx.x / 8u) * 32u + c4) * ASZ;
+            u8* dst = tile + (rlocal * 32u + c4) * ASZ;
             if constexpr (AH16)
                 *reinterpret_cast<uint2*>(dst) = e4m3x4_to_half4(q);
             else
                 *reinterpret_cast<u32*>(dst) = q;
+            }
         }
         __syncthreads();
         // One declaration for both formats; the row stride scales with the element size. On the

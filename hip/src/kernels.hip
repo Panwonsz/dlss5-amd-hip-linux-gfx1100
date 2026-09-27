@@ -364,10 +364,10 @@ void launch_pool_f32_h(const float* src, float* dst, __half* dst_h, uint w, uint
         const dim3 g_((m + 15) / 16, (n + 63) / 64);                                               \
         if (dlss5_w16())                                                                       \
             LAUNCH((k_linear_f32<F8IN, F8OUT, HRID, HOUT, RAST, F8RES, HRAST, DLSS5_AH16, true>),  \
-                   g_, 128, __VA_ARGS__);                                                          \
+                   g_, (n < 64 ? 64 : 128), __VA_ARGS__);                                                          \
         else                                                                                       \
             LAUNCH((k_linear_f32<F8IN, F8OUT, HRID, HOUT, RAST, F8RES, HRAST, DLSS5_AH16, false>), \
-                   g_, 128, __VA_ARGS__);                                                          \
+                   g_, (n < 64 ? 64 : 128), __VA_ARGS__);                                                          \
     } while (0)
 
 void launch_linear_f32(const float* in, const u8* w, float* out, uint m, uint n, uint k,
