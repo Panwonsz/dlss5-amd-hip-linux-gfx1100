@@ -57,6 +57,7 @@ static bool c32_check_on(){static const bool on=c32_env("DLSS5_C32_CHECK");retur
 static bool c32_bypass=false;
 struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
+ bool rin_=false; // C32 fused raster-in: set by run() around its window() call
  DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1;
  void create(const std::string&dir,int id,uint channels,uint width,uint height,uint shift,bool raw_output){
   c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;
@@ -123,7 +124,8 @@ struct Block {
      if(c32_fused_on()){
       launch_c32_fused(in_h,fw.as<u8>(),fs.as<float>(),qw.as<u8>(),qs.as<float>(),1.f,bias.as<float>(),
                        p1.as<u8>(),s1.as<float>(),write_f32_out?s.ah.as<__half>():nullptr,
-                       emit_h?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain);
+                       emit_h?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain,
+                       nullptr,nullptr,nullptr,rin_);
       return;
      }
     }
@@ -169,6 +171,14 @@ struct Block {
            bool input_f16_exact=false){
    bool use_h = in_h || (c==32 && input_f16_exact);
    bool use_f8 = c!=32 && in_f8 && !use_h;
+   // C32 fused raster-in: hand the previous block's f16 raster straight to the fused kernel,
+   // which reads it with k_reframe_hin_hout's mapping; the reframe launch is skipped.
+   if(c==32&&in_h&&c32_fused_on()&&!c32_check_on()&&(write_f32_out||emit_h)){
+    rin_=true;window(in,s.a.as<float>(),s,nullptr,emit_f8,in_h,emit_h,write_f32_out);rin_=false;
+    if(!write_f32_out) return;
+    launch_reframe_f32_hin(s.ah.as<__half>(),out,w,h,sw,sh,px,py,c,1,0);
+    return;
+   }
    if(use_h){
     if(in_h) launch_reframe_hin_hout(in_h,s.a16.as<__half>(),w,h,sw,sh,px,py,c);
     else launch_reframe_f32_to_h(in,s.a16.as<__half>(),w,h,sw,sh,px,py,c);

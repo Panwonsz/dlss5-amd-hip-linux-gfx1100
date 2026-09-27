@@ -35,7 +35,12 @@ __device__ inline void c32f_wave_sync() {
 #endif
 }
 
-template <bool W16, bool CHAIN, bool WRITE_AH, bool RASTER>
+// RIN (raster in): in_h is the previous block's cropped f16 raster (row stride w) instead of the
+// window-major pack. The prologue reads it in place with exactly k_reframe_hin_hout's mapping and
+// zero padding, so the per-block reframe launch is gone. Output raster and input raster may be the
+// same buffer: every CTA reads and writes only its own window's pixels, reads before barrier 1 and
+// writes after the last MMA.
+template <bool W16, bool CHAIN, bool WRITE_AH, bool RASTER, bool RIN>
 __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8* ffn_w,
                                                    const float* ffn_s, const u8* qkv_w,
                                                    const float* qscale, float qgain,
@@ -80,8 +85,17 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         const uint i4 = tid + it * 128u;
         const uint tok = i4 / 8u;
         const uint c4 = (i4 % 8u) * 4u;
-        const uint2 hv =
-            *reinterpret_cast<const uint2*>(in_h + (size_t(window) * 64u + tok) * 32u + c4);
+        uint2 hv;
+        if constexpr (RIN) {
+            const uint x = (window % (sw / 8u)) * 8u + (tok & 7u);
+            const uint y = (window / (sw / 8u)) * 8u + (tok >> 3u);
+            hv = (x >= px && y >= py && x < w + px && y < h + py)
+                     ? *reinterpret_cast<const uint2*>(
+                           in_h + (size_t(y - py) * w + (x - px)) * 32u + c4)
+                     : make_uint2(0u, 0u);
+        } else {
+            hv = *reinterpret_cast<const uint2*>(in_h + (size_t(window) * 64u + tok) * 32u + c4);
+        }
         const __half2* hp = reinterpret_cast<const __half2*>(&hv);
         if constexpr (!CHAIN) {
             *reinterpret_cast<__half2*>(in16 + tok * 34u + c4) = hp[0];
