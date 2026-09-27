@@ -65,7 +65,9 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
     // NH=1's 16*32 floats = 2048 B, so the wider tile still fits inside it. Aligned because the
     // f16 path stores eight bytes at a time.
     constexpr uint ASZ = AH16 ? 2u : 1u;
-    constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 64u : COLS;
+    // port f9366e0: 68 (not 64) floats/row for C32/NH3, so the 16 rows of float4 norm
+    // reads spread over the LDS banks. Upstream uses 66; 68 keeps every row 16 B aligned.
+    constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 68u : COLS;
     static_assert(16u * STAGE_COLS * 4u >= 16u * 32u * ASZ, "A-tile no longer fits inside stage");
     __shared__ __align__(16) float stage[16 * STAGE_COLS];
     u8* tile = reinterpret_cast<u8*>(stage);
