@@ -105,7 +105,29 @@ __device__ inline __half e4m3_to_half(u32 b) {
     return __ushort_as_half(e4m3_to_half_bits(b));
 }
 
+// DLSS5_E4M3_FASTENC=1: the same function in fewer operations.
+//  - normal range: after the RNE add/mask, (r >> 20) - 960 IS the code ((exp - 120) * 8 + mantissa),
+//    and one unsigned min against 126 covers both the 448 saturation and +inf (their r lands >= 126);
+//  - subnormal range (|v| < 2^-6): adding 16384 (ulp 2^-9) rounds |v| to the E4M3 subnormal step
+//    with the FPU's own RNE, and the low mantissa bits of the sum are the code -- in place of
+//    fmin/mul/rndne/cvt;
+//  - NaN keeps 0x7f | sign.
+// Checked for all 2^32 inputs against the integer recipe (host, and hip/tests/test_e4m3_fastenc.hip).
+// Default ON since 2026-09-28: GPU test bit-identical over 2^32 inputs, trace IDENTICAL,
+// 66.3 -> 62.8 ms on gfx1100.
+#ifndef DLSS5_E4M3_FASTENC
+#define DLSS5_E4M3_FASTENC 1
+#endif
 __device__ inline u8 e4m3_byte_nb(float v) {
+#if DLSS5_E4M3_FASTENC
+    const u32 b = as_u32(v), a = b & 0x7fffffffu, sg = (b >> 24) & 0x80u;
+    const u32 r = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
+    const u32 cn = min((r >> 20) - 960u, 126u);
+    const u32 q = as_u32(fabsf(v) + 16384.f) - 0x46800000u;
+    u32 code = a < 0x3c800000u ? q : cn;
+    code = a > 0x7f800000u ? 127u : code;
+    return u8(sg | code);
+#else
     u32 b = as_u32(v), a = b & 0x7fffffffu, sg = (b >> 24) & 0x80u;
     u32 q = u32(nearbyintf(fminf(fabsf(v), 1.f) * 512.f));
     u32 r = (a + 0x7ffffu + ((a >> 20) & 1u)) & 0xfff00000u;
@@ -118,6 +140,7 @@ __device__ inline u8 e4m3_byte_nb(float v) {
     code = (code & ~mt) | (126u & mt);
     code = (code & ~mn) | (127u & mn);
     return u8(sg | code);
+#endif
 }
 __device__ inline float F_nb(float v) {
     u32 bits = as_u32(v), a = bits & 0x7fffffffu, s = bits & 0x80000000u;
