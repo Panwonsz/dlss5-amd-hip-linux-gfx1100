@@ -124,7 +124,10 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
 // hip-24: pack a C32 block's 64x64 attention bias in accumulator order (f32 or f16).
 void launch_c32_bias_pack(const float* bias, float* out32, __half* out16);
 void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, uint h,
-                      uint packed = 0, bool direct_f8 = false);
+                      uint packed = 0, bool direct_f8 = false, int bias_mode = 0,
+                      bool splitrow = false);
+// hip-26: pack a block's heads x 64 x 64 window-attention bias in accumulator order (f32).
+void launch_attn_bias_pack(const float* bias, float* out, uint heads);
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,
                    uint width, uint height, uint temporal_on);
 void launch_prefix_h(const float* in, const float* w, const float* temporal, float* out,

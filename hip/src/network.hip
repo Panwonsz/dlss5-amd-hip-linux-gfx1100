@@ -55,6 +55,12 @@ static bool c32_env(const char* name){const char* e=std::getenv(name);return e&&
 static bool c32_fused_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_FUSED");return !(e&&std::string(e)=="0");}();return on;}
 static bool c32_check_on(){static const bool on=c32_env("DLSS5_C32_CHECK");return on;}
 static bool c32_bypass=false;
+// hip-26, C64..C512 window attention: DLSS5_ATTN_BIASPK=1 packs the bias per lane (as hip-24 does for
+// C32), DLSS5_ATTN_SPLITROW=1 runs the softmax rows on all 128 threads. Unset = off. Bit-identical.
+// Both default ON since 2026-09-28 (trace IDENTICAL, -1.16 ms together). ONLY "0" turns one off.
+static bool attn_env_default_on(const char* n){const char* e=std::getenv(n);return !(e&&std::string(e)=="0");}
+static bool attn_biaspk_on(){static const bool on=attn_env_default_on("DLSS5_ATTN_BIASPK");return on;}
+static bool attn_splitrow_on(){static const bool on=attn_env_default_on("DLSS5_ATTN_SPLITROW");return on;}
 // DLSS5_C32_BIASPK (hip-24): "1" = the C32 attention bias pre-packed per lane (f32), "2" = the same in
 // f16 when every bias value is exact in f16 (else 1). Unset = off. Same values: bit-identical.
 // Default 1 since 2026-09-28 (trace IDENTICAL, -0.64 ms median of 8 interleaved runs). "0" = plain bias.
@@ -97,6 +103,9 @@ struct Block {
   // half_matrix for a different kernel again. Getting that partition wrong in either direction is
   // the mismatch dlss5_w16()'s comment in dlss5_common.hpp warns about.
   qw=upload_tiled_weights(a.data(),3*c,c);p1=upload_tiled_weights(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+  if(c>=64&&attn_biaspk_on()){biaspk.alloc(size_t(c/32)*4096*4);
+   launch_attn_bias_pack(bias.as<float>(),biaspk.as<float>(),c/32);
+   hip_check(hipDeviceSynchronize(),"attn bias pack");bias_mode=1;}
   if(c==32&&c32_biaspk_env()){int mode=c32_biaspk_env();const float* bv=a.data()+4*m;
    if(mode==2)for(uint i=0;i<4096;++i)if(!(H(bv[i])==bv[i])){mode=1;break;}
    biaspk.alloc(4096*(mode==2?2:4));
@@ -176,7 +185,7 @@ struct Block {
    // f16 -> f32 -> E4M3 path is bit-identical with half the global traffic.
    if(c==32)launch_qkv_norm_f32_hin(32,s.bh.as<__half>(),qw.as<u8>(),s.q8.as<u8>(),n,qs.as<float>(),1.f,true);
    else launch_qkv_norm_f32_f8in(c,s.f8.as<u8>(),qw.as<u8>(),s.q8.as<u8>(),n,qs.as<float>(),1.f,c==32);
-   launch_attention(c,s.q8.as<u8>(),bias.as<float>(),s.att8.as<u8>(),sw,sh,1,true);
+   launch_attention(c,s.q8.as<u8>(),c==32?bias.as<float>():c32_bias(),s.att8.as<u8>(),sw,sh,1,true,c==32?0:bias_mode,attn_splitrow_on());
     // mapoutput C64..256 uses NATIVE_MATRIX_RESIDUAL even for raw outputs.
     // C512 split shaders retain H(product) and H before FP8 stores.
     // The attention output is already E4M3; e4m3_byte(from_e4m3(x)) is the identity,

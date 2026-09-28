@@ -626,24 +626,33 @@ void launch_project(int c, const u8* in, const u8* w, const float* scales, u8* o
     }
 }
 
+void launch_attn_bias_pack(const float* bias, float* out, uint heads) {
+    if (!bias || !out || !heads) throw std::runtime_error("attn bias pack buffers");
+    LAUNCH(k_attn_bias_pack, heads, 128, bias, out);
+}
 void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, uint h,
-                      uint packed, bool direct_f8) {
+                      uint packed, bool direct_f8, int bias_mode, bool splitrow) {
     dim3 grid(grid_cap((w / 8) * (h / 8)), c / 32);
     switch (c) {
     case 32:
-        LAUNCH(k_window_attention<32>, grid, 128, qkv, bias, out, w, h, packed, direct_f8);
+        LAUNCH(k_window_attention<32>, grid, 128, qkv, bias, out, w, h, packed, direct_f8,
+               uint(bias_mode), splitrow);
         break;
     case 64:
-        LAUNCH(k_window_attention<64>, grid, 128, qkv, bias, out, w, h, packed, direct_f8);
+        LAUNCH(k_window_attention<64>, grid, 128, qkv, bias, out, w, h, packed, direct_f8,
+               uint(bias_mode), splitrow);
         break;
     case 128:
-        LAUNCH(k_window_attention<128>, grid, 128, qkv, bias, out, w, h, packed, direct_f8);
+        LAUNCH(k_window_attention<128>, grid, 128, qkv, bias, out, w, h, packed, direct_f8,
+               uint(bias_mode), splitrow);
         break;
     case 256:
-        LAUNCH(k_window_attention<256>, grid, 128, qkv, bias, out, w, h, packed, direct_f8);
+        LAUNCH(k_window_attention<256>, grid, 128, qkv, bias, out, w, h, packed, direct_f8,
+               uint(bias_mode), splitrow);
         break;
     case 512:
-        LAUNCH(k_window_attention<512>, grid, 128, qkv, bias, out, w, h, packed, direct_f8);
+        LAUNCH(k_window_attention<512>, grid, 128, qkv, bias, out, w, h, packed, direct_f8,
+               uint(bias_mode), splitrow);
         break;
     default:
         throw std::runtime_error("attn channels");

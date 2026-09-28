@@ -49,7 +49,8 @@ __device__ inline uint window_pixel(uint window, uint token, uint width) {
 template <int C, bool QKV16 = DLSS5_QKV16>
 __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, const float* bias,
                                                              u8* output, uint width,
-                                   uint height, uint packed, bool direct_f8 = false) {
+                                   uint height, uint packed, bool direct_f8 = false,
+                                   uint bias_mode = 0, bool splitrow = false) {
     using namespace linalg;
     constexpr int HEADS = C / 32;
     constexpr int STRIDE = 3 * C;
@@ -75,17 +76,29 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
             qkv, ((window * 64u + k0) * uint(STRIDE) + uint(C) + head * 32u) * QSZ,
             uint(STRIDE) * QSZ);
         C32 s = Multiply(q, k);
+        // hip-26 DLSS5_ATTN_BIASPK: the same bias values, packed per head in accumulator order
+        // (k_attn_bias_pack): two 16-byte loads per lane per 16x16 tile instead of eight dwords.
+        float bv[8];
+        if (bias_mode == 1u) {
+            const float4* bp = reinterpret_cast<const float4*>(bias + head * 4096u) +
+                               ((wave * 4u + k0 / 16u) * 32u + (threadIdx.x & 31u)) * 2u;
+            const float4 x = bp[0], y = bp[1];
+            bv[0] = x.x; bv[1] = x.y; bv[2] = x.z; bv[3] = x.w;
+            bv[4] = y.x; bv[5] = y.y; bv[6] = y.z; bv[7] = y.w;
+        }
         for (uint i = 0; i < s.Length(); i++) {
             uint2 rc = s.GetCoordinate(i);
             uint qi = qtok + rc.x, kj = k0 + rc.y;
-            scores[qi * 68 + kj] = __float2half_rn(
-                fast_exp_raw(s.Get(i) + bias[head * 4096u + qi * 64u + kj]));
+            const float bb = bias_mode ? bv[i] : bias[head * 4096u + qi * 64u + kj];
+            scores[qi * 68 + kj] = __float2half_rn(fast_exp_raw(s.Get(i) + bb));
         }
     }
     __syncthreads();
 
-    if (threadIdx.x < 64) {
-        uint qi = threadIdx.x;
+    // hip-26 DLSS5_ATTN_SPLITROW: all 128 threads take part -- two per row. Both compute the row's
+    // sum in the same serial order (so both hold the same inv); each encodes half the row.
+    if (splitrow || threadIdx.x < 64) {
+        uint qi = threadIdx.x & 63u;
         float sum = 0.f;
         // 16 x 8B loads (4 f16 each); 136B row stride keeps 8B alignment and the
         // per-step banks 2-way. Serial f32 order 0..63 is preserved.
@@ -101,7 +114,8 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
         // 4 x 16B stores per row (16 E4M3 bytes): rows are 16B-aligned, banks
         // 8-way instead of 32-way.
         uint4* row = reinterpret_cast<uint4*>(p8 + qi * 64);
-        for (int q4 = 0; q4 < 4; q4++) {
+        const int qb = splitrow ? int(threadIdx.x >> 6) * 2 : 0, qn = splitrow ? 2 : 4;
+        for (int q4 = qb; q4 < qb + qn; q4++) {
             uint4 v;
             u8* b = reinterpret_cast<u8*>(&v);
             for (int t = 0; t < 16; t++)
@@ -131,6 +145,21 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     }
     __syncthreads();
     }
+}
+
+// hip-26: window-attention bias (heads x 64 x 64 f32) in accumulator order, per head:
+// out[head*4096 + ((wave*4 + kb)*32 + lane)*8 + i] = bias[head*4096 + (wave*16 + row_i)*64 + kb*16 + col_i]
+// with (row_i, col_i) = C32::GetCoordinate(i). One 128-thread block per head, once at creation.
+__global__ void k_attn_bias_pack(const float* bias, float* out) {
+    using namespace linalg;
+    const uint head = blockIdx.x, wave = threadIdx.x / 32u, lane = threadIdx.x & 31u;
+    const C32 t = C32::Splat(0.f);
+    for (uint kb = 0; kb < 4u; ++kb)
+        for (uint i = 0; i < t.Length(); ++i) {
+            const uint2 c = t.GetCoordinate(i);
+            out[size_t(head) * 4096u + ((size_t(wave) * 4u + kb) * 32u + lane) * 8u + i] =
+                bias[size_t(head) * 4096u + (wave * 16u + c.x) * 64u + kb * 16u + c.y];
+        }
 }
 
 } // namespace dlss5
