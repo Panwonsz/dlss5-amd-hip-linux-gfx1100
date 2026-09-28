@@ -55,6 +55,10 @@ static bool c32_env(const char* name){const char* e=std::getenv(name);return e&&
 static bool c32_fused_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_FUSED");return !(e&&std::string(e)=="0");}();return on;}
 static bool c32_check_on(){static const bool on=c32_env("DLSS5_C32_CHECK");return on;}
 static bool c32_bypass=false;
+// DLSS5_C32_BIASPK (hip-24): "1" = the C32 attention bias pre-packed per lane (f32), "2" = the same in
+// f16 when every bias value is exact in f16 (else 1). Unset = off. Same values: bit-identical.
+// Default 1 since 2026-09-28 (trace IDENTICAL, -0.64 ms median of 8 interleaved runs). "0" = plain bias.
+static int c32_biaspk_env(){static const int v=[]{const char* e=std::getenv("DLSS5_C32_BIASPK");if(!e||!e[0])return 1;return (e[0]=='1'||e[0]=='2')&&!e[1]?e[0]-'0':0;}();return v;}
 // DLSS5_IO16=1: full-resolution rasters travel as exact f16 (block 0 -> pool/post-merge, block 70 ->
 // head), the prefix's unread f32 copy is not written, and each encoder group's last block writes
 // its skip buffer directly (no device-to-device copy). Bit-identical: see kernels/io16.hip.
@@ -67,6 +71,8 @@ struct Block {
  uint c{},w{},h{},px{},py{},sw{},sh{};bool raw{},chain{};
  bool rin_=false; // C32 fused raster-in: set by run() around its window() call
  float* f32out_=nullptr;bool f32done_=false; // C32 fused f32 raster: target, and whether it was written
+ DeviceBuf biaspk;int bias_mode=0; // hip-24: packed C32 bias and its format (0 = plain `bias`)
+ const float* c32_bias()const{return bias_mode?biaspk.as<float>():bias.as<float>();}
  DeviceBuf fw,fs,ex,ct,p0,s0,qw,qs,bias,p1,s1;
  void create(const std::string&dir,int id,uint channels,uint width,uint height,uint shift,bool raw_output){
   c=channels;w=width;h=height;px=(shift&1)?4:0;py=(shift&2)?4:0;sw=(w+px+7)&~7u;sh=(h+py+7)&~7u;raw=raw_output;
@@ -91,6 +97,11 @@ struct Block {
   // half_matrix for a different kernel again. Getting that partition wrong in either direction is
   // the mismatch dlss5_w16()'s comment in dlss5_common.hpp warns about.
   qw=upload_tiled_weights(a.data(),3*c,c);p1=upload_tiled_weights(a.data()+3*m,c,c);bias=floats(a.data()+4*m,(c/32)*4096);qs=floats(a.data()+4*m+(c/32)*4096,c/32);s1=floats(a.data()+4*m+(c/32)*4096+c/32,c);
+  if(c==32&&c32_biaspk_env()){int mode=c32_biaspk_env();const float* bv=a.data()+4*m;
+   if(mode==2)for(uint i=0;i<4096;++i)if(!(H(bv[i])==bv[i])){mode=1;break;}
+   biaspk.alloc(4096*(mode==2?2:4));
+   launch_c32_bias_pack(bias.as<float>(),mode==1?biaspk.as<float>():nullptr,mode==2?biaspk.as<__half>():nullptr);
+   hip_check(hipDeviceSynchronize(),"c32 bias pack");bias_mode=mode;}
  }
  // The only physical activation format here is window-major [window][64][C].
  // Residuals remain distinct from quantized matrix operands.
@@ -131,11 +142,11 @@ struct Block {
       c32_check(in_h,s);return;
      }
      if(c32_fused_on()){
-      launch_c32_fused(in_h,fw.as<u8>(),fs.as<float>(),qw.as<u8>(),qs.as<float>(),1.f,bias.as<float>(),
+      launch_c32_fused(in_h,fw.as<u8>(),fs.as<float>(),qw.as<u8>(),qs.as<float>(),1.f,c32_bias(),
                        p1.as<u8>(),s1.as<float>(),
                        (write_f32_out&&!f32out_)?s.ah.as<__half>():nullptr,
                        emit_h?s.out16.as<__half>():nullptr,w,h,sw,sh,px,py,chain,
-                       nullptr,nullptr,nullptr,rin_,(write_f32_out&&f32out_)?f32out_:nullptr);
+                       nullptr,nullptr,nullptr,rin_,(write_f32_out&&f32out_)?f32out_:nullptr,bias_mode);
       f32done_=write_f32_out&&f32out_;
       return;
      }
@@ -290,9 +301,9 @@ struct Network70::Impl {
    // Block 0 as Block::window would launch it, but its output is the cropped f16 raster full_h
    // (plus the f32 copy only when tracing, for the block hash).
    auto&b=blocks[0];
-   launch_c32_fused(s.a16.as<__half>(),b.fw.as<u8>(),b.fs.as<float>(),b.qw.as<u8>(),b.qs.as<float>(),1.f,b.bias.as<float>(),
+   launch_c32_fused(s.a16.as<__half>(),b.fw.as<u8>(),b.fs.as<float>(),b.qw.as<u8>(),b.qs.as<float>(),1.f,b.c32_bias(),
                     b.p1.as<u8>(),b.s1.as<float>(),nullptr,full_h.as<__half>(),b.w,b.h,b.sw,b.sh,b.px,b.py,b.chain,
-                    nullptr,nullptr,nullptr,false,tracing?skip[0].as<float>():nullptr);
+                    nullptr,nullptr,nullptr,false,tracing?skip[0].as<float>():nullptr,b.bias_mode);
    mark(0,skip[0].as<float>(),N*32);
   }else{
   blocks[0].f32out_=c32_f32out_on()?skip[0].as<float>():nullptr;blocks[0].f32done_=false;
@@ -345,9 +356,9 @@ struct Network70::Impl {
    // Block 70 as Block::run's raster-in path launches it; output = cropped f16 raster in full_h
    // (block 0's copy is dead after the merge), f32 only when tracing.
    auto&b=blocks[70];
-   launch_c32_fused(s.out16.as<__half>(),b.fw.as<u8>(),b.fs.as<float>(),b.qw.as<u8>(),b.qs.as<float>(),1.f,b.bias.as<float>(),
+   launch_c32_fused(s.out16.as<__half>(),b.fw.as<u8>(),b.fs.as<float>(),b.qw.as<u8>(),b.qs.as<float>(),1.f,b.c32_bias(),
                     b.p1.as<u8>(),b.s1.as<float>(),nullptr,full_h.as<__half>(),b.w,b.h,b.sw,b.sh,b.px,b.py,b.chain,
-                    nullptr,nullptr,nullptr,true,tracing?dst:nullptr);
+                    nullptr,nullptr,nullptr,true,tracing?dst:nullptr,b.bias_mode);
    std::swap(src,dst);mark(70,src,N*32);
    launch_head_hin(full_h.as<__half>(),head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
   }else{

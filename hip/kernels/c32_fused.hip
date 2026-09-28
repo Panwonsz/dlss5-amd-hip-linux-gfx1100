@@ -99,7 +99,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                                                    const float* proj_s, __half* out_ah,
                                                    __half* out_raster, uint w, uint h, uint sw,
                                                    uint px, uint py, __half* dbg_bh, u8* dbg_q8,
-                                                   u8* dbg_att8, float* out_f32) {
+                                                   u8* dbg_att8, float* out_f32,
+                                                   uint bias_mode = 0) {
     using namespace linalg;
     using BT = typename WeightB<W16>::type;
     constexpr uint BSZ = W16 ? 2u : 1u;   // bytes per weight element
@@ -333,10 +334,31 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         for (uint k0 = 0; k0 < 64u; k0 += 16u) {
             const B8 k = B8::LoadCol(packed, (64u + k0) * PS, PS);
             const C32 s = Multiply(q, k);
+            // hip-24 DLSS5_C32_BIASPK: the same 64x64 bias values, pre-packed so that each lane's eight
+            // values for this 16x16 tile are contiguous (k_c32_bias_pack): 2 (f32) or 1 (f16, only when
+            // every value is exact in f16) 16-byte loads instead of eight scattered dword loads.
+            float bv[8];
+            if (bias_mode == 1u) {
+                const float4* bp =
+                    reinterpret_cast<const float4*>(bias) + ((wave * 4u + k0 / 16u) * 32u + lane) * 2u;
+                const float4 x = bp[0], y = bp[1];
+                bv[0] = x.x; bv[1] = x.y; bv[2] = x.z; bv[3] = x.w;
+                bv[4] = y.x; bv[5] = y.y; bv[6] = y.z; bv[7] = y.w;
+            } else if (bias_mode == 2u) {
+                const uint4 x =
+                    reinterpret_cast<const uint4*>(bias)[(wave * 4u + k0 / 16u) * 32u + lane];
+                const __half2* hh = reinterpret_cast<const __half2*>(&x);
+#pragma unroll
+                for (uint j = 0; j < 4u; ++j) {
+                    bv[2u * j] = __half2float(__low2half(hh[j]));
+                    bv[2u * j + 1u] = __half2float(__high2half(hh[j]));
+                }
+            }
             for (uint i = 0; i < s.Length(); ++i) {
                 const uint2 c = s.GetCoordinate(i);
                 const uint qi = first + c.x, kj = k0 + c.y;
-                scores[qi * 68u + kj] = __float2half_rn(fast_exp_raw(s.Get(i) + bias[qi * 64u + kj]));
+                const float bb = bias_mode ? bv[i] : bias[qi * 64u + kj];
+                scores[qi * 68u + kj] = __float2half_rn(fast_exp_raw(s.Get(i) + bb));
             }
         }
     }
@@ -443,6 +465,24 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             }
         }
     }
+}
+
+// hip-24: the C32 attention bias (64 x 64 f32) in accumulator order: out[((wave*4 + kb)*32 + lane)*8 + i]
+// is the value lane `lane` of wave `wave` adds to element i of the 16x16 score tile kb, i.e.
+// bias[(wave*16 + row_i) * 64 + kb*16 + col_i] with (row_i, col_i) = C32::GetCoordinate(i) -- the same
+// mapping k_c32_fused uses. One block of 128 threads, run once per C32 block at creation.
+__global__ void k_c32_bias_pack(const float* bias, float* out32, __half* out16) {
+    using namespace linalg;
+    const uint wave = threadIdx.x / 32u, lane = threadIdx.x & 31u;
+    const C32 t = C32::Splat(0.f);
+    for (uint kb = 0; kb < 4u; ++kb)
+        for (uint i = 0; i < t.Length(); ++i) {
+            const uint2 c = t.GetCoordinate(i);
+            const float v = bias[(wave * 16u + c.x) * 64u + kb * 16u + c.y];
+            const size_t o = ((size_t(wave) * 4u + kb) * 32u + lane) * 8u + i;
+            if (out32) out32[o] = v;
+            if (out16) out16[o] = __float2half_rn(v);
+        }
 }
 
 } // namespace dlss5

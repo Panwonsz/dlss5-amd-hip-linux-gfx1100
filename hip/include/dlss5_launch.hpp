@@ -120,7 +120,9 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
                       const float* proj_s, __half* out_ah, __half* out_raster, uint w, uint h,
                       uint sw, uint sh, uint px, uint py, bool chain, __half* dbg_bh = nullptr,
                       u8* dbg_q8 = nullptr, u8* dbg_att8 = nullptr, bool raster_in = false,
-                      float* out_f32 = nullptr);
+                      float* out_f32 = nullptr, int bias_mode = 0);
+// hip-24: pack a C32 block's 64x64 attention bias in accumulator order (f32 or f16).
+void launch_c32_bias_pack(const float* bias, float* out32, __half* out16);
 void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, uint h,
                       uint packed = 0, bool direct_f8 = false);
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,
