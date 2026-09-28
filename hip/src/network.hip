@@ -55,6 +55,11 @@ static bool c32_env(const char* name){const char* e=std::getenv(name);return e&&
 static bool c32_fused_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_FUSED");return !(e&&std::string(e)=="0");}();return on;}
 static bool c32_check_on(){static const bool on=c32_env("DLSS5_C32_CHECK");return on;}
 static bool c32_bypass=false;
+// DLSS5_IO16=1: full-resolution rasters travel as exact f16 (block 0 -> pool/post-merge, block 70 ->
+// head), the prefix's unread f32 copy is not written, and each encoder group's last block writes
+// its skip buffer directly (no device-to-device copy). Bit-identical: see kernels/io16.hip.
+// Default ON since 2026-09-28 (trace IDENTICAL, mean unchanged, -1.1 ms). ONLY "0" turns it off.
+static bool io16_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_IO16");return !(e&&std::string(e)=="0");}();return on;}
 // DLSS5_C32_F32OUT=1: the fused kernel writes the cropped f32 raster itself (no reframe launch).
 // Default ON since 2026-09-27 (trace IDENTICAL, -1.5 ms). ONLY the exact string "0" turns it off.
 static bool c32_f32out_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_C32_F32OUT");return !(e&&std::string(e)=="0");}();return on;}
@@ -232,7 +237,7 @@ struct Up {
 struct Network70::Impl {
  std::mutex mutex;bool ready=false;float gpu_ms=0;hipStream_t stream{};hipEvent_t ev0{},ev1{};
  DeviceBuf rgb,color,tiles,history,prefix_w,head_w,post_sc,head_rgb,map,inv;
- DeviceBuf raster[2],skip[6],out,trace_stats,trace_bits,ds[4];
+ DeviceBuf raster[2],skip[6],out,trace_stats,trace_bits,ds[4],full_h;
  std::array<Block,71> blocks;Vit vit[8];Up up[5];Scratch s;
  std::array<uint,71> counts{};std::array<Trace,71> trace{};
  ~Impl(){if(stream)(void)hipStreamSynchronize(stream);if(ev0)(void)hipEventDestroy(ev0);if(ev1)(void)hipEventDestroy(ev1);if(stream)(void)hipStreamDestroy(stream);}
@@ -256,6 +261,7 @@ struct Network70::Impl {
   up[0].create(dir,"decoder39-weights",32,20,60,36,1024,512);up[1].create(dir,"block48-weights",60,36,120,72,512,256);up[2].create(dir,"block56-weights",120,72,240,144,256,128);up[3].create(dir,"block62-weights",240,144,480,288,128,64);up[4].create(dir,"block66-weights",480,288,960,576,64,32);
   rgb.alloc(1920ull*1080*16);color.alloc(size_t(N)*16);tiles.alloc(size_t(N)*16);out.alloc(size_t(N)*12);
   for(auto&r:raster)r.alloc(size_t(N)*32*4);
+  full_h.alloc(size_t(N)*32*2);
   for(int i=0;i<6;++i)skip[i].alloc((size_t(N)*32>>i)*4);
   s.create();trace_stats.alloc(71*256*3*4);trace_bits.alloc(71*256*2*4);
   hip_check(hipStreamCreate(&stream),"network stream");hip_check(hipEventCreate(&ev0),"network event0");hip_check(hipEventCreate(&ev1),"network event1");ready=true;
@@ -278,26 +284,45 @@ struct Network70::Impl {
    if(timing){hip_check(hipStreamSynchronize(stream),"time sync");auto t=clk::now();block_ms[id]+=std::chrono::duration<double,std::milli>(t-t_last).count();t_last=t;}};
   hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
   launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
-  launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
+  const bool io16=io16_on()&&c32_fused_on()&&!c32_check_on();
+  launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,io16?nullptr:s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
+  if(io16){
+   // Block 0 as Block::window would launch it, but its output is the cropped f16 raster full_h
+   // (plus the f32 copy only when tracing, for the block hash).
+   auto&b=blocks[0];
+   launch_c32_fused(s.a16.as<__half>(),b.fw.as<u8>(),b.fs.as<float>(),b.qw.as<u8>(),b.qs.as<float>(),1.f,b.bias.as<float>(),
+                    b.p1.as<u8>(),b.s1.as<float>(),nullptr,full_h.as<__half>(),b.w,b.h,b.sw,b.sh,b.px,b.py,b.chain,
+                    nullptr,nullptr,nullptr,false,tracing?skip[0].as<float>():nullptr);
+   mark(0,skip[0].as<float>(),N*32);
+  }else{
   blocks[0].f32out_=c32_f32out_on()?skip[0].as<float>():nullptr;blocks[0].f32done_=false;
   blocks[0].window(s.a.as<float>(),s.a.as<float>(),s,nullptr,false,s.a16.as<__half>(),false);
   blocks[0].f32out_=nullptr;
    // Block 0 p1 writes H(v) in f16 (C32 path); crop from the f16 window raster.
    if(!blocks[0].f32done_)launch_reframe_f32_hin(s.ah.as<__half>(),skip[0].as<float>(),W,Ht,W,Ht,0,0,32,1,0);
    blocks[0].f32done_=false;mark(0,skip[0].as<float>(),N*32);
+  }
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
-  launch_pool_f32_h(skip[0].as<float>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576);
+  if(io16)launch_pool_hin(full_h.as<__half>(),s.out16.as<__half>(),W,Ht,32,960,576);
+  else launch_pool_f32_h(skip[0].as<float>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576);
   const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
   const __half* group_in_h=s.out16.as<__half>();
    for(int g=0;g<5;++g){
    const u8* in_f8=nullptr; const __half* in_h=group_in_h;
-   for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
-   hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
+   // io16: the group's last block writes skip[g+1] itself; src then points at it, dst at that
+   // block's input, and `spare` is the raster buffer that would have been dst.
+   float* spare=nullptr;
+   for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];
+    const bool to_skip=io16&&j+1==num[g];float* target=to_skip?skip[g+1].as<float>():dst;
+    b.run(src,target,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);
+    if(to_skip){spare=dst;dst=src;src=target;}else std::swap(src,dst);
+    mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
+   if(!io16)hip_check(hipMemcpyAsync(skip[g+1].p,src,size_t(w)*h*c*4,hipMemcpyDeviceToDevice,stream),"encoder skip");
     uint ow=g==4?32:w/2,oh=g==4?20:h/2;
      if(g<4){launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin(s.a16.as<__half>(),ds[g].as<__half>(),nullptr,s.out16.as<__half>(),ow*oh,c*2,c,1,1,0);}
      else{launch_pool_f32_h(src,nullptr,s.a16.as<__half>(),w,h,c,ow,oh);launch_linear_half_hin(s.a16.as<__half>(),head_w.as<__half>(),dst,nullptr,ow*oh,c*2,c,1,1,0);}
     group_in_h=g<4?s.out16.as<__half>():nullptr;
-    std::swap(src,dst);w=ow;h=oh;c*=2;
+    if(io16){src=dst;dst=spare;}else std::swap(src,dst);w=ow;h=oh;c*=2;
   }
   launch_gather_f32(src,map.as<int>(),dst,655360);std::swap(src,dst);
   for(int j=0;j<8;++j){vit[j].run(src,dst,s);std::swap(src,dst);mark(31+j,src,655360);}
@@ -315,9 +340,21 @@ struct Network70::Impl {
   // decoder's last low-res output and produce a plausible wrong picture. (See the stale-object
   // section of the plan: the page fault was the lucky outcome, the silent version is the bad one.)
   // Dropping the store also drops a swap; src still points at the low-res decoder output here.
+  if(io16){
+   launch_post_merge_hin(src,full_h.as<__half>(),post_sc.as<float>(),s.out16.as<__half>(),W,Ht,true);
+   // Block 70 as Block::run's raster-in path launches it; output = cropped f16 raster in full_h
+   // (block 0's copy is dead after the merge), f32 only when tracing.
+   auto&b=blocks[70];
+   launch_c32_fused(s.out16.as<__half>(),b.fw.as<u8>(),b.fs.as<float>(),b.qw.as<u8>(),b.qs.as<float>(),1.f,b.bias.as<float>(),
+                    b.p1.as<u8>(),b.s1.as<float>(),nullptr,full_h.as<__half>(),b.w,b.h,b.sw,b.sh,b.px,b.py,b.chain,
+                    nullptr,nullptr,nullptr,true,tracing?dst:nullptr);
+   std::swap(src,dst);mark(70,src,N*32);
+   launch_head_hin(full_h.as<__half>(),head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
+  }else{
   launch_post_merge_f32_h(src,skip[0].as<float>(),post_sc.as<float>(),nullptr,s.out16.as<__half>(),W,Ht,true);
   blocks[70].run(nullptr,dst,s,nullptr,false,s.out16.as<__half>(),false,true,false);std::swap(src,dst);mark(70,src,N*32);
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
+  }
   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
   hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
   if(timing){double total=std::chrono::duration<double,std::milli>(clk::now()-t_start).count();

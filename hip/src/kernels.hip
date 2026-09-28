@@ -867,3 +867,5 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
 #undef DLSS5_C32F
 
 } // namespace dlss5
+
+#include "../kernels/io16.hip"

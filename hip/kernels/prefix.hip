@@ -66,7 +66,8 @@ __global__ void k_prefix(const float* input, const float* weights, const float* 
     __syncthreads();
     for (uint i = 0; i < 16; i++) {
         float v = otile[i * 32 + t];
-        output[first * 32 + i * 32 + t] = v;
+        if (output)  // DLSS5_IO16 passes nullptr: the fused block 0 reads only output_h
+            output[first * 32 + i * 32 + t] = v;
         if (output_h)
             output_h[first * 32 + i * 32 + t] = __float2half_rn(v);
     }
