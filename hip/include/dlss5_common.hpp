@@ -74,8 +74,9 @@ __device__ inline u32 dlss5_mask(bool c) { return 0u - u32(c); }
 // so one exact f16 multiply by 256 finishes the job, two codes at a time (v_pk_mul_f16). 0x7f/0xff
 // get the same NaN bits (0x7f80 | sign) as the integer recipe below. Checked for all 65,536 code
 // pairs against it (hip/tests/test_e4m3_fastdec.hip; needs f16 denormals, the HIP default).
+// Default ON since 2026-09-28: all 71 graph-block hashes IDENTICAL, 87.3 -> 66.3 ms on gfx1100.
 #ifndef DLSS5_E4M3_FASTDEC
-#define DLSS5_E4M3_FASTDEC 0
+#define DLSS5_E4M3_FASTDEC 1
 #endif
 // X = code0 | code1 << 16 (other bits zero) -> f16(code0) | f16(code1) << 16.
 __device__ inline u32 e4m3x2_to_half2_bits(u32 X) {
