@@ -46,15 +46,18 @@ __device__ inline float sq_f32(float v) {
 // when it reaches the store. See DLSS5_QKV16 in dlss5_linalg.hpp.
 template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false,
           bool AH16 = DLSS5_AH16, bool W16 = false, bool QOUT16 = DLSS5_QKV16>
-__global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
-                               u8* output, uint m, uint k, const float* scales, float qgain,
-                               bool half_squares, const __half* input_h = nullptr,
-                               uint head_base = 0u) {
+// The kernel body, callable with any LDS stage and any grid-y index (hip-19): k_qkv_norm_f32 below
+// is the unchanged launch, k_qkv_norm_pair runs the QK heads and the V-only tail in ONE launch.
+__device__ __forceinline__ void qkv_norm_body(float* stage, uint by, const float* input,
+                                              const u8* input_f8, const u8* weights, u8* output,
+                                              uint m, uint k, const float* scales, float qgain,
+                                              bool half_squares, const __half* input_h,
+                                              uint head_base) {
     using namespace linalg;
     constexpr uint HEADS = C / 32u;
     constexpr uint COLS = 32u * NH;
     const uint first = blockIdx.x * 16u;
-    const uint head0 = head_base + blockIdx.y * NH;
+    const uint head0 = head_base + by * NH;
     const uint wave = threadIdx.x / 32u;
     // Single LDS buffer: the A-tile staging aliases the start of the stage
     // buffer. The tile is only read inside the K loop; stage is only
@@ -69,7 +72,7 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
     // reads spread over the LDS banks. Upstream uses 66; 68 keeps every row 16 B aligned.
     constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 68u : COLS;
     static_assert(16u * STAGE_COLS * 4u >= 16u * 32u * ASZ, "A-tile no longer fits inside stage");
-    __shared__ __align__(16) float stage[16 * STAGE_COLS];
+    // stage: 16 * STAGE_COLS floats (or, VONLY, at least the A tile), provided by the caller.
     u8* tile = reinterpret_cast<u8*>(stage);
     C32 acc = C32::Splat(0.f);
     const uint col = head0 * 32u + wave * 16u;
@@ -216,6 +219,36 @@ __global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8*
             }
         }
     }
+}
+
+template <int C, int NH, bool F8IN = false, bool HIN = false, bool VONLY = false,
+          bool AH16 = DLSS5_AH16, bool W16 = false, bool QOUT16 = DLSS5_QKV16>
+__global__ void k_qkv_norm_f32(const float* input, const u8* input_f8, const u8* weights,
+                               u8* output, uint m, uint k, const float* scales, float qgain,
+                               bool half_squares, const __half* input_h = nullptr,
+                               uint head_base = 0u) {
+    constexpr uint STAGE_COLS = VONLY ? 128u : (C == 32 && NH == 3) ? 68u : 32u * NH;
+    __shared__ __align__(16) float stage[16 * STAGE_COLS];
+    qkv_norm_body<C, NH, F8IN, HIN, VONLY, AH16, W16, QOUT16>(stage, blockIdx.y, input, input_f8,
+        weights, output, m, k, scales, qgain, half_squares, input_h, head_base);
+}
+
+// DLSS5_QKV_ONE: the C64..C512 pair (QK heads, NH=2, then the V-only tail) as ONE launch. Grid y:
+// the first C/32 rows are the QK CTAs, the next C/64 the V CTAs, each running exactly the body the
+// separate launch runs, with the same head0. The V part uses the stage only for its A tile, so the
+// QK size (16 x 64 floats) serves both. Bit-identical by construction.
+template <int C, bool F8IN, bool HIN, bool AH16, bool W16, bool QOUT16 = DLSS5_QKV16>
+__global__ void k_qkv_norm_pair(const float* input, const u8* input_f8, const u8* weights,
+                                u8* output, uint m, uint k, const float* scales, float qgain,
+                                bool half_squares, const __half* input_h) {
+    constexpr uint HEADS = C / 32u;
+    __shared__ __align__(16) float stage[16 * 64];
+    if (blockIdx.y < HEADS)
+        qkv_norm_body<C, 2, F8IN, HIN, false, AH16, W16, QOUT16>(stage, blockIdx.y, input, input_f8,
+            weights, output, m, k, scales, qgain, half_squares, input_h, 0u);
+    else
+        qkv_norm_body<C, 2, F8IN, HIN, true, AH16, W16, QOUT16>(stage, blockIdx.y - HEADS, input,
+            input_f8, weights, output, m, k, scales, qgain, half_squares, input_h, 2u * HEADS);
 }
 
 } // namespace dlss5

@@ -61,6 +61,13 @@ static int ffn_groups32() {
 
 static uint grid_cap(uint n) { return n ? n : 1u; }
 
+// DLSS5_QKV_ONE: one launch per C64..C512 QKV-norm instead of two (k_qkv_norm_pair). hip-20.
+// Default ON since 2026-09-28 (trace IDENTICAL, ~-0.2 ms). ONLY the exact string "0" turns it off.
+static bool qkv_one_on() {
+    static const bool on = [] { const char* e = std::getenv("DLSS5_QKV_ONE"); return !(e && e[0] == '0' && !e[1]); }();
+    return on;
+}
+
 const char* dlss5_kernel_formats() {
     return "ah16=" DLSS5_STR(DLSS5_AH16) " qkv16=" DLSS5_STR(DLSS5_QKV16);
 }
@@ -249,12 +256,18 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
 #define DLSS5_QKV_PAIR(C, F8IN, HIN, W16, f32in, f8in, h_in)                                       \
     {                                                                                              \
         uint heads = (C) / 32u;                                                                    \
+        if (qkv_one_on()) {                                                                        \
+            LAUNCH((k_qkv_norm_pair<C, F8IN, HIN, DLSS5_AH16, W16>),                               \
+                   dim3((m + 15) / 16, heads + heads / 2u), 128, f32in, f8in, w, out, m, c,       \
+                   scales, qgain, half_squares, h_in);                                             \
+        } else {                                                                                   \
         LAUNCH((k_qkv_norm_f32<C, 2, F8IN, HIN, false, DLSS5_AH16, W16>),                          \
                dim3((m + 15) / 16, heads), 128, f32in, f8in, w, out, m, c, scales, qgain,          \
                half_squares, h_in);                                                                \
         LAUNCH((k_qkv_norm_f32<C, 2, F8IN, HIN, true, DLSS5_AH16, W16>),                           \
                dim3((m + 15) / 16, heads / 2u), 128, f32in, f8in, w, out, m, c, scales, qgain,     \
                half_squares, h_in, 2u * heads);                                                    \
+        }                                                                                          \
     }
 
 #define DLSS5_QKV_NORM_F32(W16)                                                                    \
