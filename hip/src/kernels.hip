@@ -8,6 +8,7 @@
 #include "../kernels/ffn_fused.hip"
 #include "../kernels/qkv.hip"
 #include "../kernels/qkv_norm.hip"
+#include "../kernels/qkv_wide.hip"
 #include "../kernels/project.hip"
 #include "../kernels/prefix.hip"
 #include "../kernels/attention.hip"
@@ -66,6 +67,30 @@ static uint grid_cap(uint n) { return n ? n : 1u; }
 static bool qkv_one_on() {
     static const bool on = [] { const char* e = std::getenv("DLSS5_QKV_ONE"); return !(e && e[0] == '0' && !e[1]); }();
     return on;
+}
+
+// DLSS5_QKV_WIDE (hip-21): k_qkv_norm_wide, one CTA per 16 tokens over all 3C columns.
+// "1" = C64, "2" = C64 + C128, "3" = C64 + C128 + C256; unset or anything else = off. Bit-identical.
+static bool qkv_wide_for(int c) {
+    static const int level = [] {
+        const char* e = std::getenv("DLSS5_QKV_WIDE");
+        // Default level 2 since 2026-09-28 (trace IDENTICAL, ~-1.0 ms; level 3 measured +1.7 ms).
+        if (!e || !e[0]) return 2;
+        return (e[0] >= '1' && e[0] <= '3' && !e[1]) ? e[0] - '0' : 0;
+    }();
+    return c == 64 ? level >= 1 : c == 128 ? level >= 2 : c == 256 ? level >= 3 : false;
+}
+template <int C, bool F8IN, bool HIN, bool W16>
+static bool try_qkv_wide(const float* f32in, const u8* f8in, const u8* w, u8* out, uint m, uint c,
+                         const float* scales, float qgain, bool half_squares, const __half* h_in) {
+    if constexpr (C == 64 || C == 128 || C == 256) {
+        if (!qkv_wide_for(C)) return false;
+        LAUNCH((k_qkv_norm_wide<C, F8IN, HIN, DLSS5_AH16, W16>), dim3((m + 15) / 16), 128, f32in, f8in,
+               w, out, m, c, scales, qgain, half_squares, h_in);
+        return true;
+    } else {
+        return false;
+    }
 }
 
 const char* dlss5_kernel_formats() {
@@ -256,7 +281,9 @@ void launch_normalize_qkv(const float* in, const float* scales, u8* out,
 #define DLSS5_QKV_PAIR(C, F8IN, HIN, W16, f32in, f8in, h_in)                                       \
     {                                                                                              \
         uint heads = (C) / 32u;                                                                    \
-        if (qkv_one_on()) {                                                                        \
+        if (try_qkv_wide<C, F8IN, HIN, W16>(f32in, f8in, w, out, m, c, scales, qgain,              \
+                                           half_squares, h_in)) {                                  \
+        } else if (qkv_one_on()) {                                                                 \
             LAUNCH((k_qkv_norm_pair<C, F8IN, HIN, DLSS5_AH16, W16>),                               \
                    dim3((m + 15) / 16, heads + heads / 2u), 128, f32in, f8in, w, out, m, c,       \
                    scales, qgain, half_squares, h_in);                                             \
