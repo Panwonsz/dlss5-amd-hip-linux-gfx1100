@@ -63,6 +63,18 @@ __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) 
             const u32 lo = reinterpret_cast<const u32*>(q)[0];
             const u32 hi = reinterpret_cast<const u32*>(q)[1];
 
+#if DLSS5_E4M3_FASTDEC
+            // Four codes per dword, two per v_pk_mul_f16 (e4m3x4_to_half4).
+            const uint2 a = e4m3x4_to_half4(lo), c = e4m3x4_to_half4(hi);
+            f[0] = __ushort_as_half((unsigned short)(a.x & 0xffffu));
+            f[1] = __ushort_as_half((unsigned short)(a.x >> 16));
+            f[2] = __ushort_as_half((unsigned short)(a.y & 0xffffu));
+            f[3] = __ushort_as_half((unsigned short)(a.y >> 16));
+            f[4] = __ushort_as_half((unsigned short)(c.x & 0xffffu));
+            f[5] = __ushort_as_half((unsigned short)(c.x >> 16));
+            f[6] = __ushort_as_half((unsigned short)(c.y & 0xffffu));
+            f[7] = __ushort_as_half((unsigned short)(c.y >> 16));
+#else
             f[0] = e4m3_to_half(lo & 0xffu);
             f[1] = e4m3_to_half((lo >> 8) & 0xffu);
             f[2] = e4m3_to_half((lo >> 16) & 0xffu);
@@ -71,6 +83,7 @@ __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) 
             f[5] = e4m3_to_half((hi >> 8) & 0xffu);
             f[6] = e4m3_to_half((hi >> 16) & 0xffu);
             f[7] = e4m3_to_half(hi >> 24);
+#endif
         } else {
             for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(q[i]);
         }

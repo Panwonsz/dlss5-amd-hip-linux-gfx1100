@@ -49,6 +49,13 @@ __device__ inline void c32f_wave_sync() {
 #ifndef DLSS5_C32_H16
 #define DLSS5_C32_H16 0
 #endif
+// DLSS5_C32_SPLITROW=1: the per-row softmax / RMS epilogues use all 32 lanes instead of 16. Both
+// halves of a wave compute the row's serial sum (same instructions, same order, same value), then
+// each half quantizes half of the row. Bit-identical; halves the idle-lane cost of the E4M3 encodes.
+// Default ON since 2026-09-28: trace IDENTICAL, 89.6 -> 87.3 ms.
+#ifndef DLSS5_C32_SPLITROW
+#define DLSS5_C32_SPLITROW 1
+#endif
 #ifndef DLSS5_C32_H16_STRIDE
 #define DLSS5_C32_H16_STRIDE 136
 #endif
@@ -258,8 +265,8 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                 raw[(first + c.x) * RS + 16u + c.y] = q1.Get(i);
             }
             c32f_wave_sync();
-            if (lane < 16u) {
-                const uint row = first + lane;
+            if (DLSS5_C32_SPLITROW || lane < 16u) {
+                const uint row = first + (lane & 15u);
                 const float* s0 = raw + row * RS;
                 const float* s1 = s0 + 16u;
                 const float4* f0 = reinterpret_cast<const float4*>(s0);
@@ -285,11 +292,21 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
                 if (part == 0u)
                     inv *= qscale[0] * qgain;
                 u8* dst = packed + (part * 64u + row) * PS;
-                for (uint ch = 0; ch < 16u; ++ch) dst[ch] = e4m3_byte(s0[ch] * inv);
-                for (uint ch = 0; ch < 16u; ++ch) dst[16u + ch] = e4m3_byte(s1[ch] * inv);
-                if (dbg_q8)  // DLSS5_C32_CHECK: the split path's q8 (E4M3 layout [token][96])
-                    for (uint ch = 0; ch < 32u; ++ch)
-                        dbg_q8[(size_t(window) * 64u + row) * 96u + part * 32u + ch] = dst[ch];
+                if constexpr (DLSS5_C32_SPLITROW) {
+                    // lanes 0-15 encode channels 0-15, lanes 16-31 channels 16-31 of the same row.
+                    const uint hb = (lane >> 4u) * 16u;
+                    for (uint ch = 0; ch < 16u; ++ch) dst[hb + ch] = e4m3_byte(s0[hb + ch] * inv);
+                    if (dbg_q8)
+                        for (uint ch = 0; ch < 16u; ++ch)
+                            dbg_q8[(size_t(window) * 64u + row) * 96u + part * 32u + hb + ch] =
+                                dst[hb + ch];
+                } else {
+                    for (uint ch = 0; ch < 16u; ++ch) dst[ch] = e4m3_byte(s0[ch] * inv);
+                    for (uint ch = 0; ch < 16u; ++ch) dst[16u + ch] = e4m3_byte(s1[ch] * inv);
+                    if (dbg_q8)  // DLSS5_C32_CHECK: the split path's q8 (E4M3 layout [token][96])
+                        for (uint ch = 0; ch < 32u; ++ch)
+                            dbg_q8[(size_t(window) * 64u + row) * 96u + part * 32u + ch] = dst[ch];
+                }
             }
             c32f_wave_sync();
         } else {
@@ -326,8 +343,10 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     c32f_wave_sync();
 
     uint4 p8r[4];
-    if (lane < 16u) {
-        const uint qi = first + lane;
+    constexpr int NQ = DLSS5_C32_SPLITROW ? 2 : 4;          // 16-byte quarters per lane
+    const int q4base = DLSS5_C32_SPLITROW ? int(lane >> 4u) * 2 : 0;
+    if (DLSS5_C32_SPLITROW || lane < 16u) {
+        const uint qi = first + (lane & 15u);
         float sum = 0.f;
         for (int j = 0; j < 16; j++) {
             const uint2 v = *reinterpret_cast<const uint2*>(&scores[qi * 68u + j * 4]);
@@ -339,19 +358,20 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         }
         // IEEE 1/x: bit-identical to the rcp+Newton form on gfx1100 (test_norm_inverse.hip).
         const float inv = 1.f / fmaxf(sum, 1e-20f);
-        for (int q4 = 0; q4 < 4; q4++) {
+        for (int q = 0; q < NQ; q++) {
+            const int q4 = q4base + q;
             uint4 v;
             u8* b = reinterpret_cast<u8*>(&v);
             for (int t = 0; t < 16; t++)
                 b[t] = e4m3_byte(__half2float(scores[qi * 68u + q4 * 16 + t]) * inv);
-            p8r[q4] = v;
+            p8r[q] = v;
         }
     }
     // Barrier 4: p8 rows (64 B) overlap other waves' not-yet-summed scores rows (136 B).
     c32f_block_sync();
-    if (lane < 16u) {
-        uint4* row = reinterpret_cast<uint4*>(p8 + (first + lane) * 64u);
-        for (int q4 = 0; q4 < 4; q4++) row[q4] = p8r[q4];
+    if (DLSS5_C32_SPLITROW || lane < 16u) {
+        uint4* row = reinterpret_cast<uint4*>(p8 + (first + (lane & 15u)) * 64u);
+        for (int q = 0; q < NQ; q++) row[q4base + q] = p8r[q];
     }
     c32f_wave_sync();
 

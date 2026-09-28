@@ -68,13 +68,37 @@ __device__ inline u32 dlss5_mask(bool c) { return 0u - u32(c); }
 // Branch-free E4M3 byte -> f16 (exact for every code; 0x7f/0xff -> f16 NaN).
 // Integer-only so the 32 lanes vectorize; a private f16[256] + load_matrix_sync
 // was ~19x slower (tests/probe_frag.hip: 129 vs 2471 GFLOPS).
+// DLSS5_E4M3_FASTDEC=1: decode by rescaling instead of rebuilding the exponent. The f16 whose bits
+// are ((code & 0x7f) << 7) | sign << 15 is exactly the E4M3 value times 2^-8 -- normals AND
+// subnormals, since both formats put their exponent bias difference (15 - 7) in the same place --
+// so one exact f16 multiply by 256 finishes the job, two codes at a time (v_pk_mul_f16). 0x7f/0xff
+// get the same NaN bits (0x7f80 | sign) as the integer recipe below. Checked for all 65,536 code
+// pairs against it (hip/tests/test_e4m3_fastdec.hip; needs f16 denormals, the HIP default).
+#ifndef DLSS5_E4M3_FASTDEC
+#define DLSS5_E4M3_FASTDEC 0
+#endif
+// X = code0 | code1 << 16 (other bits zero) -> f16(code0) | f16(code1) << 16.
+__device__ inline u32 e4m3x2_to_half2_bits(u32 X) {
+    typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
+    const u32 t = X & 0x007f007fu;
+    const u32 bits = (t << 7) | ((X & 0x00800080u) << 8);
+    h2_t v = __builtin_bit_cast(h2_t, bits);
+    const h2_t k256 = {(_Float16)256.0f, (_Float16)256.0f};
+    v = v * k256;
+    const u32 nan = (((t + 0x00010001u) & 0x00800080u) >> 7) * 0x7e00u;
+    return __builtin_bit_cast(u32, v) | nan;
+}
 __device__ inline uint16_t e4m3_to_half_bits(u32 b) {
+#if DLSS5_E4M3_FASTDEC
+    return uint16_t(e4m3x2_to_half2_bits(b & 0xffu));
+#else
     u32 e = (b >> 3) & 15u, m = b & 7u, s = (b & 0x80u) << 8;
     u32 normal = ((e + 8u) << 10) | (m << 7);
     u32 sub = (((0x88887760u >> (m * 4u)) & 15u) << 10) | (((0xE480u >> (m * 2u)) & 3u) << 8);
     u32 mask = 0u - u32(e != 0u);
     u32 nan = 0u - u32((b & 0x7fu) == 0x7fu);
     return uint16_t(s | (normal & mask) | (sub & ~mask) | (nan & 0x7e00u));
+#endif
 }
 __device__ inline __half e4m3_to_half(u32 b) {
     return __ushort_as_half(e4m3_to_half_bits(b));
@@ -121,7 +145,10 @@ __device__ inline float F_nb(float v) {
 // Takes and returns packed words rather than elements because both callers already have their four
 // codes in one dword and write them with one store.
 __device__ inline uint2 e4m3x4_to_half4(u32 q) {
-#if DLSS5_GFX11
+#if DLSS5_GFX11 && DLSS5_E4M3_FASTDEC
+    return make_uint2(e4m3x2_to_half2_bits((q & 0xffu) | ((q << 8) & 0x00ff0000u)),
+                      e4m3x2_to_half2_bits(((q >> 16) & 0xffu) | ((q >> 8) & 0x00ff0000u)));
+#elif DLSS5_GFX11
     return make_uint2(u32(e4m3_to_half_bits(q & 0xffu)) |
                           (u32(e4m3_to_half_bits((q >> 8) & 0xffu)) << 16),
                       u32(e4m3_to_half_bits((q >> 16) & 0xffu)) |
