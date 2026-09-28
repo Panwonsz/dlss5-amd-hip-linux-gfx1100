@@ -17,6 +17,7 @@
 #include "../kernels/fused.hip"
 #include "../kernels/ops.hip"
 #include "../kernels/linear_splitk.hip"
+#include "../kernels/vit_attention_mw.hip"
 #include "../kernels/c32_fused.hip"
 
 namespace dlss5 {
@@ -676,9 +677,29 @@ void launch_vit_attention(const float* qkv, u8* out, uint tokens, uint dim) {
     LAUNCH((k_vit_attention<false>), dim3(tokens / 16, dim / 32), 32, qkv, nullptr, out, tokens,
            dim);
 }
+// DLSS5_VIT_ATTN_MW: waves per CTA for the streamed one-pass ViT attention (vit_attention_mw.hip),
+// 2, 4 or 8; "0" keeps the original one-wave kernel. Bit-identical either way.
+// Default 4 since 2026-09-28 (trace IDENTICAL, 62.2 -> 60.6 ms on gfx1100).
+static uint vit_attn_mw() {
+    static const uint nw = [] {
+        const char* e = std::getenv("DLSS5_VIT_ATTN_MW");
+        if (!e || !e[0]) return 4u;
+        if (e[1]) return 0u;
+        return e[0] == '2' ? 2u : e[0] == '4' ? 4u : e[0] == '8' ? 8u : 0u;
+    }();
+    return nw;
+}
 void launch_vit_attention_f8(const u8* qkv_f8, u8* out, uint tokens, uint dim) {
     if (tokens % 16 || dim % 32)
         throw std::runtime_error("vit attention extent");
+    const uint nw = vit_attn_mw();
+    if (nw && tokens % (16u * nw) == 0) {
+        const dim3 grid(tokens / (16u * nw), dim / 32);
+        if (nw == 2) LAUNCH((k_vit_attention_mw<2>), grid, 64, qkv_f8, out, tokens, dim);
+        else if (nw == 4) LAUNCH((k_vit_attention_mw<4>), grid, 128, qkv_f8, out, tokens, dim);
+        else LAUNCH((k_vit_attention_mw<8>), grid, 256, qkv_f8, out, tokens, dim);
+        return;
+    }
     LAUNCH((k_vit_attention<true>), dim3(tokens / 16, dim / 32), 32, nullptr, qkv_f8, out, tokens,
            dim);
 }
