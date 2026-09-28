@@ -16,6 +16,7 @@
 #include "../kernels/stage.hip"
 #include "../kernels/fused.hip"
 #include "../kernels/ops.hip"
+#include "../kernels/linear_splitk.hip"
 #include "../kernels/c32_fused.hip"
 
 namespace dlss5 {
@@ -392,6 +393,13 @@ void launch_linear_f32_f8out(const float* in, const u8* w, float* out, u8* out_f
                  in, nullptr, w, out, out_f8, m, n, k, residual, scales, mode, ordered,
                  matrix_residual);
 }
+// DLSS5_LINEAR_SPLITK=1: ordered == 2 linears (the ViT contract/projection) run as
+// k_linear_f32_splitk4 -- the four K partitions on four waves, bit-identical (linear_splitk.hip).
+static bool linear_splitk_on() {
+    // Default ON since 2026-09-28 (trace IDENTICAL, ~-0.6 ms). ONLY the exact string "0" turns it off.
+    static const bool on = [] { const char* e = std::getenv("DLSS5_LINEAR_SPLITK"); return !(e && e[0] == '0' && !e[1]); }();
+    return on;
+}
 void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint n, uint k,
                             const float* residual, const float* scales, int mode, int ordered,
                             bool matrix_residual) {
@@ -399,6 +407,15 @@ void launch_linear_f32_f8in(const u8* in, const u8* w, float* out, uint m, uint 
         (residual && !scales) || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
         reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out))
         throw std::runtime_error("linear geometry/alias");
+    if (ordered == 2 && mode != 4 && !matrix_residual && m % 16 == 0 && n % 64 == 0 &&
+        k % 128 == 0 && linear_splitk_on()) {
+        const dim3 g_(m / 16, n / 64);
+        if (dlss5_w16())
+            LAUNCH((k_linear_f32_splitk4<true>), g_, 128, in, w, out, m, n, k, residual, scales, mode);
+        else
+            LAUNCH((k_linear_f32_splitk4<false>), g_, 128, in, w, out, m, n, k, residual, scales, mode);
+        return;
+    }
     DLSS5_LINEAR(true, false, false, false, false, false, false,
                  nullptr, in, w, out, nullptr, m, n, k, residual, scales, mode, ordered,
                  matrix_residual);
