@@ -80,7 +80,7 @@ libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/ne
 	$(HIPCC) $(CXXFLAGS) -shared -fPIC $^ $(LDFLAGS) -o $@
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
-	$(MINGW_CC) -shared -O2 -o $@ src/trampoline.c
+	$(MINGW_CC) -shared -O2 -static-libgcc -o $@ src/trampoline.c
 
 # The object to LD_PRELOAD into a Proton game: no HIP, dlopens libdlss5_hip.so on the first call.
 libdlss5_hip_preload.so: src/preload_shim.c include/dlss5_capi.h
