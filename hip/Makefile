@@ -52,7 +52,7 @@ bench-qkv32: tests/bench_qkv32.hip kernels/qkv_norm.hip include/*.hpp $(BUILD)/.
 
 all: $(TESTS) hip-network70 libdlss5_hip.so
 
-game: libdlss5_hip.so dlss5_hip.dll
+game: libdlss5_hip.so dlss5_hip.dll libdlss5_hip_preload.so
 
 test_wmma: tests/test_wmma.hip include/dlss5_linalg.hpp include/dlss5_common.hpp include/dlss5_runtime.hpp
 	$(HIPCC) $(CXXFLAGS) tests/test_wmma.hip $(LDFLAGS) -o $@
@@ -81,6 +81,10 @@ libdlss5_hip.so: $(BUILD)/capi.o $(BUILD)/frame.o $(BUILD)/kernels.o $(BUILD)/ne
 
 dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
 	$(MINGW_CC) -shared -O2 -o $@ src/trampoline.c
+
+# The object to LD_PRELOAD into a Proton game: no HIP, dlopens libdlss5_hip.so on the first call.
+libdlss5_hip_preload.so: src/preload_shim.c include/dlss5_capi.h
+	cc -shared -fPIC -O2 -Wall -Iinclude src/preload_shim.c -ldl -lpthread -o $@
 
 test: $(TESTS)
 	@set -e; for t in $(TESTS); do ./$$t; done
@@ -131,4 +135,4 @@ test-model:
 	$(BUILD)/test_frame_api "$(WEIGHTS)"
 
 clean:
-	rm -f $(BUILD)/.flags $(TESTS) hip-network70 libdlss5_hip.so dlss5_hip.dll $(BUILD)/*.o $(BUILD)/test_capi
+	rm -f $(BUILD)/.flags $(TESTS) hip-network70 libdlss5_hip.so dlss5_hip.dll libdlss5_hip_preload.so $(BUILD)/*.o $(BUILD)/test_capi
