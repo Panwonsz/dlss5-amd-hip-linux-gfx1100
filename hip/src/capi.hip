@@ -3,6 +3,7 @@
 #include "dlss5_launch.hpp"
 #include "dlss5_frame.hpp"
 #include "dlss5_staged_io.hpp"
+#include "dlss5_shared_import.hpp"
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -43,6 +44,7 @@ struct StagedBuffers {
 };
 static std::unique_ptr<StagedBuffers> g_staged;
 static Dlss5HipStagedBridge g_staged_bridge;
+static Dlss5HipSharedBridge g_shared_bridge;
 // The network writes 1152 rows; the V1 caller wants the first 1080. Held here rather than allocated
 // per call, and released by dlss5_shutdown so an unload does not leave 25 MB behind.
 static std::vector<float> g_out1152;
@@ -335,69 +337,139 @@ extern "C" int dlss5_run_frame(const Dlss5Frame* f) {
    EncodeRow(dlss5_run(DecodeRow(in))). Non-finite model input or output fails the call, as dlss5_run
    does. hip/tests/test_staged.cpp checks the byte equality against the daemon's own code. */
 
+// The part dlss5_run_staged and dlss5_run_shared have in common: dev_in / dev_out hold the staged
+// layout (1920x1080 in `format`, rows `pitch` apart) in device memory. Decode, model, the finite checks
+// dlss5_run makes, in -> out (the row padding the daemon echoes), encode. Synchronous.
+static void staged_core(StagedBuffers& s, const uint8_t* dev_in, uint8_t* dev_out, dlss5_u32 format,
+                        dlss5_u32 pitch, dlss5_u32 seed) {
+    const size_t bytes = size_t(pitch) * 1080;
+    const dim3 grid((1920 + 255) / 256, 1080), block(256);
+    uint32_t bad = 0;
+    dlss5::hip_check(hipMemset(s.flag.p, 0, 4), "staged flag");
+    hipLaunchKernelGGL(dlss5::staged::k_staged_decode, grid, block, 0, nullptr, dev_in, s.rgba.as<float4>(),
+                       format, pitch, 1920u, s.flag.as<uint32_t>());
+    dlss5::hip_check(hipGetLastError(), "staged decode");
+    dlss5::hip_check(hipMemcpy(&bad, s.flag.p, 4, hipMemcpyDeviceToHost), "staged decode check");
+    if (bad) throw std::runtime_error("nonfinite network input");
+    g_net->run(s.rgba.as<float>(), s.rgb.as<float>(), seed); // device in, device out
+    dlss5::hip_check(hipMemset(s.flag.p, 0, 4), "staged flag");
+    hipLaunchKernelGGL(dlss5::staged::k_staged_finite, dim3(1024), dim3(256), 0, nullptr, s.rgb.as<float>(),
+                       size_t(1920) * 1152 * 3, s.flag.as<uint32_t>());
+    dlss5::hip_check(hipGetLastError(), "staged output check");
+    dlss5::hip_check(hipMemcpy(&bad, s.flag.p, 4, hipMemcpyDeviceToHost), "staged output check");
+    if (bad) throw std::runtime_error("nonfinite network output");
+    dlss5::hip_check(hipMemcpy(dev_out, dev_in, bytes, hipMemcpyDeviceToDevice), "staged padding");
+    hipLaunchKernelGGL(dlss5::staged::k_staged_encode, grid, block, 0, nullptr, s.rgb.as<float>(), dev_out, format,
+                       pitch, 1920u);
+    dlss5::hip_check(hipGetLastError(), "staged encode");
+    dlss5::hip_check(hipDeviceSynchronize(), "staged completion");
+}
+
+static StagedBuffers& staged_buffers() {
+    if (!g_staged) {
+        auto next = std::make_unique<StagedBuffers>();
+        next->rgba.alloc(1920ull * 1080 * 16);
+        next->rgb.alloc(1920ull * 1152 * 12);
+        next->flag.alloc(4);
+        g_staged = std::move(next);
+    }
+    return *g_staged;
+}
+
+static bool staged_args_ok(dlss5_u32 format, dlss5_u32 pitch) {
+    const dlss5_u32 bpp = dlss5::staged::bytes_per_pixel(format);
+    return bpp && pitch >= 1920u * bpp && pitch % 4 == 0 && pitch <= (1u << 20);
+}
+
 extern "C" int dlss5_run_staged(const void* in, void* out, dlss5_u32 format, dlss5_u32 pitch,
                                 dlss5_u32 seed) {
     std::lock_guard<std::mutex> lock(g_mu);
     // Like dlss5_run: no motion contract, so any call breaks frame continuity.
     if (g_frame) g_frame->history_valid = false;
     if (!g_net) return set_err("not initialized"), -1;
-    const dlss5_u32 bpp = dlss5::staged::bytes_per_pixel(format);
-    if (!in || !out || in == out || !bpp || pitch < 1920u * bpp || pitch % 4 || pitch > (1u << 20))
+    if (!in || !out || in == out || !staged_args_ok(format, pitch))
         return set_err("staged: unsupported format, bad pitch or null buffers"), -1;
     try {
-        using clk = std::chrono::steady_clock;
-        const auto t0 = clk::now();
         dlss5::hip_check(hipSetDevice(g_gpu), "hipSetDevice");
         const size_t bytes = size_t(pitch) * 1080;
-        if (!g_staged) {
-            auto next = std::make_unique<StagedBuffers>();
-            next->rgba.alloc(1920ull * 1080 * 16);
-            next->rgb.alloc(1920ull * 1152 * 12);
-            next->flag.alloc(4);
-            g_staged = std::move(next);
-        }
-        auto& s = *g_staged;
+        auto& s = staged_buffers();
         if (s.bytes != bytes) {
             s.in.alloc(bytes);
             s.out.alloc(bytes);
             s.bytes = bytes;
         }
-        const dim3 grid((1920 + 255) / 256, 1080), block(256);
-        uint32_t bad = 0;
         dlss5::hip_check(hipMemcpy(s.in.p, in, bytes, hipMemcpyHostToDevice), "staged upload");
-        const auto t1 = clk::now();
-        dlss5::hip_check(hipMemset(s.flag.p, 0, 4), "staged flag");
-        hipLaunchKernelGGL(dlss5::staged::k_staged_decode, grid, block, 0, nullptr, s.in.as<uint8_t>(),
-                           s.rgba.as<float4>(), format, pitch, 1920u, s.flag.as<uint32_t>());
-        dlss5::hip_check(hipGetLastError(), "staged decode");
-        dlss5::hip_check(hipMemcpy(&bad, s.flag.p, 4, hipMemcpyDeviceToHost), "staged decode check");
-        if (bad) throw std::runtime_error("nonfinite network input");
-        g_net->run(s.rgba.as<float>(), s.rgb.as<float>(), seed); // device in, device out
-        const auto t2 = clk::now();
-        dlss5::hip_check(hipMemset(s.flag.p, 0, 4), "staged flag");
-        hipLaunchKernelGGL(dlss5::staged::k_staged_finite, dim3(1024), dim3(256), 0, nullptr,
-                           s.rgb.as<float>(), size_t(1920) * 1152 * 3, s.flag.as<uint32_t>());
-        dlss5::hip_check(hipGetLastError(), "staged output check");
-        dlss5::hip_check(hipMemcpy(&bad, s.flag.p, 4, hipMemcpyDeviceToHost), "staged output check");
-        if (bad) throw std::runtime_error("nonfinite network output");
-        dlss5::hip_check(hipMemcpy(s.out.p, s.in.p, bytes, hipMemcpyDeviceToDevice), "staged padding");
-        hipLaunchKernelGGL(dlss5::staged::k_staged_encode, grid, block, 0, nullptr, s.rgb.as<float>(),
-                           s.out.as<uint8_t>(), format, pitch, 1920u);
-        dlss5::hip_check(hipGetLastError(), "staged encode");
+        staged_core(s, s.in.as<uint8_t>(), s.out.as<uint8_t>(), format, pitch, seed);
         dlss5::hip_check(hipMemcpy(out, s.out.p, bytes, hipMemcpyDeviceToHost), "staged download");
-        const auto t3 = clk::now();
-        static int nlog;
-        if (nlog < 4) {
-            auto ms = [](clk::time_point a, clk::time_point b) {
-                return std::chrono::duration<double, std::milli>(b - a).count();
-            };
-            char buf[192];
-            snprintf(buf, sizeof buf,
-                     "staged ok  format=%u pitch=%u  upload=%.2fms  decode+model=%.2fms (gpu %.2f)  "
-                     "check+encode+download=%.2fms",
-                     format, pitch, ms(t0, t1), ms(t1, t2), g_net->last_gpu_ms(), ms(t2, t3));
-            run_log(buf);
-            nlog++;
+        g_err.clear();
+        return 0;
+    } catch (const std::exception& e) {
+        set_err(e.what());
+        run_log(e.what());
+        return -1;
+    }
+}
+
+/* ---- Zero-copy (2026-09-29): the same exchange on the game's own GPU buffers. ----
+   in_handle / out_handle: Win32 shared handles (ID3D12Device::CreateSharedHandle) of DEFAULT-heap
+   buffers of `buffer_bytes`, created with D3D12_HEAP_FLAG_SHARED; `generation` changes whenever the caller
+   recreates them. They are imported once (see dlss5_shared_import.hpp) and then read and written in
+   place: no host copy at all. out receives exactly what dlss5_run_staged would write.
+   verify_in, if not null, is a host copy of the same frame's input (the caller staged it twice); the
+   imported input is compared with it byte for byte, and a difference returns 1 (the answer is still
+   written) with the count in dlss5_last_error. */
+extern "C" int dlss5_import_shared(void* handle, unsigned long long buffer_bytes, dlss5_u32 generation) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    try {
+        dlss5::hip_check(hipSetDevice(g_gpu), "hipSetDevice");
+        void* dev = nullptr;
+        std::string why;
+        if (!dlss5::shared::import_handle(handle, size_t(buffer_bytes), generation, &dev, why))
+            return set_err(("zero-copy import: " + why).c_str()), -1;
+        g_err.clear();
+        return 0;
+    } catch (const std::exception& e) {
+        set_err(e.what());
+        return -1;
+    }
+}
+
+extern "C" int dlss5_run_shared(void* in_handle, void* out_handle, unsigned long long buffer_bytes,
+                                dlss5_u32 generation, dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed,
+                                const void* verify_in) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_frame) g_frame->history_valid = false;
+    if (!g_net) return set_err("not initialized"), -1;
+    const size_t bytes = size_t(pitch) * 1080;
+    if (!in_handle || !out_handle || in_handle == out_handle || !staged_args_ok(format, pitch) ||
+        buffer_bytes < bytes)
+        return set_err("shared: unsupported format, bad pitch/size or null handles"), -1;
+    try {
+        dlss5::hip_check(hipSetDevice(g_gpu), "hipSetDevice");
+        void *dev_in = nullptr, *dev_out = nullptr;
+        std::string why;
+        if (!dlss5::shared::import_handle(in_handle, size_t(buffer_bytes), generation, &dev_in, why) ||
+            !dlss5::shared::import_handle(out_handle, size_t(buffer_bytes), generation, &dev_out, why))
+            return set_err(("zero-copy import: " + why).c_str()), -1;
+        size_t differing = 0;
+        if (verify_in) {
+            static std::vector<uint8_t> seen;
+            seen.resize(bytes);
+            dlss5::hip_check(hipMemcpy(seen.data(), dev_in, bytes, hipMemcpyDeviceToHost), "verify download");
+            const auto* host = static_cast<const uint8_t*>(verify_in);
+            // Pixel bytes only: the copies never write the row padding, so it holds whatever was there.
+            const size_t row_bytes = size_t(1920) * dlss5::staged::bytes_per_pixel(format);
+            for (size_t y = 0; y < 1080; ++y)
+                for (size_t x = 0; x < row_bytes; ++x) differing += seen[y * pitch + x] != host[y * pitch + x];
+        }
+        staged_core(staged_buffers(), static_cast<const uint8_t*>(dev_in), static_cast<uint8_t*>(dev_out), format,
+                    pitch, seed);
+        if (differing) {
+            char buf[160];
+            snprintf(buf, sizeof buf, "zero-copy verify: the shared input differs from the mapped copy in %zu of %zu pixel bytes",
+                     differing, size_t(1920) * dlss5::staged::bytes_per_pixel(format) * 1080);
+            set_err(buf);
+            return 1;
         }
         g_err.clear();
         return 0;
@@ -430,4 +502,7 @@ __attribute__((constructor)) static void dlss5_hip_publish(void) {
     g_staged_bridge.magic=DLSS5_HIP_STAGED_MAGIC;g_staged_bridge.run_staged=dlss5_run_staged;g_staged_bridge.last_gpu_ms=dlss5_last_gpu_ms;
     snprintf(buf,sizeof(buf),"%p",(void*)&g_staged_bridge);
     if(setenv(DLSS5_HIP_STAGED_ENV,buf,1)!=0){g_staged_bridge.magic=0;(void)unsetenv(DLSS5_HIP_STAGED_ENV);}
+    g_shared_bridge.magic=DLSS5_HIP_SHARED_MAGIC;g_shared_bridge.import_shared=dlss5_import_shared;g_shared_bridge.run_shared=dlss5_run_shared;
+    snprintf(buf,sizeof(buf),"%p",(void*)&g_shared_bridge);
+    if(setenv(DLSS5_HIP_SHARED_ENV,buf,1)!=0){g_shared_bridge.magic=0;(void)unsetenv(DLSS5_HIP_SHARED_ENV);}
 }

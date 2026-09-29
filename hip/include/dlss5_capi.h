@@ -95,6 +95,25 @@ typedef struct Dlss5HipStagedBridge {
 DLSS5_CAPI_EXPORT int dlss5_run_staged(const void *in, void *out, dlss5_u32 format, dlss5_u32 pitch,
                                        dlss5_u32 seed);
 
+/* Zero-copy (2026-09-29): the staged exchange on D3D12 shared buffers imported into HIP.
+   in_handle / out_handle: Win32 handles from ID3D12Device::CreateSharedHandle of DEFAULT-heap buffers
+   (D3D12_HEAP_FLAG_SHARED) of buffer_bytes; generation changes whenever they are recreated.
+   dlss5_import_shared imports one up front (0, or -1 with the reason). dlss5_run_shared writes exactly
+   what dlss5_run_staged would; verify_in (nullable) is a host copy of the same input to compare with,
+   and a difference returns 1 with the count in dlss5_last_error. */
+#define DLSS5_HIP_SHARED_MAGIC 0x3550494853534C44ULL
+#define DLSS5_HIP_SHARED_ENV "DLSS5_HIP_SHARED_BRIDGE"
+typedef struct Dlss5HipSharedBridge {
+    unsigned long long magic;
+    int (*import_shared)(void *handle, unsigned long long buffer_bytes, dlss5_u32 generation);
+    int (*run_shared)(void *in_handle, void *out_handle, unsigned long long buffer_bytes, dlss5_u32 generation,
+                      dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed, const void *verify_in);
+} Dlss5HipSharedBridge;
+DLSS5_CAPI_EXPORT int dlss5_import_shared(void *handle, unsigned long long buffer_bytes, dlss5_u32 generation);
+DLSS5_CAPI_EXPORT int dlss5_run_shared(void *in_handle, void *out_handle, unsigned long long buffer_bytes,
+                                       dlss5_u32 generation, dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed,
+                                       const void *verify_in);
+
 #ifdef __cplusplus
 }
 #endif

@@ -30,6 +30,8 @@ typedef int (*frame_fn)(const Dlss5Frame *);
 typedef int (*find_fn)(const char *);
 typedef int (*staged_fn)(const void *, void *, dlss5_u32, dlss5_u32, dlss5_u32);
 typedef double (*gpu_ms_fn)(void);
+typedef int (*import_fn)(void *, unsigned long long, dlss5_u32);
+typedef int (*shared_fn)(void *, void *, unsigned long long, dlss5_u32, dlss5_u32, dlss5_u32, dlss5_u32, const void *);
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *g_lib;
@@ -41,12 +43,15 @@ static frame_fn r_frame;
 static find_fn r_find;
 static staged_fn r_staged;
 static gpu_ms_fn r_gpu_ms;
+static import_fn r_import;
+static shared_fn r_shared;
 static char g_error[1024];
 
 static Dlss5HipBridge g_bridge;
 static Dlss5HipFrameBridge g_frame_bridge;
 static Dlss5HipDeviceBridge g_device_bridge;
 static Dlss5HipStagedBridge g_staged_bridge;
+static Dlss5HipSharedBridge g_shared_bridge;
 
 static int load(void) {
     int ok;
@@ -78,6 +83,8 @@ static int load(void) {
             r_find = (find_fn)dlsym(h, "dlss5_find_device");
             r_staged = (staged_fn)dlsym(h, "dlss5_run_staged");
             r_gpu_ms = (gpu_ms_fn)dlsym(h, "dlss5_last_gpu_ms");
+            r_import = (import_fn)dlsym(h, "dlss5_import_shared");
+            r_shared = (shared_fn)dlsym(h, "dlss5_run_shared");
             if (!r_init || !r_run || !r_shutdown || !r_error)
                 snprintf(g_error, sizeof g_error, "preload shim: %s lacks the dlss5_* exports", path);
             else
@@ -130,6 +137,26 @@ static int s_run_staged(const void *in, void *out, dlss5_u32 format, dlss5_u32 p
 }
 static double s_last_gpu_ms(void) { return g_lib && r_gpu_ms ? r_gpu_ms() : -1.0; }
 
+static int s_import_shared(void *handle, unsigned long long bytes, dlss5_u32 gen) {
+    if (!load())
+        return -1;
+    if (!r_import) {
+        snprintf(g_error, sizeof g_error, "preload shim: model library lacks dlss5_import_shared (rebuild it)");
+        return -1;
+    }
+    return r_import(handle, bytes, gen);
+}
+static int s_run_shared(void *in, void *out, unsigned long long bytes, dlss5_u32 gen, dlss5_u32 format,
+                        dlss5_u32 pitch, dlss5_u32 seed, const void *verify) {
+    if (!load())
+        return -1;
+    if (!r_shared) {
+        snprintf(g_error, sizeof g_error, "preload shim: model library lacks dlss5_run_shared (rebuild it)");
+        return -1;
+    }
+    return r_shared(in, out, bytes, gen, format, pitch, seed, verify);
+}
+
 static void publish(const char *name, void *table, unsigned long long *magic) {
     char buf[32];
     snprintf(buf, sizeof buf, "%p", table);
@@ -156,4 +183,8 @@ __attribute__((constructor)) static void dlss5_preload_publish(void) {
     g_staged_bridge.run_staged = s_run_staged;
     g_staged_bridge.last_gpu_ms = s_last_gpu_ms;
     publish(DLSS5_HIP_STAGED_ENV, &g_staged_bridge, &g_staged_bridge.magic);
+    g_shared_bridge.magic = DLSS5_HIP_SHARED_MAGIC;
+    g_shared_bridge.import_shared = s_import_shared;
+    g_shared_bridge.run_shared = s_run_shared;
+    publish(DLSS5_HIP_SHARED_ENV, &g_shared_bridge, &g_shared_bridge.magic);
 }

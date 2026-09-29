@@ -17,6 +17,7 @@ static Dlss5HipBridge *g;
 static Dlss5HipFrameBridge *g_frame;
 static Dlss5HipDeviceBridge *g_device;
 static Dlss5HipStagedBridge *g_staged;
+static Dlss5HipSharedBridge *g_shared;
 static _Thread_local const char *local_error;
 
 static unsigned long long parse_hex_ptr(const char *s) {
@@ -70,6 +71,7 @@ static void init_bridge(void) {
     g_frame = (Dlss5HipFrameBridge *)read_bridge(DLSS5_HIP_FRAME_ENV);
     g_device = (Dlss5HipDeviceBridge *)read_bridge(DLSS5_HIP_DEVICE_ENV);
     g_staged = (Dlss5HipStagedBridge *)read_bridge(DLSS5_HIP_STAGED_ENV);
+    g_shared = (Dlss5HipSharedBridge *)read_bridge(DLSS5_HIP_SHARED_ENV);
 }
 
 BOOL __stdcall DllMain(void *h, DWORD reason, void *r) {
@@ -147,4 +149,26 @@ EXPORT double dlss5_last_gpu_ms(void) {
     if (!g_staged || g_staged->magic != DLSS5_HIP_STAGED_MAGIC || !g_staged->last_gpu_ms)
         return -1.0;
     return ((double SYSV (*)(void))g_staged->last_gpu_ms)();
+}
+
+EXPORT int dlss5_import_shared(void *handle, unsigned long long buffer_bytes, dlss5_u32 generation) {
+    local_error = 0;
+    if (!g_shared || g_shared->magic != DLSS5_HIP_SHARED_MAGIC || !g_shared->import_shared) {
+        local_error = "hip shared bridge missing (rebuild libdlss5_hip.so and the preload shim)";
+        return -1;
+    }
+    return ((int SYSV (*)(void *, unsigned long long, dlss5_u32))g_shared->import_shared)(handle, buffer_bytes,
+                                                                                          generation);
+}
+
+EXPORT int dlss5_run_shared(void *in_handle, void *out_handle, unsigned long long buffer_bytes, dlss5_u32 generation,
+                            dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed, const void *verify_in) {
+    local_error = 0;
+    if (!g_shared || g_shared->magic != DLSS5_HIP_SHARED_MAGIC || !g_shared->run_shared) {
+        local_error = "hip shared bridge missing (rebuild libdlss5_hip.so and the preload shim)";
+        return -1;
+    }
+    return ((int SYSV (*)(void *, void *, unsigned long long, dlss5_u32, dlss5_u32, dlss5_u32, dlss5_u32,
+                          const void *))g_shared->run_shared)(in_handle, out_handle, buffer_bytes, generation, format,
+                                                              pitch, seed, verify_in);
 }
