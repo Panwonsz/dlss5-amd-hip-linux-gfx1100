@@ -17,7 +17,7 @@ W, H = 1920, 1080
 
 def frame():
     y, x, c = np.meshgrid(np.arange(H), np.arange(W), np.arange(4), indexing='ij')
-    return (((x * 7 + y * 13 + c * 29) % 256).astype(np.float32) / np.float32(255)).ravel()
+    return (((x * 7 + y * 13 + c * 29) % 256).astype(np.float32) * np.float32(0.00390625)).ravel()
 
 
 def digest(out):
@@ -75,8 +75,8 @@ def main():
         times.append((time.perf_counter() - t) * 1e3)
         digests.append(digest(out))
     shutdown()
-    print('5 runs %s ms (wall, incl. host copies) | output digest %016x | replay %s'
-          % (' '.join('%.1f' % v for v in times), digests[0],
+    print('5 runs %s ms (wall, incl. host copies) | input digest %016x | output digest %016x | replay %s'
+          % (' '.join('%.1f' % v for v in times), digest(inp), digests[0],
              'equal' if len(set(digests)) == 1 else 'DIFFERS'))
 
 
