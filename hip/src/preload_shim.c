@@ -28,6 +28,8 @@ typedef void (*shutdown_fn)(void);
 typedef const char *(*error_fn)(void);
 typedef int (*frame_fn)(const Dlss5Frame *);
 typedef int (*find_fn)(const char *);
+typedef int (*staged_fn)(const void *, void *, dlss5_u32, dlss5_u32, dlss5_u32);
+typedef double (*gpu_ms_fn)(void);
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 static void *g_lib;
@@ -37,11 +39,14 @@ static shutdown_fn r_shutdown;
 static error_fn r_error;
 static frame_fn r_frame;
 static find_fn r_find;
+static staged_fn r_staged;
+static gpu_ms_fn r_gpu_ms;
 static char g_error[1024];
 
 static Dlss5HipBridge g_bridge;
 static Dlss5HipFrameBridge g_frame_bridge;
 static Dlss5HipDeviceBridge g_device_bridge;
+static Dlss5HipStagedBridge g_staged_bridge;
 
 static int load(void) {
     int ok;
@@ -71,6 +76,8 @@ static int load(void) {
             r_error = (error_fn)dlsym(h, "dlss5_last_error");
             r_frame = (frame_fn)dlsym(h, "dlss5_run_frame");
             r_find = (find_fn)dlsym(h, "dlss5_find_device");
+            r_staged = (staged_fn)dlsym(h, "dlss5_run_staged");
+            r_gpu_ms = (gpu_ms_fn)dlsym(h, "dlss5_last_gpu_ms");
             if (!r_init || !r_run || !r_shutdown || !r_error)
                 snprintf(g_error, sizeof g_error, "preload shim: %s lacks the dlss5_* exports", path);
             else
@@ -112,6 +119,17 @@ static int s_find(const char *name) {
     return r_find(name);
 }
 
+static int s_run_staged(const void *in, void *out, dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed) {
+    if (!load())
+        return -1;
+    if (!r_staged) {
+        snprintf(g_error, sizeof g_error, "preload shim: model library lacks dlss5_run_staged (rebuild it)");
+        return -1;
+    }
+    return r_staged(in, out, format, pitch, seed);
+}
+static double s_last_gpu_ms(void) { return g_lib && r_gpu_ms ? r_gpu_ms() : -1.0; }
+
 static void publish(const char *name, void *table, unsigned long long *magic) {
     char buf[32];
     snprintf(buf, sizeof buf, "%p", table);
@@ -134,4 +152,8 @@ __attribute__((constructor)) static void dlss5_preload_publish(void) {
     g_device_bridge.magic = DLSS5_HIP_DEVICE_MAGIC;
     g_device_bridge.find_device = s_find;
     publish(DLSS5_HIP_DEVICE_ENV, &g_device_bridge, &g_device_bridge.magic);
+    g_staged_bridge.magic = DLSS5_HIP_STAGED_MAGIC;
+    g_staged_bridge.run_staged = s_run_staged;
+    g_staged_bridge.last_gpu_ms = s_last_gpu_ms;
+    publish(DLSS5_HIP_STAGED_ENV, &g_staged_bridge, &g_staged_bridge.magic);
 }

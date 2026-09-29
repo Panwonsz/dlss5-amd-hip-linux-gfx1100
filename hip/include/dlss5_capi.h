@@ -80,6 +80,21 @@ typedef struct Dlss5HipDeviceBridge {
 /* Unique exact name match only. Ambiguous or absent adapters return -1. */
 DLSS5_CAPI_EXPORT int dlss5_find_device(const char *exact_name);
 
+/* Staged entry (2026-09-29): the daemon's exchange, in-process, with the pixel conversion on the GPU.
+   in/out: host pointers (in-game: the CPU-mapped D3D12 READBACK / UPLOAD staging buffers) holding
+   1920x1080 pixels in DXGI `format` (2, 10, 24, 26, 28, 29, 87, 91), rows `pitch` bytes apart. out gets
+   exactly what dlss5-nr-daemon answers for the same bytes and seed: in's bytes with every pixel
+   replaced by EncodeRow(dlss5_run(DecodeRow(in))). Returns 0, or -1 with dlss5_last_error. */
+#define DLSS5_HIP_STAGED_MAGIC 0x3450494853534C44ULL
+#define DLSS5_HIP_STAGED_ENV "DLSS5_HIP_STAGED_BRIDGE"
+typedef struct Dlss5HipStagedBridge {
+    unsigned long long magic;
+    int (*run_staged)(const void *in, void *out, dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed);
+    double (*last_gpu_ms)(void);
+} Dlss5HipStagedBridge;
+DLSS5_CAPI_EXPORT int dlss5_run_staged(const void *in, void *out, dlss5_u32 format, dlss5_u32 pitch,
+                                       dlss5_u32 seed);
+
 #ifdef __cplusplus
 }
 #endif

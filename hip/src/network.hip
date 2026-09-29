@@ -302,7 +302,7 @@ struct Network70::Impl {
   auto t_last=clk::now();const auto t_start=t_last;
   auto mark=[&](int id,const float* data,uint count){++counts[id];trace[id].elements=count;if(tracing)launch_trace_f32(data,count,trace_stats.as<float>()+id*768,trace_bits.as<uint>()+id*512);
    if(timing){hip_check(hipStreamSynchronize(stream),"time sync");auto t=clk::now();block_ms[id]+=std::chrono::duration<double,std::milli>(t-t_last).count();t_last=t;}};
-  hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyHostToDevice,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
+  hip_check(hipMemcpyAsync(rgb.p,input,1920ull*1080*16,hipMemcpyDefault,stream),"input upload");hip_check(hipEventRecord(ev0,stream),"start");
   launch_rgb_graph(rgb.as<float>(),color.as<float>(),tiles.as<float>(),W,1080,W,Ht);
   const bool io16=io16_on()&&c32_fused_on()&&!c32_check_on();
   launch_prefix_h(tiles.as<float>(),prefix_w.as<float>(),host_history?history.as<float>():nullptr,io16?nullptr:s.a.as<float>(),s.a16.as<__half>(),seed,W,Ht,host_history?1:0);
@@ -376,7 +376,7 @@ struct Network70::Impl {
   launch_head_f32(src,head_rgb.as<float>(),color.as<float>(),out.as<float>(),N);
   }
   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
-  hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDeviceToHost,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
+  hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDefault,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
   if(timing){double total=std::chrono::duration<double,std::milli>(clk::now()-t_start).count();
    for(int b=0;b<71;++b)std::fprintf(stderr,"time block=%02d ms=%.1f\n",b,block_ms[b]);
    std::fprintf(stderr,"time total_ms=%.1f (head+download after block 70 included)\n",total);}

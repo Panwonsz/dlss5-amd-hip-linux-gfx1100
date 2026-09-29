@@ -36,6 +36,23 @@ while read -r name path; do
     count=$((count + 1))
 done < <(ldd "$src_real" | awk '/=>/ && $3 ~ /^\// {print $1, $3}')
 
+# HIP dlopens libamd_comgr at runtime, so ldd does not list it -- and without it HIP reports "no
+# ROCm-capable device" even though ROCr sees the GPU (found in-game, 2026-09-29). Copy it and its own
+# dependencies from the folder libamdhip64 was found in.
+hipdir=$(dirname "$(ldd "$src_real" | awk '/libamdhip64/ && $3 ~ /^\// {print $3; exit}')")
+for extra in "$hipdir"/libamd_comgr.so.[0-9]; do
+    [[ -f "$extra" ]] || continue
+    cp -fL "$extra" "$out/$(basename "$extra")"
+    count=$((count + 1))
+    while read -r name path; do
+        [[ -n "$path" && -f "$path" ]] || continue
+        [[ "$name" =~ $skip_re ]] && continue
+        [[ -f "$out/$name" ]] && continue
+        cp -fL "$path" "$out/$name"
+        count=$((count + 1))
+    done < <(ldd "$extra" | awk '/=>/ && $3 ~ /^\// {print $1, $3}')
+done
+
 missing=$(ldd "$src_real" | grep "not found" || true)
 if [[ -n "$missing" ]]; then
     echo "unresolved on the host (fix these first):" >&2

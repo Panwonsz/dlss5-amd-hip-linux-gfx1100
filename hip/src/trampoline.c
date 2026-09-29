@@ -16,6 +16,7 @@ __declspec(dllimport) void *__stdcall GetProcAddress(HANDLE m, const char *n);
 static Dlss5HipBridge *g;
 static Dlss5HipFrameBridge *g_frame;
 static Dlss5HipDeviceBridge *g_device;
+static Dlss5HipStagedBridge *g_staged;
 static _Thread_local const char *local_error;
 
 static unsigned long long parse_hex_ptr(const char *s) {
@@ -68,6 +69,7 @@ static void init_bridge(void) {
     g = (Dlss5HipBridge *)read_bridge(DLSS5_HIP_ENV);
     g_frame = (Dlss5HipFrameBridge *)read_bridge(DLSS5_HIP_FRAME_ENV);
     g_device = (Dlss5HipDeviceBridge *)read_bridge(DLSS5_HIP_DEVICE_ENV);
+    g_staged = (Dlss5HipStagedBridge *)read_bridge(DLSS5_HIP_STAGED_ENV);
 }
 
 BOOL __stdcall DllMain(void *h, DWORD reason, void *r) {
@@ -129,4 +131,20 @@ EXPORT int dlss5_find_device(const char *name) {
         return -1;
     }
     return ((int SYSV (*)(const char *))g_device->find_device)(name);
+}
+
+EXPORT int dlss5_run_staged(const void *in, void *out, dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed) {
+    local_error = 0;
+    if (!g_staged || g_staged->magic != DLSS5_HIP_STAGED_MAGIC || !g_staged->run_staged) {
+        local_error = "hip staged bridge missing (rebuild libdlss5_hip.so and the preload shim)";
+        return -1;
+    }
+    return ((int SYSV (*)(const void *, void *, dlss5_u32, dlss5_u32, dlss5_u32))g_staged->run_staged)(
+        in, out, format, pitch, seed);
+}
+
+EXPORT double dlss5_last_gpu_ms(void) {
+    if (!g_staged || g_staged->magic != DLSS5_HIP_STAGED_MAGIC || !g_staged->last_gpu_ms)
+        return -1.0;
+    return ((double SYSV (*)(void))g_staged->last_gpu_ms)();
 }

@@ -83,6 +83,11 @@ dlss5_hip.dll: src/trampoline.c include/dlss5_capi.h
 	$(MINGW_CC) -shared -O2 -static-libgcc -o $@ src/trampoline.c
 
 # The object to LD_PRELOAD into a Proton game: no HIP, dlopens libdlss5_hip.so on the first call.
+# dlss5_run_staged against the daemon's own DecodeRow/EncodeRow: build/test_staged <weights> [lib]
+test-staged: tests/test_staged.cpp ../linux/dlss5_nr_daemon.cpp libdlss5_hip.so
+	mkdir -p $(BUILD)
+	g++ -O2 -std=c++17 tests/test_staged.cpp -ldl -lpthread -o $(BUILD)/test_staged
+
 libdlss5_hip_preload.so: src/preload_shim.c include/dlss5_capi.h
 	cc -shared -fPIC -O2 -Wall -Iinclude src/preload_shim.c -ldl -lpthread -o $@
 

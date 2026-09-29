@@ -2,6 +2,8 @@
 #include "dlss5_network.hpp"
 #include "dlss5_launch.hpp"
 #include "dlss5_frame.hpp"
+#include "dlss5_staged_io.hpp"
+#include <chrono>
 #include <mutex>
 #include <string>
 #include <cstdio>
@@ -34,6 +36,13 @@ struct FrameBuffers {
     }
 };
 static std::unique_ptr<FrameBuffers> g_frame;
+// dlss5_run_staged's device buffers (see the staged entry below).
+struct StagedBuffers {
+    dlss5::DeviceBuf in, out, rgba, rgb, flag;
+    size_t bytes = 0;
+};
+static std::unique_ptr<StagedBuffers> g_staged;
+static Dlss5HipStagedBridge g_staged_bridge;
 // The network writes 1152 rows; the V1 caller wants the first 1080. Held here rather than allocated
 // per call, and released by dlss5_shutdown so an unload does not leave 25 MB behind.
 static std::vector<float> g_out1152;
@@ -227,6 +236,7 @@ extern "C" void dlss5_shutdown(void) {
     delete g_net;
     g_net = nullptr;
     g_frame.reset();
+    g_staged.reset();
     std::vector<float>().swap(g_out1152);
 }
 
@@ -318,6 +328,86 @@ extern "C" int dlss5_run_frame(const Dlss5Frame* f) {
     } catch(const std::exception&e) {if(g_frame)g_frame->history_valid=false;set_err(e.what());return -1;}
 }
 
+/* ---- Staged entry (2026-09-29): the daemon's whole exchange, in this process, on the GPU. ----
+   in/out are the game's CPU-mapped D3D12 READBACK / UPLOAD buffers (or any host memory): 1920x1080 in
+   DXGI `format`, rows `pitch` bytes apart. out receives exactly the bytes dlss5-nr-daemon sends back for
+   the same request and seed: in's bytes (row padding included) with every pixel replaced by
+   EncodeRow(dlss5_run(DecodeRow(in))). Non-finite model input or output fails the call, as dlss5_run
+   does. hip/tests/test_staged.cpp checks the byte equality against the daemon's own code. */
+
+extern "C" int dlss5_run_staged(const void* in, void* out, dlss5_u32 format, dlss5_u32 pitch,
+                                dlss5_u32 seed) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    // Like dlss5_run: no motion contract, so any call breaks frame continuity.
+    if (g_frame) g_frame->history_valid = false;
+    if (!g_net) return set_err("not initialized"), -1;
+    const dlss5_u32 bpp = dlss5::staged::bytes_per_pixel(format);
+    if (!in || !out || in == out || !bpp || pitch < 1920u * bpp || pitch % 4 || pitch > (1u << 20))
+        return set_err("staged: unsupported format, bad pitch or null buffers"), -1;
+    try {
+        using clk = std::chrono::steady_clock;
+        const auto t0 = clk::now();
+        dlss5::hip_check(hipSetDevice(g_gpu), "hipSetDevice");
+        const size_t bytes = size_t(pitch) * 1080;
+        if (!g_staged) {
+            auto next = std::make_unique<StagedBuffers>();
+            next->rgba.alloc(1920ull * 1080 * 16);
+            next->rgb.alloc(1920ull * 1152 * 12);
+            next->flag.alloc(4);
+            g_staged = std::move(next);
+        }
+        auto& s = *g_staged;
+        if (s.bytes != bytes) {
+            s.in.alloc(bytes);
+            s.out.alloc(bytes);
+            s.bytes = bytes;
+        }
+        const dim3 grid((1920 + 255) / 256, 1080), block(256);
+        uint32_t bad = 0;
+        dlss5::hip_check(hipMemcpy(s.in.p, in, bytes, hipMemcpyHostToDevice), "staged upload");
+        const auto t1 = clk::now();
+        dlss5::hip_check(hipMemset(s.flag.p, 0, 4), "staged flag");
+        hipLaunchKernelGGL(dlss5::staged::k_staged_decode, grid, block, 0, nullptr, s.in.as<uint8_t>(),
+                           s.rgba.as<float4>(), format, pitch, 1920u, s.flag.as<uint32_t>());
+        dlss5::hip_check(hipGetLastError(), "staged decode");
+        dlss5::hip_check(hipMemcpy(&bad, s.flag.p, 4, hipMemcpyDeviceToHost), "staged decode check");
+        if (bad) throw std::runtime_error("nonfinite network input");
+        g_net->run(s.rgba.as<float>(), s.rgb.as<float>(), seed); // device in, device out
+        const auto t2 = clk::now();
+        dlss5::hip_check(hipMemset(s.flag.p, 0, 4), "staged flag");
+        hipLaunchKernelGGL(dlss5::staged::k_staged_finite, dim3(1024), dim3(256), 0, nullptr,
+                           s.rgb.as<float>(), size_t(1920) * 1152 * 3, s.flag.as<uint32_t>());
+        dlss5::hip_check(hipGetLastError(), "staged output check");
+        dlss5::hip_check(hipMemcpy(&bad, s.flag.p, 4, hipMemcpyDeviceToHost), "staged output check");
+        if (bad) throw std::runtime_error("nonfinite network output");
+        dlss5::hip_check(hipMemcpy(s.out.p, s.in.p, bytes, hipMemcpyDeviceToDevice), "staged padding");
+        hipLaunchKernelGGL(dlss5::staged::k_staged_encode, grid, block, 0, nullptr, s.rgb.as<float>(),
+                           s.out.as<uint8_t>(), format, pitch, 1920u);
+        dlss5::hip_check(hipGetLastError(), "staged encode");
+        dlss5::hip_check(hipMemcpy(out, s.out.p, bytes, hipMemcpyDeviceToHost), "staged download");
+        const auto t3 = clk::now();
+        static int nlog;
+        if (nlog < 4) {
+            auto ms = [](clk::time_point a, clk::time_point b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            char buf[192];
+            snprintf(buf, sizeof buf,
+                     "staged ok  format=%u pitch=%u  upload=%.2fms  decode+model=%.2fms (gpu %.2f)  "
+                     "check+encode+download=%.2fms",
+                     format, pitch, ms(t0, t1), ms(t1, t2), g_net->last_gpu_ms(), ms(t2, t3));
+            run_log(buf);
+            nlog++;
+        }
+        g_err.clear();
+        return 0;
+    } catch (const std::exception& e) {
+        set_err(e.what());
+        run_log(e.what());
+        return -1;
+    }
+}
+
 __attribute__((constructor)) static void dlss5_hip_publish(void) {
     memset(&g_bridge, 0, sizeof(g_bridge));
     g_bridge.magic = DLSS5_HIP_MAGIC;
@@ -337,4 +427,7 @@ __attribute__((constructor)) static void dlss5_hip_publish(void) {
     g_device_bridge.magic=DLSS5_HIP_DEVICE_MAGIC;g_device_bridge.find_device=dlss5_find_device;
     snprintf(buf,sizeof(buf),"%p",(void*)&g_device_bridge);
     if(setenv(DLSS5_HIP_DEVICE_ENV,buf,1)!=0){g_device_bridge.magic=0;(void)unsetenv(DLSS5_HIP_DEVICE_ENV);}
+    g_staged_bridge.magic=DLSS5_HIP_STAGED_MAGIC;g_staged_bridge.run_staged=dlss5_run_staged;g_staged_bridge.last_gpu_ms=dlss5_last_gpu_ms;
+    snprintf(buf,sizeof(buf),"%p",(void*)&g_staged_bridge);
+    if(setenv(DLSS5_HIP_STAGED_ENV,buf,1)!=0){g_staged_bridge.magic=0;(void)unsetenv(DLSS5_HIP_STAGED_ENV);}
 }
