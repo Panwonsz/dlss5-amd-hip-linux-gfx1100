@@ -20,12 +20,15 @@
 #include "../kernels/linear_splitk.hip"
 #include "../kernels/vit_attention_mw.hip"
 #include "../kernels/c32_fused.hip"
+#include "../kernels/c32_f16act.hip"
 
 namespace dlss5 {
 
 static thread_local hipStream_t g_stream;
 
 void set_launch_stream(hipStream_t s) { g_stream = s; }
+
+static bool f16_act_on(); // DLSS5_F16_ACT, defined beside launch_c32_fused
 
 #define LAUNCH(name, grid, block, ...)                                                             \
     do {                                                                                           \
@@ -200,13 +203,13 @@ void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float
         throw std::runtime_error("FFN f16 in extent/alias");
     if (dlss5_w16()) { DLSS5_FFN_HIN_HOUT(true) } else { DLSS5_FFN_HIN_HOUT(false) }
 }
-#define DLSS5_FFN_F8(W16)                                                                            \
+#define DLSS5_FFN_F8(W16, FA)                                                                            \
     switch (c) {                                                                                     \
-    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, false, W16>), groups, 128, in, w, scales,   \
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, false, W16, true, FA>), groups, 128, in, w, scales,   \
                     out_f32, out_f8, tokens); break;                                                 \
-    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, false, W16>), groups, 256, in, w, scales, \
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, false, W16, true, FA>), groups, 256, in, w, scales, \
                      out_f32, out_f8, tokens); break;                                                \
-    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, false, W16>), groups, 512, in, w, scales, \
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, false, W16, true, FA>), groups, 512, in, w, scales, \
                      out_f32, out_f8, tokens); break;                                                \
     default: throw std::runtime_error("FFN f8 channels");                                             \
     }
@@ -216,17 +219,18 @@ void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales,
     if (!tokens || c == 32 || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f8 extent/alias");
     uint groups = (tokens + 15) / 16;
-    if (dlss5_w16()) { DLSS5_FFN_F8(true) } else { DLSS5_FFN_F8(false) }
+    if (dlss5_w16() && f16_act_on()) { DLSS5_FFN_F8(true, true) }
+    else if (dlss5_w16()) { DLSS5_FFN_F8(true, false) } else { DLSS5_FFN_F8(false, false) }
 }
-#define DLSS5_FFN_F8IN(W16)                                                                          \
+#define DLSS5_FFN_F8IN(W16, FA)                                                                          \
     switch (c) {                                                                                     \
-    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, true, false, W16>), groups, 128, nullptr, w,       \
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, true, false, W16, true, FA>), groups, 128, nullptr, w,       \
                     scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr,           \
                     in_f8); break;                                                                   \
-    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, true, false, W16>), groups, 256, nullptr, w,     \
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, true, false, W16, true, FA>), groups, 256, nullptr, w,     \
                      scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr,          \
                      in_f8); break;                                                                  \
-    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, true, false, W16>), groups, 512, nullptr, w,     \
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, true, false, W16, true, FA>), groups, 512, nullptr, w,     \
                      scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr,          \
                      in_f8); break;                                                                  \
     default: throw std::runtime_error("FFN f8in channels");                                           \
@@ -238,17 +242,18 @@ void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float*
     if (!tokens || c == 32 || !in_f8 || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f8in extent/alias");
     uint groups = (tokens + 15) / 16;
-    if (dlss5_w16()) { DLSS5_FFN_F8IN(true) } else { DLSS5_FFN_F8IN(false) }
+    if (dlss5_w16() && f16_act_on()) { DLSS5_FFN_F8IN(true, true) }
+    else if (dlss5_w16()) { DLSS5_FFN_F8IN(true, false) } else { DLSS5_FFN_F8IN(false, false) }
 }
-#define DLSS5_FFN_HIN_F8(W16)                                                                        \
+#define DLSS5_FFN_HIN_F8(W16, FA)                                                                        \
     switch (c) {                                                                                     \
-    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true, W16>), groups, 128, nullptr, w,       \
+    case 64: LAUNCH((k_ffn_f32<64, true, 1, false, false, true, W16, true, FA>), groups, 128, nullptr, w,       \
                     scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr,   \
                     in_h); break;                                                                    \
-    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, true, W16>), groups, 256, nullptr, w,     \
+    case 128: LAUNCH((k_ffn_f32<128, true, 1, false, false, true, W16, true, FA>), groups, 256, nullptr, w,     \
                      scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr,  \
                      in_h); break;                                                                   \
-    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, true, W16>), groups, 512, nullptr, w,     \
+    case 256: LAUNCH((k_ffn_f32<256, true, 1, false, false, true, W16, true, FA>), groups, 512, nullptr, w,     \
                      scales, out_f32, out_f8, tokens, chain_residual, precise_c32, nullptr, nullptr,  \
                      in_h); break;                                                                   \
     default: throw std::runtime_error("FFN f16in channels");                                          \
@@ -260,7 +265,8 @@ void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const floa
     if (!tokens || c == 32 || c == 512 || !in_h || !out_f32 || !out_f8)
         throw std::runtime_error("FFN f16in extent/alias");
     uint groups = (tokens + 15) / 16;
-    if (dlss5_w16()) { DLSS5_FFN_HIN_F8(true) } else { DLSS5_FFN_HIN_F8(false) }
+    if (dlss5_w16() && f16_act_on()) { DLSS5_FFN_HIN_F8(true, true) }
+    else if (dlss5_w16()) { DLSS5_FFN_HIN_F8(true, false) } else { DLSS5_FFN_HIN_F8(false, false) }
 }
 
 void launch_normalize_qkv(const float* in, const float* scales, u8* out,
@@ -633,6 +639,19 @@ void launch_attn_bias_pack(const float* bias, float* out, uint heads) {
 void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, uint h,
                       uint packed, bool direct_f8, int bias_mode, bool splitrow) {
     dim3 grid(grid_cap((w / 8) * (h / 8)), c / 32);
+    if (f16_act_on()) { // DLSS5_F16_ACT: f16 probabilities (NOT bit-exact)
+#define DLSS5_ATTN_F16(C) LAUNCH((k_window_attention<C, DLSS5_QKV16, true>), grid, 128, qkv, bias, out, w, h, \
+                                packed, direct_f8, uint(bias_mode), splitrow)
+        switch (c) {
+        case 32: DLSS5_ATTN_F16(32); return;
+        case 64: DLSS5_ATTN_F16(64); return;
+        case 128: DLSS5_ATTN_F16(128); return;
+        case 256: DLSS5_ATTN_F16(256); return;
+        case 512: DLSS5_ATTN_F16(512); return;
+        default: throw std::runtime_error("attn channels");
+        }
+#undef DLSS5_ATTN_F16
+    }
     switch (c) {
     case 32:
         LAUNCH(k_window_attention<32>, grid, 128, qkv, bias, out, w, h, packed, direct_f8,
@@ -744,6 +763,12 @@ void launch_vit_attention_f8(const u8* qkv_f8, u8* out, uint tokens, uint dim) {
     const uint nw = vit_attn_mw();
     if (nw && tokens % (16u * nw) == 0) {
         const dim3 grid(tokens / (16u * nw), dim / 32);
+        if (f16_act_on()) { // DLSS5_F16_ACT: f16 probabilities (NOT bit-exact)
+            if (nw == 2) LAUNCH((k_vit_attention_mw<2, true>), grid, 64, qkv_f8, out, tokens, dim);
+            else if (nw == 4) LAUNCH((k_vit_attention_mw<4, true>), grid, 128, qkv_f8, out, tokens, dim);
+            else LAUNCH((k_vit_attention_mw<8, true>), grid, 256, qkv_f8, out, tokens, dim);
+            return;
+        }
         if (nw == 2) LAUNCH((k_vit_attention_mw<2>), grid, 64, qkv_f8, out, tokens, dim);
         else if (nw == 4) LAUNCH((k_vit_attention_mw<4>), grid, 128, qkv_f8, out, tokens, dim);
         else LAUNCH((k_vit_attention_mw<8>), grid, 256, qkv_f8, out, tokens, dim);
@@ -823,15 +848,19 @@ void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,fl
   if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH((k_split_f32<false>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,nullptr,n);
 }
 void launch_split_f32_f8(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
-  if(!n||in==out||!out_f8)throw std::runtime_error("split f8 geometry/alias");LAUNCH((k_split_f32<true>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,out_f8,n);
+  if(!n||in==out||!out_f8)throw std::runtime_error("split f8 geometry/alias");
+  if(f16_act_on())LAUNCH((k_split_f32<true,false,false,true>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,out_f8,n);
+  else LAUNCH((k_split_f32<true>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,out_f8,n);
 }
 void launch_split_f32_f8in_f8(const u8* in_f8,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
   if(!n||!in_f8||!out_f8)throw std::runtime_error("split f8in geometry/alias");
-  LAUNCH((k_split_f32<true, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,in_f8);
+  if(f16_act_on())LAUNCH((k_split_f32<true, true, false, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,in_f8);
+  else LAUNCH((k_split_f32<true, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,in_f8);
 }
 void launch_split_f32_hin_f8(const __half* in_h,const u8* pre,const u8* ex,const u8* ct,float* out,u8* out_f8,uint n){
   if(!n||!in_h||!out_f8)throw std::runtime_error("split f16in geometry/alias");
-  LAUNCH((k_split_f32<true, false, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,nullptr,in_h);
+  if(f16_act_on())LAUNCH((k_split_f32<true, false, true, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,nullptr,in_h);
+  else LAUNCH((k_split_f32<true, false, true>),dim3((n+15)/16,8),128,nullptr,pre,ex,ct,out,out_f8,n,nullptr,in_h);
 }
 void launch_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,uint ow,uint oh){
  if(w<2||h<2||ow%8||oh%8||ow<w||oh<h)throw std::runtime_error("RGB geometry");LAUNCH(k_rgb_graph,(ow*oh+255)/256,256,in,raster,tiles,w,h,ow,oh);
@@ -852,6 +881,20 @@ void launch_trace_f32(const float* in,uint n,float* stats,uint* bits){LAUNCH(k_t
 // k_ffn_f32<32> + k_qkv_norm_f32<32,3> + k_window_attention<32> + k_linear_f32 mode 4.
 // raster_in: in_h is the previous block's cropped f16 raster (skips k_reframe_hin_hout).
 // out_f32: write the cropped f32 raster directly (skips launch_reframe_f32_hin); excludes out_ah.
+#define DLSS5_C32H(CH, OM, RA, RI)                                                                \
+    LAUNCH((k_c32_fused_f16act<true, CH, OM, RA, RI>), windows, 128, in_h, ffn_w, ffn_s, qkv_w,   \
+           qscale, qgain, bias, proj_w, proj_s, out_ah, out_raster, w, h, sw, px, py, out_f32,    \
+           uint(bias_mode))
+// DLSS5_F16_ACT=1: see kernels/c32_f16act.hip. Read once; said once, because it changes the output.
+static bool f16_act_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("DLSS5_F16_ACT");
+        const bool v = e && std::string(e) == "1";
+        if (v) std::fprintf(stderr, "DLSS5_F16_ACT=1: C32 blocks run with f16 activations (NOT bit-exact)\n");
+        return v;
+    }();
+    return on;
+}
 #define DLSS5_C32F(W16, CH, OM, RA, RI)                                                            \
     LAUNCH((k_c32_fused<W16, CH, OM, RA, RI>), windows, 128, in_h, ffn_w, ffn_s, qkv_w, qscale,    \
            qgain, bias, proj_w, proj_s, out_ah, out_raster, w, h, sw, px, py, dbg_bh, dbg_q8,      \
@@ -869,6 +912,34 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
     const int om = out_f32 ? 2 : out_ah ? 1 : 0;
     const int sel = (raster_in ? 64 : 0) | (dlss5_w16() ? 32 : 0) | (chain ? 16 : 0) | om * 2 |
                     (out_raster ? 1 : 0);
+    // DLSS5_F16_ACT=1 (EXPERIMENT, not bit-exact): the C32 blocks with f16 activations instead of E4M3.
+    // W16 builds only (the default); the debug outputs of DLSS5_C32_CHECK keep the exact kernel.
+    if (f16_act_on() && dlss5_w16() && !dbg_bh && !dbg_q8 && !dbg_att8) {
+        switch (sel) {
+        case 33: DLSS5_C32H(false, 0, true, false); break;
+        case 34: DLSS5_C32H(false, 1, false, false); break;
+        case 35: DLSS5_C32H(false, 1, true, false); break;
+        case 36: DLSS5_C32H(false, 2, false, false); break;
+        case 37: DLSS5_C32H(false, 2, true, false); break;
+        case 49: DLSS5_C32H(true, 0, true, false); break;
+        case 50: DLSS5_C32H(true, 1, false, false); break;
+        case 51: DLSS5_C32H(true, 1, true, false); break;
+        case 52: DLSS5_C32H(true, 2, false, false); break;
+        case 53: DLSS5_C32H(true, 2, true, false); break;
+        case 97: DLSS5_C32H(false, 0, true, true); break;
+        case 98: DLSS5_C32H(false, 1, false, true); break;
+        case 99: DLSS5_C32H(false, 1, true, true); break;
+        case 100: DLSS5_C32H(false, 2, false, true); break;
+        case 101: DLSS5_C32H(false, 2, true, true); break;
+        case 113: DLSS5_C32H(true, 0, true, true); break;
+        case 114: DLSS5_C32H(true, 1, false, true); break;
+        case 115: DLSS5_C32H(true, 1, true, true); break;
+        case 116: DLSS5_C32H(true, 2, false, true); break;
+        case 117: DLSS5_C32H(true, 2, true, true); break;
+        default: throw std::runtime_error("c32 f16act variant");
+        }
+        return;
+    }
     switch (sel) {
     case 1: DLSS5_C32F(false, false, 0, true, false); break;
     case 2: DLSS5_C32F(false, false, 1, false, false); break;
@@ -914,6 +985,7 @@ void launch_c32_fused(const __half* in_h, const u8* ffn_w, const float* ffn_s, c
     }
 }
 #undef DLSS5_C32F
+#undef DLSS5_C32H
 void launch_c32_bias_pack(const float* bias, float* out32, __half* out16) {
     if (!bias || (!out32 && !out16)) throw std::runtime_error("c32 bias pack buffers");
     LAUNCH(k_c32_bias_pack, 1, 128, bias, out32, out16);
