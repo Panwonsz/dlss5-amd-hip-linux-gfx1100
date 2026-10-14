@@ -46,7 +46,9 @@ __device__ inline uint window_pixel(uint window, uint token, uint width) {
 // against the 6 that 218 VGPRs would permit).
 //
 // k_qkv_norm_f32 must agree; DLSS5_QKV16 in dlss5_linalg.hpp drives both.
-template <int C, bool QKV16 = DLSS5_QKV16>
+// DLSS5_F16_ACT (F16ACT): the probabilities are f16, written over the scores (row stride 72 halves) once
+// every row has been read into registers; no E4M3 rounding. NOT bit-exact.
+template <int C, bool QKV16 = DLSS5_QKV16, bool F16ACT = false>
 __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, const float* bias,
                                                              u8* output, uint width,
                                    uint height, uint packed, bool direct_f8 = false,
@@ -60,8 +62,8 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     const uint nwin = (width / 8) * (height / 8);
     const uint wave = threadIdx.x / 32u;
     const uint qtok = wave * 16u;
-    __shared__ __half scores[64 * 68];
-    __shared__ u8 p8[64 * 64];
+    __shared__ __attribute__((aligned(16))) __half scores[F16ACT ? 64 * 72 : 64 * 68];
+    __shared__ u8 p8[F16ACT ? 16 : 64 * 64];
     for (uint window = blockIdx.x; window < nwin; window += gridDim.x) {
 
     // One spelling for both formats; every offset into qkv scales with the element size.
@@ -97,7 +99,34 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
 
     // hip-26 DLSS5_ATTN_SPLITROW: all 128 threads take part -- two per row. Both compute the row's
     // sum in the same serial order (so both hold the same inv); each encodes half the row.
-    if (splitrow || threadIdx.x < 64) {
+    if constexpr (F16ACT) {
+        // Two threads per row (as split-row): both sum the whole row in the same serial order, each
+        // normalizes 32 values into registers; after the barrier they land over the scores.
+        uint4 pr[4];
+        {
+            const uint qi = threadIdx.x & 63u, base = (threadIdx.x >> 6) * 32u;
+            float sum = 0.f;
+            for (int j = 0; j < 16; j++) {
+                uint2 v = *reinterpret_cast<const uint2*>(&scores[qi * 68 + j * 4]);
+                const __half2* h = reinterpret_cast<const __half2*>(&v);
+                sum += __half2float(__low2half(h[0]));
+                sum += __half2float(__high2half(h[0]));
+                sum += __half2float(__low2half(h[1]));
+                sum += __half2float(__high2half(h[1]));
+            }
+            const float inv = attn_norm_inverse(fmaxf(sum, 1e-20f));
+            for (int q = 0; q < 4; q++) {
+                __half* b = reinterpret_cast<__half*>(&pr[q]);
+                for (int t = 0; t < 8; t++)
+                    b[t] = __float2half_rn(__half2float(scores[qi * 68 + base + q * 8 + t]) * inv);
+            }
+        }
+        __syncthreads(); // every row is read before any is overwritten
+        {
+            uint4* row = reinterpret_cast<uint4*>(scores + (threadIdx.x & 63u) * 72 + (threadIdx.x >> 6) * 32u);
+            for (int q = 0; q < 4; q++) row[q] = pr[q];
+        }
+    } else if (splitrow || threadIdx.x < 64) {
         uint qi = threadIdx.x & 63u;
         float sum = 0.f;
         // 16 x 8B loads (4 f16 each); 136B row stride keeps 8B alignment and the
@@ -128,13 +157,20 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     C32 av0 = C32::Splat(0.f);
     C32 av1 = C32::Splat(0.f);
     for (uint k0 = 0; k0 < 64; k0 += 32) {
-        A8 p = A8::Load(p8, qtok * 64u + k0, 64);   // p8 stays E4M3, see the note above
         const uint vbase =
             ((window * 64u + k0) * uint(STRIDE) + 2u * uint(C) + head * 32u) * QSZ;
         KVT v0 = KVT::LoadRow(qkv, vbase, uint(STRIDE) * QSZ);
         KVT v1 = KVT::LoadRow(qkv, vbase + 16u * QSZ, uint(STRIDE) * QSZ);
+        if constexpr (F16ACT) {
+            using AF = typename HiddenA<true>::type;
+            AF p = AF::Load(scores, (qtok * 72u + k0) * 2u, 144u);
+            av0.MultiplyAccumulate(p, v0);
+            av1.MultiplyAccumulate(p, v1);
+        } else {
+        A8 p = A8::Load(p8, qtok * 64u + k0, 64);   // p8 stays E4M3, see the note above
         av0.MultiplyAccumulate(p, v0);
         av1.MultiplyAccumulate(p, v1);
+        }
     }
     for (uint i = 0; i < av0.Length(); i++) {
         uint2 rc = av0.GetCoordinate(i);

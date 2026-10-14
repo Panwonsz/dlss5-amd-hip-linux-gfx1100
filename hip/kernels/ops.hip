@@ -201,7 +201,7 @@ __global__ void k_linear_f32(const float* input, const u8* input_f8, const u8* w
 // put a number on that, because gfx1100's hardware counters all read 0.00 and the difference cannot be
 // measured any other way.
 template <int C, bool F8OUT = false, int GROUPS = 1, bool HOUT = false, bool F8IN = false,
-          bool HIN = false, bool W16 = false, bool AH16 = true>
+          bool HIN = false, bool W16 = false, bool AH16 = true, bool F16ACT = false>
 __global__ void k_ffn_f32(const float* input, const u8* weights, const float* scales,
                           float* output, u8* output_f8, uint tokens, bool chain_residual = false,
                           bool precise_c32 = false, __half* output_h = nullptr,
@@ -298,7 +298,9 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
             for (uint i = 0; i < ex[n].Length(); ++i) ex[n].Set(i,
                 C == 32 && precise_c32 ? ActivatePolyC32(ex[n].Get(i))
                                        : ActivatePoly(ex[n].Get(i)));
-            if constexpr (AH16)
+            if constexpr (AH16 && F16ACT)  // DLSS5_F16_ACT: the activation's own f16, no E4M3 rounding
+                ex[n].StoreF16(hidden + t0 * hidden_c * 2, (sub * 4 + n) * 32, hidden_c * 2);
+            else if constexpr (AH16)
                 ex[n].StoreQuantF16(hidden + t0 * hidden_c * 2, (sub * 4 + n) * 32, hidden_c * 2);
             else
                 ex[n].StoreF8(hidden + t0 * hidden_c, (sub * 4 + n) * 16, hidden_c);
@@ -546,13 +548,15 @@ __global__ void k_linear_half(const float* input,const __half* weights,float* ou
 
 // Split FFWD group parallel, logical window-major input/output. No opaque
 // tiled activation format crosses a launch boundary.
-template <bool F8OUT, bool F8IN = false, bool HIN = false>
+template <bool F8OUT, bool F8IN = false, bool HIN = false, bool F16ACT = false>
 __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const u8* contract,
                              float* out,u8* out_f8,uint tokens,const u8* in_f8=nullptr,
                              const __half* in_h=nullptr){
   using namespace linalg;
   uint first=blockIdx.x*16,group=blockIdx.y,wave=threadIdx.x/32;
-  __shared__ u8 tile[512],mix[16*64],hid[16*256];
+  // DLSS5_F16_ACT: mix and hid as f16 tiles (rows 128 / 512 B) instead of E4M3 bytes.
+  __shared__ __attribute__((aligned(16))) u8 tile[512],mix[16*64*(F16ACT?2:1)],hid[16*256*(F16ACT?2:1)];
+  using AF=typename linalg::HiddenA<true>::type;
    C32 a=C32::Splat(0.f);
    for(uint g=0;g<16;++g){
     {
@@ -579,13 +583,21 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
    __syncthreads();
   a.MultiplyAccumulate(A8::Load(tile,0,32),B8::LoadRow(pre,((group*4+wave)*16+g)*512,16));__syncthreads();
  }
- for(uint i=0;i<a.Length();++i)a.Set(i,H(a.Get(i)));a.StoreF8(mix,wave*16,64);__syncthreads();
+ for(uint i=0;i<a.Length();++i)a.Set(i,H(a.Get(i)));
+ if constexpr(F16ACT)a.StoreF16(mix,wave*16*2,128);else a.StoreF8(mix,wave*16,64);__syncthreads();
  for(uint j=0;j<4;++j){C32 acc=C32::Splat(0.f);uint col=wave*64+j*16;
-  for(uint g=0;g<2;++g)acc.MultiplyAccumulate(A8::Load(mix,g*32,64),B8::LoadRow(expand,group*16384+((col/16)*2+g)*512,16));
-  for(uint i=0;i<acc.Length();++i)acc.Set(i,ActivatePoly(H(acc.Get(i))));acc.StoreF8(hid,col,256);
+  for(uint g=0;g<2;++g){
+   if constexpr(F16ACT)acc.MultiplyAccumulate(AF::Load(mix,g*32*2,128),B8::LoadRow(expand,group*16384+((col/16)*2+g)*512,16));
+   else acc.MultiplyAccumulate(A8::Load(mix,g*32,64),B8::LoadRow(expand,group*16384+((col/16)*2+g)*512,16));
+  }
+  for(uint i=0;i<acc.Length();++i)acc.Set(i,ActivatePoly(H(acc.Get(i))));
+  if constexpr(F16ACT)acc.StoreF16(hid,col*2,512);else acc.StoreF8(hid,col,256);
  }
  __syncthreads();C32 acc=C32::Splat(0.f);
- for(uint g=0;g<8;++g)acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
+ for(uint g=0;g<8;++g){
+  if constexpr(F16ACT)acc.MultiplyAccumulate(AF::Load(hid,g*32*2,512),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
+  else acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
+ }
   for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens){u8 q=e4m3_byte(H(acc.Get(i)));if constexpr(F8OUT)out_f8[(first+rc.x)*512+group*64+wave*16+rc.y]=q;out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(q);}}
 }
 

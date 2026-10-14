@@ -22,7 +22,8 @@
 
 namespace dlss5 {
 
-template <uint NW>
+// F16ACT (DLSS5_F16_ACT): the probabilities as f16 (row stride 40 halves), no E4M3 rounding. NOT bit-exact.
+template <uint NW, bool F16ACT = false>
 __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, u8* out, uint tokens,
                                                                uint dim) {
     using namespace linalg;
@@ -32,7 +33,7 @@ __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, 
     // kv[b]: 32 keys x 32 bytes of K, then 32 keys x 32 bytes of V.
     __shared__ __attribute__((aligned(16))) u8 kv[2][2048];
     __shared__ __attribute__((aligned(16))) u8 qtile[NW][16 * 32];
-    __shared__ __attribute__((aligned(16))) u8 prob[NW][16 * 32];
+    __shared__ __attribute__((aligned(16))) u8 prob[NW][F16ACT ? 16 * 40 * 2 : 16 * 32];
     __shared__ float ex[NW][16 * 33];
     __shared__ float denom_s[NW][16];
 
@@ -89,7 +90,10 @@ __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, 
                               ? __half2float(__ushort_as_half(uint16_t((bits << 4) + 0x4000u)))
                               : 0.f;
                 ex[wave][rc.x * 33 + half * 16 + rc.y] = e;
-                prob[wave][rc.x * 32 + half * 16 + rc.y] = e4m3_byte(e);
+                if constexpr (F16ACT)
+                    reinterpret_cast<__half*>(prob[wave])[rc.x * 40 + half * 16 + rc.y] = __float2half_rn(e);
+                else
+                    prob[wave][rc.x * 32 + half * 16 + rc.y] = e4m3_byte(e);
             }
         }
         // ex/prob are this wave's own; a wave-level fence orders its LDS writes before the reads.
@@ -98,10 +102,17 @@ __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, 
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
         if (lane < 16)
             for (uint j = 0; j < 32; ++j) denom += ex[wave][lane * 33 + j];
-        A8 p = A8::Load(prob[wave], 0, 32);
         B8 v0 = B8::LoadRow(buf + 1024, 0, 32), v1 = B8::LoadRow(buf + 1024, 16, 32);
-        acc0.MultiplyAccumulate(p, v0);
-        acc1.MultiplyAccumulate(p, v1);
+        if constexpr (F16ACT) {
+            using AF = typename HiddenA<true>::type;
+            const AF p = AF::Load(prob[wave], 0, 80);
+            acc0.MultiplyAccumulate(p, v0);
+            acc1.MultiplyAccumulate(p, v1);
+        } else {
+            A8 p = A8::Load(prob[wave], 0, 32);
+            acc0.MultiplyAccumulate(p, v0);
+            acc1.MultiplyAccumulate(p, v1);
+        }
         // The next chunk rewrites ex/prob: all lanes must be done reading them.
         __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
         __builtin_amdgcn_wave_barrier();
