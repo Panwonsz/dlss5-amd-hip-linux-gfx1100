@@ -2,7 +2,11 @@ HIPCC ?= /opt/rocm/bin/hipcc
 ARCH ?= gfx1201
 INCLUDES := -Iinclude -I/opt/rocm/include
 LDFLAGS := -L/opt/rocm/lib -lamdhip64 -lhsa-runtime64 -Wl,-rpath,/opt/rocm/lib
-CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES)
+# Extra compiler flags for experiments, e.g. EXTRA_FLAGS=-mcumode (CU mode: each CU keeps its own half of
+# the WGP's LDS and caches; the default on gfx10+ is WGP mode). Part of the .flags stamp, so changing it
+# rebuilds everything.
+EXTRA_FLAGS ?=
+CXXFLAGS := -O3 -std=c++17 --offload-arch=$(ARCH) $(INCLUDES) $(EXTRA_FLAGS)
 BUILD ?= build
 
 # Every object depends on this stamp, which holds the exact compiler and flags. Without it, changing
