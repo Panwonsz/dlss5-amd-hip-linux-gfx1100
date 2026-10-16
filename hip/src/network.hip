@@ -43,7 +43,8 @@ std::vector<int> map_read(const std::string&p){
 struct StreamScope {hipStream_t old;explicit StreamScope(hipStream_t s):old(get_launch_stream()){set_launch_stream(s);}~StreamScope(){set_launch_stream(old);}};
 struct Scratch {
   DeviceBuf a,b,bh,ah,d,q,q8,att8,hidden,hidden8,d8,f8,out8,a8,out16,a16;
-  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3*(DLSS5_QKV16?2:1));att8.alloc(n);hidden.alloc(640ull*4096*4);hidden8.alloc(640ull*4096);d8.alloc(n);f8.alloc(n);out8.alloc(n);a8.alloc(n);out16.alloc(n*2);a16.alloc(n*2);}
+  DeviceBuf vit_a,vit_h,vit_b; // hip-37 ViT GEMM: E4M3-rounded input, expand activations, QKV input (f16)
+  void create(){const size_t n=size_t(W+8)*(Ht+8)*32;a.alloc(n*4);b.alloc(n*4);bh.alloc(n*2);ah.alloc(n*2);d.alloc(n*4);q.alloc(n*12);q8.alloc(n*3*(DLSS5_QKV16?2:1));att8.alloc(n);hidden.alloc(640ull*4096*4);hidden8.alloc(640ull*4096);d8.alloc(n);f8.alloc(n);out8.alloc(n);a8.alloc(n);out16.alloc(n*2);a16.alloc(n*2);vit_a.alloc(640ull*1024*2);vit_h.alloc(640ull*4096*2);vit_b.alloc(640ull*1024*2);}
 };
 // port 6a9040e: DLSS5_C32_FUSED=1 runs every C32 window block as one kernel (kernels/c32_fused.hip).
 // DLSS5_C32_CHECK=1 runs the split path (which the network keeps using) AND the fused kernel on the
@@ -235,6 +236,20 @@ struct Vit {
   qw=half_matrix(q.data(),3072,1024);qs=floats(q.data()+3145728,32);pw=upload_tiled_weights(o.data(),1024,1024);ps=floats(o.data()+1048576,1024);
  }
   void run(const float* in,float* out,Scratch&s){
+   if(dlss5_vit_gemm()){
+    // hip-37 (kernels/vit_gemm.hip): same numbers, 64x64 GEMM tiles. s.hidden holds the four
+    // contract/projection K partitions (4 x 640 x 1024 f32 = its exact size).
+    launch_vit_quant_in(in,s.vit_a.as<__half>(),640*1024);
+    launch_vit_gemm(0,s.vit_a.p,ex.p,nullptr,s.vit_h.as<__half>(),640,4096,1024,1);
+    launch_vit_gemm(1,s.vit_h.p,ct.p,s.hidden.as<float>(),nullptr,640,1024,4096,4);
+    launch_vit_reduce(s.hidden.as<float>(),in,cs.as<float>(),s.b.as<float>(),s.vit_b.as<__half>(),640,1024);
+    launch_vit_gemm(3,s.vit_b.p,qw.p,s.q.as<float>(),nullptr,640,3072,1024,1);
+    launch_normalize_qkv(s.q.as<float>(),qs.as<float>(),s.q8.as<u8>(),640,1024,5.65625f);
+    launch_vit_attention_f8(s.q8.as<u8>(),s.att8.as<u8>(),640,1024);
+    launch_vit_gemm(2,s.att8.p,pw.p,s.hidden.as<float>(),nullptr,640,1024,1024,4);
+    launch_vit_reduce(s.hidden.as<float>(),s.b.as<float>(),ps.as<float>(),out,nullptr,640,1024);
+    return;
+   }
    // The expand output is already on the E4M3 grid; keeping the bytes lets the
    // contract GEMM consume them directly (e4m3_byte(from_e4m3(q)) == q).
    launch_linear_f32_f8out(in,ex.as<u8>(),s.hidden.as<float>(),s.hidden8.as<u8>(),640,4096,1024,nullptr,nullptr,2,0);

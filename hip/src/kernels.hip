@@ -18,6 +18,7 @@
 #include "../kernels/fused.hip"
 #include "../kernels/ops.hip"
 #include "../kernels/linear_splitk.hip"
+#include "../kernels/vit_gemm.hip"
 #include "../kernels/vit_attention_mw.hip"
 #include "../kernels/c32_fused.hip"
 #include "../kernels/c32_f16act.hip"
@@ -843,6 +844,38 @@ void launch_linear_half_h(const float* in,const __half* w,float* out,__half* out
 void launch_linear_half_hin(const __half* in,const __half* w,float* out,__half* out_h,uint m,uint n,uint k,uint parts,int ordered,int raw){
   if(!m||!n||!k||n%16||k%32||!parts||(k/32)%parts||!in||raw<0||raw>2)throw std::runtime_error("half linear f16-in geometry/alias");
   LAUNCH((k_linear_half<true>),dim3((m+15)/16,n/16),32,reinterpret_cast<const float*>(in),w,out,m,n,k,parts,ordered,raw,out_h);
+}
+// ---- hip-37: ViT linears as one 64x64 register-blocked GEMM (kernels/vit_gemm.hip), bit-identical ----
+// Default ON; DLSS5_VIT_GEMM=0 (exactly "0") runs the previous kernels, for timing.
+bool dlss5_vit_gemm() {
+    static const bool on = [] { const char* e = std::getenv("DLSS5_VIT_GEMM"); return !(e && e[0] == '0' && !e[1]); }();
+    return on && dlss5_w16();
+}
+void launch_vit_quant_in(const float* in, __half* out, uint count) {
+    if (!in || !out || !count || count % 4) throw std::runtime_error("vit quant extent");
+    LAUNCH(k_vit_quant_in, (count / 4 + 255) / 256, 256, in, out, count / 4);
+}
+// kind: 0 expand (f16 A -> f16 E4M3 activations), 1 contract (f16 A -> partials), 2 projection (E4M3 A
+// -> partials), 3 QKV (genuine f16 A and weights -> raw f32).
+void launch_vit_gemm(int kind, const void* a, const void* w, float* out, __half* out_h, uint m, uint n,
+                     uint k, uint parts) {
+    if (!a || !w || !m || !n || !k || !parts || m % 64 || n % 64 || k % (32 * parts) ||
+        (kind == 0 && (!out_h || parts != 1)) || (kind == 3 && (!out || parts != 1)) ||
+        ((kind == 1 || kind == 2) && (!out || parts != 4)) || kind < 0 || kind > 3)
+        throw std::runtime_error("vit gemm geometry");
+    const dim3 grid(m / 64, n / 64, parts);
+    switch (kind) {
+    case 0: LAUNCH((k_vit_gemm<0, 1>), grid, 128, a, w, out, out_h, m, n, k); break;
+    case 1: LAUNCH((k_vit_gemm<0, 0>), grid, 128, a, w, out, out_h, m, n, k); break;
+    case 2: LAUNCH((k_vit_gemm<1, 0>), grid, 128, a, w, out, out_h, m, n, k); break;
+    default: LAUNCH((k_vit_gemm<2, 2>), grid, 128, a, w, out, out_h, m, n, k); break;
+    }
+}
+void launch_vit_reduce(const float* parts, const float* residual, const float* scales, float* out,
+                       __half* out_h, uint m, uint n) {
+    if (!parts || !out || !m || !n || (residual && !scales) || residual == out)
+        throw std::runtime_error("vit reduce extent/alias");
+    LAUNCH(k_vit_reduce, (m * n + 255) / 256, 256, parts, residual, scales, out, out_h, m, n);
 }
 void launch_split_f32(const float* in,const u8* pre,const u8* ex,const u8* ct,float* out,uint n){
   if(!n||in==out)throw std::runtime_error("split geometry/alias");LAUNCH((k_split_f32<false>),dim3((n+15)/16,8),128,in,pre,ex,ct,out,nullptr,n);

@@ -172,6 +172,13 @@ hipStream_t get_launch_stream();
 void launch_linear_half(const float*,const __half*,float*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
 void launch_linear_half_h(const float*,const __half*,float*,__half*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
 void launch_linear_half_hin(const __half*,const __half*,float*,__half*,uint m,uint n,uint k,uint partitions,int ordered,int raw);
+// hip-37: ViT linears as one register-blocked GEMM (kernels/vit_gemm.hip). Bit-identical; DLSS5_VIT_GEMM=0 = old path.
+bool dlss5_vit_gemm();
+void launch_vit_quant_in(const float* in, __half* out, uint count);
+void launch_vit_gemm(int kind, const void* a, const void* w, float* out, __half* out_h, uint m, uint n,
+                     uint k, uint parts);
+void launch_vit_reduce(const float* parts, const float* residual, const float* scales, float* out,
+                       __half* out_h, uint m, uint n);
 void launch_split_f32(const float*,const u8*,const u8*,const u8*,float*,uint tokens);
 void launch_rgb_graph(const float*,float*,float*,uint w,uint h,uint ow,uint oh);
 void launch_gather_f32(const float*,const int*,float*,uint n);
