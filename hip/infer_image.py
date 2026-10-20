@@ -78,7 +78,12 @@ def main(argv=None):
         mode = manifest.get('layout_mode')
         if mode == 'amd-consumer-derived' and not args.allow_derived_layouts:
             p.error('Reconstructed cache requires --allow-derived-layouts')
-        validate_cache(weights, **({'layout_mode': mode} if mode else {}))
+        if (weights / 'model-small.txt').is_file():
+            # hip-40: convert_310916.py's cache (small model); its own table set, not 310.8.0's.
+            if manifest.get('source_sha256') != '2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f':
+                p.error('model-small.txt without a 310.9.16 manifest')
+        else:
+            validate_cache(weights, **({'layout_mode': mode} if mode else {}))
     image = Image.open(args.input).convert('RGBA')
     if image.size != (1920, 1080):
         p.error('This port requires a 1920x1080 image; no implicit rescaling')

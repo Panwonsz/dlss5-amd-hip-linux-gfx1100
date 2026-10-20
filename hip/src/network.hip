@@ -274,6 +274,10 @@ struct Network70::Impl {
  DeviceBuf rgb,color,tiles,history,prefix_w,head_w,post_sc,head_rgb,map,inv;
  DeviceBuf raster[2],skip[6],out,trace_stats,trace_bits,ds[4],full_h;
  std::array<Block,71> blocks;Vit vit[8];Up up[5];Scratch s;
+ // hip-40: block topology. The 310.8.0 model uses all 71 blocks; nvngx_dlssnr 310.9.16's new (small) model
+ // uses the same layer types with two Swin blocks per level and side, stored under the ids of the old blocks
+ // that play the same role (linux/dlssnr/convert_310916.py writes model-small.txt into such a weights dir).
+ bool small=false;std::vector<int> enc_ids[5],dec_ids[5];std::array<bool,71> used{};
  std::array<uint,71> counts{};std::array<Trace,71> trace{};
  ~Impl(){if(stream)(void)hipStreamSynchronize(stream);if(ev0)(void)hipEventDestroy(ev0);if(ev1)(void)hipEventDestroy(ev1);if(stream)(void)hipStreamDestroy(stream);}
  void create(const std::string&dir){
@@ -282,12 +286,23 @@ struct Network70::Impl {
   for(size_t i=0;i<fwd.size();++i)if(back[fwd[i]]!=int(i))throw std::runtime_error("ViT maps not inverse");
   map.alloc(fwd.size()*4);map.upload(fwd.data(),fwd.size()*4);inv.alloc(back.size()*4);inv.upload(back.data(),back.size()*4);
   const uint shift[]={0,3,1,2,0,3,1,2};
+  small=std::filesystem::exists(dir+"/model-small.txt");
+  const uint gc[5]={32,64,128,256,512},gw[5]={960,480,240,120,60},gh[5]={576,288,144,72,36};
+  if(small){
+   // Shifts from the small model's frame plan: encoder blocks 0,3 per level, decoder blocks 1,2.
+   const int e[5][2]={{1,4},{5,8},{9,14},{15,22},{23,30}},d[5][2]={{40,47},{48,55},{56,61},{62,65},{66,69}};
+   for(int g=0;g<5;++g){enc_ids[g]={e[g][0],e[g][1]};dec_ids[4-g]={d[4-g][0],d[4-g][1]};}
+  }else{
+   const int ef[5]={1,5,9,15,23},en[5]={4,4,6,8,8},df[5]={40,48,56,62,66},dn[5]={8,8,6,4,4};
+   for(int g=0;g<5;++g){for(int i=0;i<en[g];++i)enc_ids[g].push_back(ef[g]+i);for(int i=0;i<dn[g];++i)dec_ids[g].push_back(df[g]+i);}
+  }
+  used.fill(false);used[0]=used[39]=used[70]=true;for(int i=31;i<39;++i)used[i]=true;
   blocks[0].create(dir,0,32,W,Ht,0,true);
-  auto group=[&](int first,int count,uint c,uint w,uint h,bool enc){for(int i=0;i<count;++i)blocks[first+i].create(dir,first+i,c,w,h,shift[i],c==32||(enc&&i==count-1));};
-  group(1,4,32,960,576,true);group(5,4,64,480,288,true);group(9,6,128,240,144,true);group(15,8,256,120,72,true);group(23,8,512,60,36,true);
-  group(40,8,512,60,36,false);group(48,8,256,120,72,false);
-  for(int i=0;i<6;++i)blocks[56+i].create(dir,56+i,128,240,144,shift[(i+2)%4],false);
-  group(62,4,64,480,288,false);group(66,4,32,960,576,false);blocks[70].create(dir,70,32,W,Ht,3,true);
+  for(int g=0;g<5;++g){const auto&v=enc_ids[g];for(size_t i=0;i<v.size();++i){used[v[i]]=true;
+   blocks[v[i]].create(dir,v[i],gc[g],gw[g],gh[g],small?(i?3u:0u):shift[i],gc[g]==32||i+1==v.size());}}
+  for(int g=0;g<5;++g){const auto&v=dec_ids[g];const uint c=gc[4-g],w=gw[4-g],h=gh[4-g];for(size_t i=0;i<v.size();++i){used[v[i]]=true;
+   blocks[v[i]].create(dir,v[i],c,w,h,small?(i?2u:1u):(c==128?shift[(i+2)%4]:shift[i]),c==32);}}
+  blocks[70].create(dir,70,32,W,Ht,3,true);
   for(int i=0;i<8;++i)vit[i].create(dir,31+i);
   auto prefix=load(dir,"block0-ffn",8736);prefix_w=floats(prefix.data(),512);
   int ids[]={4,8,14,22};for(int i=0;i<4;++i){uint c=32u<<i;auto v=load(dir,"block"+std::to_string(ids[i])+"-ds",2ull*c*c);ds[i]=half_matrix(v.data(),2*c,c);}
@@ -340,15 +355,16 @@ struct Network70::Impl {
   float* src=raster[0].as<float>();float* dst=raster[1].as<float>();
   if(io16)launch_pool_hin(full_h.as<__half>(),s.out16.as<__half>(),W,Ht,32,960,576);
   else launch_pool_f32_h(skip[0].as<float>(),nullptr,s.out16.as<__half>(),W,Ht,32,960,576);
-  const int first[]={1,5,9,15,23},num[]={4,4,6,8,8};uint w=960,h=576,c=32;
+  uint w=960,h=576,c=32;
   const __half* group_in_h=s.out16.as<__half>();
    for(int g=0;g<5;++g){
    const u8* in_f8=nullptr; const __half* in_h=group_in_h;
    // io16: the group's last block writes skip[g+1] itself; src then points at it, dst at that
    // block's input, and `spare` is the raster buffer that would have been dst.
    float* spare=nullptr;
-   for(int j=0;j<num[g];++j){int id=first[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==num[g];
-    const bool to_skip=io16&&j+1==num[g];float* target=to_skip?skip[g+1].as<float>():dst;
+   const int ng=int(enc_ids[g].size());
+   for(int j=0;j<ng;++j){int id=enc_ids[g][j];auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==ng;
+    const bool to_skip=io16&&j+1==ng;float* target=to_skip?skip[g+1].as<float>():dst;
     b.run(src,target,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);
     if(to_skip){spare=dst;dst=src;src=target;}else std::swap(src,dst);
     mark(id,src,w*h*c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}
@@ -364,10 +380,10 @@ struct Network70::Impl {
   launch_gather_f32(src,inv.as<int>(),dst,655360);std::swap(src,dst);
   up[0].run(src,skip[5].as<float>(),tracing?dst:nullptr,s,s.out16.as<__half>());std::swap(src,dst);mark(39,src,60*36*512);
   const __half* dec_group_in_h=s.out16.as<__half>();
-   const int decfirst[]={40,48,56,62,66},decnum[]={8,8,6,4,4};
    for(int g=0;g<5;++g){if(g){up[g].run(src,skip[5-g].as<float>(),nullptr,s,s.out16.as<__half>());std::swap(src,dst);dec_group_in_h=s.out16.as<__half>();}
     const u8* in_f8=nullptr; const __half* in_h=dec_group_in_h;
-    for(int j=0;j<decnum[g];++j){int id=decfirst[g]+j;auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==decnum[g];b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
+    const int nd=int(dec_ids[g].size());
+    for(int j=0;j<nd;++j){int id=dec_ids[g][j];auto&b=blocks[id];bool emit_f8=!b.raw&&b.c>=64;bool emit_h=b.c==32;bool write_f32=tracing||j+1==nd;b.run(src,dst,s,in_f8,emit_f8,in_h,emit_h,write_f32,false);std::swap(src,dst);mark(id,src,b.w*b.h*b.c);in_f8=emit_f8?s.out8.as<u8>():nullptr;in_h=emit_h?s.out16.as<__half>():nullptr;}}
   // The merge emits ONLY f16. Block 70 is entered with in_h set, so Block::run takes the use_h path
   // and window()'s c==32 branch reads in_h alone -- the f32 raster this used to write was handed to
   // run() as `in` and never touched. The `in` argument is nullptr rather than a stale buffer on
@@ -393,10 +409,10 @@ struct Network70::Impl {
   hip_check(hipGetLastError(),"network launches");hip_check(hipEventRecord(ev1,stream),"end");
   hip_check(hipMemcpyAsync(output,out.p,size_t(N)*12,hipMemcpyDefault,stream),"output download");hip_check(hipStreamSynchronize(stream),"network completion");hip_check(hipEventElapsedTime(&gpu_ms,ev0,ev1),"GPU elapsed");
   if(timing){double total=std::chrono::duration<double,std::milli>(clk::now()-t_start).count();
-   for(int b=0;b<71;++b)std::fprintf(stderr,"time block=%02d ms=%.1f\n",b,block_ms[b]);
+   for(int b=0;b<71;++b)if(used[b])std::fprintf(stderr,"time block=%02d ms=%.1f\n",b,block_ms[b]);
    std::fprintf(stderr,"time total_ms=%.1f (head+download after block 70 included)\n",total);}
   if(tracing){std::vector<float> stats(71*768);std::vector<uint> bits(71*512);trace_stats.download(stats.data(),stats.size()*4);trace_bits.download(bits.data(),bits.size()*4);
-   bool bad=false;for(int b=0;b<71;++b){auto&t=trace[b];t.minimum=INFINITY;t.maximum=-INFINITY;t.checked=true;
+   bool bad=false;for(int b=0;b<71;++b){if(!used[b])continue;auto&t=trace[b];t.minimum=INFINITY;t.maximum=-INFINITY;t.checked=true;
     for(int l=0;l<256;++l){t.minimum=std::min(t.minimum,stats[b*768+l*3]);t.maximum=std::max(t.maximum,stats[b*768+l*3+1]);t.sum+=stats[b*768+l*3+2];t.nonfinite+=bits[b*512+l*2];t.hash^=bits[b*512+l*2+1];}
     std::fprintf(stderr,"graph block=%02d count=%u n=%u nonfinite=%u min=%.9g max=%.9g sum=%.12g hash=%08x\n",b,counts[b],t.elements,t.nonfinite,t.minimum,t.maximum,t.sum,t.hash);bad|=t.nonfinite!=0||counts[b]!=1;}
    if(bad)throw std::runtime_error("nonfinite/incomplete graph trace");

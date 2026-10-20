@@ -95,13 +95,16 @@ int main(int argc,char** argv) {
     std::vector<float> out(1920ull*1152*3),first;
     for(uint r=0;r<runs;++r) {
         double t=now_ms();net.run(rgb.data(),out.data(),seed);double host=now_ms()-t;
-        auto counts=net.last_block_counts();for(uint b=0;b<71;++b)if(counts[b]!=1)throw std::runtime_error("missing/repeated block "+std::to_string(b));
+        // hip-40: the small model (model-small.txt) runs 31 of the 71 block slots, each once.
+        const bool small_model=std::filesystem::exists(weights+"/model-small.txt");uint nblocks=0;
+        auto counts=net.last_block_counts();for(uint b=0;b<71;++b){if(counts[b]>1||(!small_model&&counts[b]!=1))throw std::runtime_error("missing/repeated block "+std::to_string(b));nblocks+=counts[b];}
+        if(nblocks!=(small_model?31u:71u))throw std::runtime_error("wrong block count "+std::to_string(nblocks));
         double sum=0,delta=0;float mn=INFINITY,mx=-INFINITY;size_t changed=0;
         for(size_t p=0;p<1920ull*1080;++p)for(uint c=0;c<3;++c){float v=out[p*3+c];if(!std::isfinite(v))throw std::runtime_error("nonfinite RGB output");
             mn=std::min(mn,v);mx=std::max(mx,v);sum+=v;delta+=std::fabs(double(v)-rgb[p*4+c]);changed+=v!=rgb[p*4+c];}
         bool replay=r==0||out==first;if(!replay)throw std::runtime_error("same input/seed produced different output");if(r==0)first=out;
-        std::printf("network71 run=%u seed=%u host_ms=%.3f gpu_ms=%.3f blocks=71 finite=1 replay=1 min=%g max=%g mean=%.7f mean_abs_change=%.7f changed=%zu\n",
-                    r,seed,host,net.last_gpu_ms(),mn,mx,sum/(1920*1080*3),delta/(1920*1080*3),changed);
+        std::printf("network71 run=%u seed=%u host_ms=%.3f gpu_ms=%.3f blocks=%u finite=1 replay=1 min=%g max=%g mean=%.7f mean_abs_change=%.7f changed=%zu\n",
+                    r,seed,host,net.last_gpu_ms(),nblocks,mn,mx,sum/(1920*1080*3),delta/(1920*1080*3),changed);
     }
     if(!output.empty()) {
         std::ofstream f(output,std::ios::binary);f.write((const char*)out.data(),1920ull*1080*3*4);f.close();

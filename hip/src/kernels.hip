@@ -679,16 +679,30 @@ void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, 
     }
 }
 
+// DLSS5_STYLE=0|1|2: NGX's Style. Default 0, NVIDIA's default and what its reference images use
+// (310.9.16 small model 49.35 dB vs NVIDIA at Style 0). Before 2026-10-20 this port always ran
+// Style 1; DLSS5_STYLE=1 reproduces those outputs bit for bit.
+static float prefix_style() {
+    static const float style = [] {
+        const char* v = std::getenv("DLSS5_STYLE");
+        if (!v || !*v) return 0.f;
+        if ((v[0] < '0' || v[0] > '2') || v[1]) throw std::runtime_error("DLSS5_STYLE must be 0, 1 or 2");
+        return float(v[0] - '0') / 128.f;
+    }();
+    return style;
+}
+
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,
                     uint width, uint height, uint temporal_on) {
     uint tokens = width * height;
-    LAUNCH(k_prefix, (tokens + 15) / 16, 32, in, w, temporal, out, seed, width, height, temporal_on);
+    LAUNCH(k_prefix, (tokens + 15) / 16, 32, in, w, temporal, out, seed, width, height, temporal_on,
+           (__half*)nullptr, prefix_style());
 }
 void launch_prefix_h(const float* in, const float* w, const float* temporal, float* out,
                      __half* out_h, uint seed, uint width, uint height, uint temporal_on) {
     uint tokens = width * height;
     LAUNCH(k_prefix, (tokens + 15) / 16, 32, in, w, temporal, out, seed, width, height,
-            temporal_on, out_h);
+            temporal_on, out_h, prefix_style());
 }
 
 void launch_gemm_tiled(const u8* a, const u8* b, u8* c, uint M, uint N, uint K, int activate) {

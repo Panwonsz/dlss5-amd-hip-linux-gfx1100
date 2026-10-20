@@ -6,7 +6,7 @@ namespace dlss5 {
 
 __global__ void k_prefix(const float* input, const float* weights, const float* temporal_rgb,
                          float* output, uint seed, uint width, uint height, uint temporal,
-                         __half* output_h = nullptr) {
+                         __half* output_h = nullptr, float style = 0.f) {
     using namespace linalg;
     const uint t = threadIdx.x;
     const uint first = (blockIdx.x + blockIdx.y * 65535u) * 16u;
@@ -40,7 +40,8 @@ __global__ void k_prefix(const float* input, const float* weights, const float* 
         float r = H(H(H(input[p * 4]) - 0.5f) * 0.125f);
         float g = H(H(H(input[p * 4 + 1]) - 0.5f) * 0.125f);
         float bl = H(H(H(input[p * 4 + 2]) - 0.5f) * 0.125f);
-        float features[16] = {g1, g2, g, bl, g0, 1, 0.0078125f, 1, r, g, 1, 1, bl, r, 1, 0};
+        // Slot 6 is NGX's Style control as Style/128 (DLSSNR-AMD's PushPreImage.style).
+        float features[16] = {g1, g2, g, bl, g0, 1, style, 1, r, g, 1, 1, bl, r, 1, 0};
         if (temporal) {
             float hx = temporal_rgb[(y * width + x) * 4 + 0];
             float hy = temporal_rgb[(y * width + x) * 4 + 1];
