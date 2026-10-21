@@ -39,9 +39,48 @@ constexpr bool kDecodeE4M3 = rocwmma::is_same_v<DataT, float8_t>;
 // matrix_a: lane l holds row (l & 15), columns base..base+7 with base = l >= 16 ? 8 : 0.
 // matrix_b (row_major and col_major fragments): lane l holds column (l & 15), rows base+i.
 enum FragKind { kFragA, kFragBRow, kFragBCol };
+// hip-45: the aligned, finite-only fill used by MatrixA::LoadFast / MatrixB::LoadColFast (A row-major or
+// B col-major: eight adjacent codes per lane). The caller guarantees 4-byte alignment; codes 0x7f/0xff
+// (NaN, produced only from a NaN input) decode to +-480 instead of NaN.
+__device__ inline u32 e4m3x2_to_half2_bits_finite(u32 X) {
+    typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
+    const u32 bits = ((X & 0x007f007fu) << 7) | ((X & 0x00800080u) << 8);
+    h2_t v = __builtin_bit_cast(h2_t, bits);
+    const h2_t k256 = {(_Float16)256.0f, (_Float16)256.0f};
+    v = v * k256;
+    return __builtin_bit_cast(u32, v);
+}
+template <typename Frag>
+__device__ inline void load_e4m3_fast(Frag& f, const u8* p, uint ldm) {
+    const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
+    const u32* q = reinterpret_cast<const u32*>(p + lead * ldm + base);
+    const u32 lo = q[0], hi = q[1];
+    const u32 a0 = e4m3x2_to_half2_bits_finite((lo & 0xffu) | ((lo << 8) & 0x00ff0000u));
+    const u32 a1 = e4m3x2_to_half2_bits_finite(((lo >> 16) & 0xffu) | ((lo >> 8) & 0x00ff0000u));
+    const u32 c0 = e4m3x2_to_half2_bits_finite((hi & 0xffu) | ((hi << 8) & 0x00ff0000u));
+    const u32 c1 = e4m3x2_to_half2_bits_finite(((hi >> 16) & 0xffu) | ((hi >> 8) & 0x00ff0000u));
+    f[0] = __ushort_as_half((unsigned short)(a0 & 0xffffu));
+    f[1] = __ushort_as_half((unsigned short)(a0 >> 16));
+    f[2] = __ushort_as_half((unsigned short)(a1 & 0xffffu));
+    f[3] = __ushort_as_half((unsigned short)(a1 >> 16));
+    f[4] = __ushort_as_half((unsigned short)(c0 & 0xffffu));
+    f[5] = __ushort_as_half((unsigned short)(c0 >> 16));
+    f[6] = __ushort_as_half((unsigned short)(c1 & 0xffffu));
+    f[7] = __ushort_as_half((unsigned short)(c1 >> 16));
+}
+// hip-46: load_e4m3's A / B-col fills through load_e4m3_fast (no alignment test, no NaN fix-up).
+#ifndef DLSS5_E4M3_LOAD_FAST
+#define DLSS5_E4M3_LOAD_FAST 1
+#endif
 template <typename Frag>
 __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) {
     const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
+#if DLSS5_E4M3_LOAD_FAST
+    if (kind != kFragBRow) {
+        load_e4m3_fast(f, p, ldm);
+        return;
+    }
+#endif
     if (kind == kFragBRow) {
         // memory element (r, c) = p[r * ldm + c]; r = base + i, c = lead
         for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(p[(base + i) * ldm + lead]);
@@ -88,35 +127,6 @@ __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) 
             for (uint i = 0; i < 8u; i++) f[i] = e4m3_to_half(q[i]);
         }
     }
-}
-// hip-45: the aligned, finite-only fill used by MatrixA::LoadFast / MatrixB::LoadColFast (A row-major or
-// B col-major: eight adjacent codes per lane). The caller guarantees 4-byte alignment; codes 0x7f/0xff
-// (NaN, produced only from a NaN input) decode to +-480 instead of NaN.
-__device__ inline u32 e4m3x2_to_half2_bits_finite(u32 X) {
-    typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
-    const u32 bits = ((X & 0x007f007fu) << 7) | ((X & 0x00800080u) << 8);
-    h2_t v = __builtin_bit_cast(h2_t, bits);
-    const h2_t k256 = {(_Float16)256.0f, (_Float16)256.0f};
-    v = v * k256;
-    return __builtin_bit_cast(u32, v);
-}
-template <typename Frag>
-__device__ inline void load_e4m3_fast(Frag& f, const u8* p, uint ldm) {
-    const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
-    const u32* q = reinterpret_cast<const u32*>(p + lead * ldm + base);
-    const u32 lo = q[0], hi = q[1];
-    const u32 a0 = e4m3x2_to_half2_bits_finite((lo & 0xffu) | ((lo << 8) & 0x00ff0000u));
-    const u32 a1 = e4m3x2_to_half2_bits_finite(((lo >> 16) & 0xffu) | ((lo >> 8) & 0x00ff0000u));
-    const u32 c0 = e4m3x2_to_half2_bits_finite((hi & 0xffu) | ((hi << 8) & 0x00ff0000u));
-    const u32 c1 = e4m3x2_to_half2_bits_finite(((hi >> 16) & 0xffu) | ((hi >> 8) & 0x00ff0000u));
-    f[0] = __ushort_as_half((unsigned short)(a0 & 0xffffu));
-    f[1] = __ushort_as_half((unsigned short)(a0 >> 16));
-    f[2] = __ushort_as_half((unsigned short)(a1 & 0xffffu));
-    f[3] = __ushort_as_half((unsigned short)(a1 >> 16));
-    f[4] = __ushort_as_half((unsigned short)(c0 & 0xffffu));
-    f[5] = __ushort_as_half((unsigned short)(c0 >> 16));
-    f[6] = __ushort_as_half((unsigned short)(c1 & 0xffffu));
-    f[7] = __ushort_as_half((unsigned short)(c1 >> 16));
 }
 #define DLSS5_LOAD_FRAG(frag, p, ldm, kind)                                              \
     do {                                                                                 \
