@@ -66,6 +66,20 @@ __device__ inline void c32f_wave_sync() {
 #ifndef DLSS5_C32_QKV_A1
 #define DLSS5_C32_QKV_A1 1
 #endif
+// hip-45: E4M3 activation fragments through LoadFast / LoadColFast (no alignment branch, no NaN fix-up;
+// bit-identical for finite activations). Every LDS offset and stride below is a multiple of 4:
+// PS 36, HS 132, p8 stride 64, VTS 68, offsets first*PS, g*32, k0, (64+k0)*PS, 128*PS, all from a
+// 16-byte-aligned base.
+#ifndef DLSS5_C32_FASTLOAD
+#define DLSS5_C32_FASTLOAD 1
+#endif
+#if DLSS5_C32_FASTLOAD
+#define C32_LOAD_A(T, ...) T::LoadFast(__VA_ARGS__)
+#define C32_LOAD_BCOL(T, ...) T::LoadColFast(__VA_ARGS__)
+#else
+#define C32_LOAD_A(T, ...) T::Load(__VA_ARGS__)
+#define C32_LOAD_BCOL(T, ...) T::LoadCol(__VA_ARGS__)
+#endif
 
 __device__ inline void c32f_block_sync() {
 #if defined(__HIP_DEVICE_COMPILE__) && DLSS5_C32_LDSBAR
@@ -178,7 +192,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
 
     // ---- FFN expand: 16 rows x 128 hidden per wave, ActivatePolyC32, E4M3 -----------------------
     {
-        const A8 a = A8::Load(packed + first * PS, 0, PS);
+        const A8 a = C32_LOAD_A(A8, packed + first * PS, 0, PS);
         if constexpr (DLSS5_C32_H16) {
             // Barrier 1b: hidden16 overlays packed, which the other waves may not have loaded yet.
             c32f_block_sync();
@@ -233,7 +247,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     for (uint g = 0; g < 4u; ++g) {
         using AH = typename HiddenA<DLSS5_C32_H16 != 0>::type;
         const AH a = DLSS5_C32_H16 ? AH::Load(hidden16, (first * HS16 + g * 32u) * 2u, HS16 * 2u)
-                                   : AH::Load(hidden + first * HS, g * 32u, HS);
+                                   : C32_LOAD_A(AH, hidden + first * HS, g * 32u, HS);
         const BT b0 = BT::LoadRow(ffn_w, 4096u * BSZ + (0u * 4u + g) * TILE, TSTR);
         const BT b1 = BT::LoadRow(ffn_w, 4096u * BSZ + (1u * 4u + g) * TILE, TSTR);
         acc0.MultiplyAccumulate(a, b0);
@@ -265,7 +279,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     u8* vt = packed + 128u * PS;
     u32 vreg[4] = {0u, 0u, 0u, 0u};  // 16 bytes: V channels c.y (bytes 0-7) and 16 + c.y (8-15)
 #if DLSS5_C32_QKV_A1
-    const A8 a_qkv = A8::Load(ffn8 + first * PS, 0, PS);
+    const A8 a_qkv = C32_LOAD_A(A8, ffn8 + first * PS, 0, PS);
 #endif
     for (uint part = 0; part < 3u; ++part) {
 #if DLSS5_C32_QKV_A1
@@ -366,9 +380,9 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
 
     // ---- window attention (k_window_attention<32>, direct_f8) ------------------------------------
     {
-        const A8 q = A8::Load(packed + first * PS, 0, PS);
+        const A8 q = C32_LOAD_A(A8, packed + first * PS, 0, PS);
         for (uint k0 = 0; k0 < 64u; k0 += 16u) {
-            const B8 k = B8::LoadCol(packed, (64u + k0) * PS, PS);
+            const B8 k = C32_LOAD_BCOL(B8, packed, (64u + k0) * PS, PS);
             const C32 s = Multiply(q, k);
             // hip-24 DLSS5_C32_BIASPK: the same 64x64 bias values, pre-packed so that each lane's eight
             // values for this 16x16 tile are contiguous (k_c32_bias_pack): 2 (f32) or 1 (f16, only when
@@ -436,11 +450,11 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     {
         C32 av0 = C32::Splat(0.f), av1 = C32::Splat(0.f);
         for (uint k0 = 0; k0 < 64u; k0 += 32u) {
-            const A8 p = A8::Load(p8, first * 64u + k0, 64);
+            const A8 p = C32_LOAD_A(A8, p8, first * 64u + k0, 64);
 #if DLSS5_C32_VT
             // B (token k, channel n) = vt[n * VTS + k]: the col-major fast path (two dwords per lane).
-            const B8 v0 = B8::LoadCol(vt, k0, VTS);
-            const B8 v1 = B8::LoadCol(vt + 16u * VTS, k0, VTS);
+            const B8 v0 = C32_LOAD_BCOL(B8, vt, k0, VTS);
+            const B8 v1 = C32_LOAD_BCOL(B8, vt + 16u * VTS, k0, VTS);
 #else
             const B8 v0 = B8::LoadRow(packed + (128u + k0) * PS, 0, PS);
             const B8 v1 = B8::LoadRow(packed + (128u + k0) * PS, 16u, PS);
@@ -464,7 +478,7 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
 
     // ---- projection (k_linear_f32 mode 4, HRID, HOUT[, HRAST]) -----------------------------------
     {
-        const A8 a = A8::Load(packed + first * PS, 0, PS);
+        const A8 a = C32_LOAD_A(A8, packed + first * PS, 0, PS);
         const BT b0 = BT::LoadRow(proj_w, 0u, TSTR);
         const BT b1 = BT::LoadRow(proj_w, TILE, TSTR);
         C32 p0 = C32::Splat(0.f), p1 = C32::Splat(0.f);

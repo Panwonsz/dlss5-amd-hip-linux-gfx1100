@@ -89,6 +89,35 @@ __device__ inline void load_e4m3(Frag& f, const u8* p, uint ldm, FragKind kind) 
         }
     }
 }
+// hip-45: the aligned, finite-only fill used by MatrixA::LoadFast / MatrixB::LoadColFast (A row-major or
+// B col-major: eight adjacent codes per lane). The caller guarantees 4-byte alignment; codes 0x7f/0xff
+// (NaN, produced only from a NaN input) decode to +-480 instead of NaN.
+__device__ inline u32 e4m3x2_to_half2_bits_finite(u32 X) {
+    typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
+    const u32 bits = ((X & 0x007f007fu) << 7) | ((X & 0x00800080u) << 8);
+    h2_t v = __builtin_bit_cast(h2_t, bits);
+    const h2_t k256 = {(_Float16)256.0f, (_Float16)256.0f};
+    v = v * k256;
+    return __builtin_bit_cast(u32, v);
+}
+template <typename Frag>
+__device__ inline void load_e4m3_fast(Frag& f, const u8* p, uint ldm) {
+    const uint l = threadIdx.x & 31u, lead = l & 15u, base = l >= 16u ? 8u : 0u;
+    const u32* q = reinterpret_cast<const u32*>(p + lead * ldm + base);
+    const u32 lo = q[0], hi = q[1];
+    const u32 a0 = e4m3x2_to_half2_bits_finite((lo & 0xffu) | ((lo << 8) & 0x00ff0000u));
+    const u32 a1 = e4m3x2_to_half2_bits_finite(((lo >> 16) & 0xffu) | ((lo >> 8) & 0x00ff0000u));
+    const u32 c0 = e4m3x2_to_half2_bits_finite((hi & 0xffu) | ((hi << 8) & 0x00ff0000u));
+    const u32 c1 = e4m3x2_to_half2_bits_finite(((hi >> 16) & 0xffu) | ((hi >> 8) & 0x00ff0000u));
+    f[0] = __ushort_as_half((unsigned short)(a0 & 0xffffu));
+    f[1] = __ushort_as_half((unsigned short)(a0 >> 16));
+    f[2] = __ushort_as_half((unsigned short)(a1 & 0xffffu));
+    f[3] = __ushort_as_half((unsigned short)(a1 >> 16));
+    f[4] = __ushort_as_half((unsigned short)(c0 & 0xffffu));
+    f[5] = __ushort_as_half((unsigned short)(c0 >> 16));
+    f[6] = __ushort_as_half((unsigned short)(c1 & 0xffffu));
+    f[7] = __ushort_as_half((unsigned short)(c1 >> 16));
+}
 #define DLSS5_LOAD_FRAG(frag, p, ldm, kind)                                              \
     do {                                                                                 \
         if constexpr (kDecodeE4M3<DataT>)                                                \
@@ -132,6 +161,20 @@ struct MatrixA {
         DLSS5_LOAD_FRAG(a.k1, p + 16, ldm, kFragA);
         return a;
     }
+    // hip-45: Load for 4-byte-aligned, finite E4M3 activations (see load_e4m3_fast); Load otherwise.
+    template <typename Ptr>
+    __device__ static MatrixA LoadFast(Ptr buf, uint byte_off, uint stride_bytes) {
+#if DLSS5_GFX11
+        if constexpr (kDecodeE4M3<DataT>) {
+            const u8* p = reinterpret_cast<const u8*>(buf) + byte_off;
+            MatrixA a;
+            load_e4m3_fast(a.k0, p, stride_bytes);
+            load_e4m3_fast(a.k1, p + 16, stride_bytes);
+            return a;
+        }
+#endif
+        return Load(buf, byte_off, stride_bytes);
+    }
 };
 
 template <typename DataT>
@@ -160,6 +203,21 @@ struct MatrixB {
         DLSS5_LOAD_FRAG(b.k0c, p, ldm, kFragBCol);
         DLSS5_LOAD_FRAG(b.k1c, p + 16, ldm, kFragBCol);
         return b;
+    }
+    // hip-45: LoadCol for 4-byte-aligned, finite E4M3 activations (see load_e4m3_fast).
+    template <typename Ptr>
+    __device__ static MatrixB LoadColFast(Ptr buf, uint byte_off, uint stride_bytes) {
+#if DLSS5_GFX11
+        if constexpr (kDecodeE4M3<DataT>) {
+            const u8* p = reinterpret_cast<const u8*>(buf) + byte_off;
+            MatrixB b;
+            b.row = false;
+            load_e4m3_fast(b.k0c, p, stride_bytes);
+            load_e4m3_fast(b.k1c, p + 16, stride_bytes);
+            return b;
+        }
+#endif
+        return LoadCol(buf, byte_off, stride_bytes);
     }
 };
 
