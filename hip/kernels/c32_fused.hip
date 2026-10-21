@@ -59,6 +59,13 @@ __device__ inline void c32f_wave_sync() {
 #ifndef DLSS5_C32_H16_STRIDE
 #define DLSS5_C32_H16_STRIDE 136
 #endif
+// hip-44 (see the file header of hip-44-c32-vt.py): V transposed for PV, and one QKV A load.
+#ifndef DLSS5_C32_VT
+#define DLSS5_C32_VT 1
+#endif
+#ifndef DLSS5_C32_QKV_A1
+#define DLSS5_C32_QKV_A1 1
+#endif
 
 __device__ inline void c32f_block_sync() {
 #if defined(__HIP_DEVICE_COMPILE__) && DLSS5_C32_LDSBAR
@@ -252,8 +259,20 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     c32f_wave_sync();
 
     // ---- QKV GEMM + Q/K RMS (k_qkv_norm_f32<32,3> numerics); V raw E4M3 --------------------------
+    // DLSS5_C32_VT: V's E4M3 bytes stay in registers until barrier 3, then go to vt (channel-major).
+    constexpr uint VTS = 68u;  // vt row stride (bytes): 64 tokens + 4, dword aligned
+    static_assert(32u * VTS <= 64u * PS, "vt fits in the ffn8 / V rows");
+    u8* vt = packed + 128u * PS;
+    u32 vreg[4] = {0u, 0u, 0u, 0u};  // 16 bytes: V channels c.y (bytes 0-7) and 16 + c.y (8-15)
+#if DLSS5_C32_QKV_A1
+    const A8 a_qkv = A8::Load(ffn8 + first * PS, 0, PS);
+#endif
     for (uint part = 0; part < 3u; ++part) {
+#if DLSS5_C32_QKV_A1
+        const A8& a = a_qkv;
+#else
         const A8 a = A8::Load(ffn8 + first * PS, 0, PS);
+#endif
         const BT b0 = BT::LoadRow(qkv_w, (part * 2u + 0u) * TILE, TSTR);
         const BT b1 = BT::LoadRow(qkv_w, (part * 2u + 1u) * TILE, TSTR);
         C32 q0 = C32::Splat(0.f), q1 = C32::Splat(0.f);
@@ -315,8 +334,13 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
             // this wave's own ffn8 rows, already consumed into `a`.
             for (uint i = 0; i < q0.Length(); ++i) {
                 const uint2 c = q0.GetCoordinate(i);
+#if DLSS5_C32_VT
+                vreg[i / 4u] |= u32(e4m3_byte(q0.Get(i))) << ((i % 4u) * 8u);
+                vreg[2u + i / 4u] |= u32(e4m3_byte(q1.Get(i))) << ((i % 4u) * 8u);
+#else
                 packed[(128u + first + c.x) * PS + c.y] = e4m3_byte(q0.Get(i));
                 packed[(128u + first + c.x) * PS + 16u + c.y] = e4m3_byte(q1.Get(i));
+#endif
                 if (dbg_q8) {
                     const size_t o = (size_t(window) * 64u + first + c.x) * 96u + 64u;
                     dbg_q8[o + c.y] = e4m3_byte(q0.Get(i));
@@ -327,6 +351,18 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
     }
     // Barrier 3: QK reads every wave's K rows, PV every wave's V rows; scores overwrite raw.
     c32f_block_sync();
+#if DLSS5_C32_VT
+    // Every wave has loaded its ffn8 rows (before barrier 3), so the region is free. vt[ch][token]; read
+    // by PV only after barrier 4. QK / softmax touch rows 0-127 and the scratch block, not this.
+    {
+        const C32 t = C32::Splat(0.f);
+        for (uint i = 0; i < t.Length(); ++i) {
+            const uint2 c = t.GetCoordinate(i);
+            vt[c.y * VTS + first + c.x] = u8(vreg[i / 4u] >> ((i % 4u) * 8u));
+            vt[(16u + c.y) * VTS + first + c.x] = u8(vreg[2u + i / 4u] >> ((i % 4u) * 8u));
+        }
+    }
+#endif
 
     // ---- window attention (k_window_attention<32>, direct_f8) ------------------------------------
     {
@@ -401,8 +437,14 @@ __global__ void __launch_bounds__(128) k_c32_fused(const __half* in_h, const u8*
         C32 av0 = C32::Splat(0.f), av1 = C32::Splat(0.f);
         for (uint k0 = 0; k0 < 64u; k0 += 32u) {
             const A8 p = A8::Load(p8, first * 64u + k0, 64);
+#if DLSS5_C32_VT
+            // B (token k, channel n) = vt[n * VTS + k]: the col-major fast path (two dwords per lane).
+            const B8 v0 = B8::LoadCol(vt, k0, VTS);
+            const B8 v1 = B8::LoadCol(vt + 16u * VTS, k0, VTS);
+#else
             const B8 v0 = B8::LoadRow(packed + (128u + k0) * PS, 0, PS);
             const B8 v1 = B8::LoadRow(packed + (128u + k0) * PS, 16u, PS);
+#endif
             av0.MultiplyAccumulate(p, v0);
             av1.MultiplyAccumulate(p, v1);
         }
