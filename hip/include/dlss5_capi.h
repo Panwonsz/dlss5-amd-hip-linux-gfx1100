@@ -114,6 +114,17 @@ DLSS5_CAPI_EXPORT int dlss5_run_shared(void *in_handle, void *out_handle, unsign
                                        dlss5_u32 generation, dlss5_u32 format, dlss5_u32 pitch, dlss5_u32 seed,
                                        const void *verify_in);
 
+/* Runtime controls (2026-10-21). dlss5_set_style: NGX's DLSSNR.Style, 0 (default), 1 or 2, for every
+   following run until changed; returns 0, or -1 for another value. Until the first call the library
+   uses DLSS5_STYLE (unset = 0). Callers resolve it optionally; older libraries lack it. */
+#define DLSS5_HIP_CONTROL_MAGIC 0x3650494853534C44ULL /* "DLSSHIP6" */
+#define DLSS5_HIP_CONTROL_ENV "DLSS5_HIP_CONTROL_BRIDGE"
+typedef struct Dlss5HipControlBridge {
+    unsigned long long magic;
+    int (*set_style)(dlss5_u32 style);
+} Dlss5HipControlBridge;
+DLSS5_CAPI_EXPORT int dlss5_set_style(dlss5_u32 style);
+
 #ifdef __cplusplus
 }
 #endif

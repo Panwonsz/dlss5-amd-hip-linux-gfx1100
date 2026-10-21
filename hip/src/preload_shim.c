@@ -31,6 +31,7 @@ typedef int (*find_fn)(const char *);
 typedef int (*staged_fn)(const void *, void *, dlss5_u32, dlss5_u32, dlss5_u32);
 typedef double (*gpu_ms_fn)(void);
 typedef int (*import_fn)(void *, unsigned long long, dlss5_u32);
+typedef int (*style_fn)(dlss5_u32);
 typedef int (*shared_fn)(void *, void *, unsigned long long, dlss5_u32, dlss5_u32, dlss5_u32, dlss5_u32, const void *);
 
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -45,6 +46,7 @@ static staged_fn r_staged;
 static gpu_ms_fn r_gpu_ms;
 static import_fn r_import;
 static shared_fn r_shared;
+static style_fn r_style;
 static char g_error[1024];
 
 static Dlss5HipBridge g_bridge;
@@ -52,6 +54,7 @@ static Dlss5HipFrameBridge g_frame_bridge;
 static Dlss5HipDeviceBridge g_device_bridge;
 static Dlss5HipStagedBridge g_staged_bridge;
 static Dlss5HipSharedBridge g_shared_bridge;
+static Dlss5HipControlBridge g_control_bridge;
 
 static int load(void) {
     int ok;
@@ -85,6 +88,7 @@ static int load(void) {
             r_gpu_ms = (gpu_ms_fn)dlsym(h, "dlss5_last_gpu_ms");
             r_import = (import_fn)dlsym(h, "dlss5_import_shared");
             r_shared = (shared_fn)dlsym(h, "dlss5_run_shared");
+            r_style = (style_fn)dlsym(h, "dlss5_set_style");
             if (!r_init || !r_run || !r_shutdown || !r_error)
                 snprintf(g_error, sizeof g_error, "preload shim: %s lacks the dlss5_* exports", path);
             else
@@ -157,6 +161,16 @@ static int s_run_shared(void *in, void *out, unsigned long long bytes, dlss5_u32
     return r_shared(in, out, bytes, gen, format, pitch, seed, verify);
 }
 
+static int s_set_style(dlss5_u32 style) {
+    if (!load())
+        return -1;
+    if (!r_style) {
+        snprintf(g_error, sizeof g_error, "preload shim: model library lacks dlss5_set_style (rebuild it)");
+        return -1;
+    }
+    return r_style(style);
+}
+
 static void publish(const char *name, void *table, unsigned long long *magic) {
     char buf[32];
     snprintf(buf, sizeof buf, "%p", table);
@@ -187,4 +201,7 @@ __attribute__((constructor)) static void dlss5_preload_publish(void) {
     g_shared_bridge.import_shared = s_import_shared;
     g_shared_bridge.run_shared = s_run_shared;
     publish(DLSS5_HIP_SHARED_ENV, &g_shared_bridge, &g_shared_bridge.magic);
+    g_control_bridge.magic = DLSS5_HIP_CONTROL_MAGIC;
+    g_control_bridge.set_style = s_set_style;
+    publish(DLSS5_HIP_CONTROL_ENV, &g_control_bridge, &g_control_bridge.magic);
 }

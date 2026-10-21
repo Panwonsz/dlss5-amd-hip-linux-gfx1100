@@ -45,6 +45,7 @@ struct StagedBuffers {
 static std::unique_ptr<StagedBuffers> g_staged;
 static Dlss5HipStagedBridge g_staged_bridge;
 static Dlss5HipSharedBridge g_shared_bridge;
+static Dlss5HipControlBridge g_control_bridge;
 // The network writes 1152 rows; the V1 caller wants the first 1080. Held here rather than allocated
 // per call, and released by dlss5_shutdown so an unload does not leave 25 MB behind.
 static std::vector<float> g_out1152;
@@ -243,6 +244,12 @@ extern "C" void dlss5_shutdown(void) {
 }
 
 extern "C" const char* dlss5_last_error(void) { return g_err.c_str(); }
+
+extern "C" int dlss5_set_style(dlss5_u32 style) {
+    if (style > 2) return set_err("dlss5_set_style: style must be 0, 1 or 2"), -1;
+    dlss5::set_prefix_style(int(style));
+    return 0;
+}
 
 extern "C" double dlss5_last_gpu_ms(void) {
     // The GPU interval of the last dlss5_run, as Network70's own events measured it. Subtracting it
@@ -505,4 +512,7 @@ __attribute__((constructor)) static void dlss5_hip_publish(void) {
     g_shared_bridge.magic=DLSS5_HIP_SHARED_MAGIC;g_shared_bridge.import_shared=dlss5_import_shared;g_shared_bridge.run_shared=dlss5_run_shared;
     snprintf(buf,sizeof(buf),"%p",(void*)&g_shared_bridge);
     if(setenv(DLSS5_HIP_SHARED_ENV,buf,1)!=0){g_shared_bridge.magic=0;(void)unsetenv(DLSS5_HIP_SHARED_ENV);}
+    g_control_bridge.magic=DLSS5_HIP_CONTROL_MAGIC;g_control_bridge.set_style=dlss5_set_style;
+    snprintf(buf,sizeof(buf),"%p",(void*)&g_control_bridge);
+    if(setenv(DLSS5_HIP_CONTROL_ENV,buf,1)!=0){g_control_bridge.magic=0;(void)unsetenv(DLSS5_HIP_CONTROL_ENV);}
 }

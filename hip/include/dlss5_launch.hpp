@@ -128,6 +128,8 @@ void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, 
                       bool splitrow = false);
 // hip-26: pack a block's heads x 64 x 64 window-attention bias in accumulator order (f32).
 void launch_attn_bias_pack(const float* bias, float* out, uint heads);
+// NGX Style for the prefix's slot 6 (0..2); -1 returns to DLSS5_STYLE / 0. Thread-safe.
+void set_prefix_style(int style);
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,
                    uint width, uint height, uint temporal_on);
 void launch_prefix_h(const float* in, const float* w, const float* temporal, float* out,

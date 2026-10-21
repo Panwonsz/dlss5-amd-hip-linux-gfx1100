@@ -1,4 +1,5 @@
 #include <cstdlib>
+#include <atomic>
 
 #define DLSS5_STR2(x) #x
 #define DLSS5_STR(x) DLSS5_STR2(x)
@@ -682,6 +683,9 @@ void launch_attention(int c, const u8* qkv, const float* bias, u8* out, uint w, 
 // DLSS5_STYLE=0|1|2: NGX's Style. Default 0, NVIDIA's default and what its reference images use
 // (310.9.16 small model 49.35 dB vs NVIDIA at Style 0). Before 2026-10-20 this port always ran
 // Style 1; DLSS5_STYLE=1 reproduces those outputs bit for bit.
+// dlss5_set_style (hip-42) overrides it at runtime; -1 = no override.
+static std::atomic<int> g_style_override{-1};
+void set_prefix_style(int style) { g_style_override.store(style >= 0 && style <= 2 ? style : -1); }
 static float prefix_style() {
     static const float style = [] {
         const char* v = std::getenv("DLSS5_STYLE");
@@ -689,7 +693,8 @@ static float prefix_style() {
         if ((v[0] < '0' || v[0] > '2') || v[1]) throw std::runtime_error("DLSS5_STYLE must be 0, 1 or 2");
         return float(v[0] - '0') / 128.f;
     }();
-    return style;
+    const int set = g_style_override.load();
+    return set >= 0 ? float(set) / 128.f : style;
 }
 
 void launch_prefix(const float* in, const float* w, const float* temporal, float* out, uint seed,

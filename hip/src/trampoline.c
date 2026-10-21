@@ -18,6 +18,7 @@ static Dlss5HipFrameBridge *g_frame;
 static Dlss5HipDeviceBridge *g_device;
 static Dlss5HipStagedBridge *g_staged;
 static Dlss5HipSharedBridge *g_shared;
+static Dlss5HipControlBridge *g_control;
 static _Thread_local const char *local_error;
 
 static unsigned long long parse_hex_ptr(const char *s) {
@@ -72,6 +73,7 @@ static void init_bridge(void) {
     g_device = (Dlss5HipDeviceBridge *)read_bridge(DLSS5_HIP_DEVICE_ENV);
     g_staged = (Dlss5HipStagedBridge *)read_bridge(DLSS5_HIP_STAGED_ENV);
     g_shared = (Dlss5HipSharedBridge *)read_bridge(DLSS5_HIP_SHARED_ENV);
+    g_control = (Dlss5HipControlBridge *)read_bridge(DLSS5_HIP_CONTROL_ENV);
 }
 
 BOOL __stdcall DllMain(void *h, DWORD reason, void *r) {
@@ -149,6 +151,15 @@ EXPORT double dlss5_last_gpu_ms(void) {
     if (!g_staged || g_staged->magic != DLSS5_HIP_STAGED_MAGIC || !g_staged->last_gpu_ms)
         return -1.0;
     return ((double SYSV (*)(void))g_staged->last_gpu_ms)();
+}
+
+EXPORT int dlss5_set_style(dlss5_u32 style) {
+    local_error = 0;
+    if (!g_control || g_control->magic != DLSS5_HIP_CONTROL_MAGIC || !g_control->set_style) {
+        local_error = "hip control bridge missing (rebuild libdlss5_hip.so and the preload shim)";
+        return -1;
+    }
+    return ((int SYSV (*)(dlss5_u32))g_control->set_style)(style);
 }
 
 EXPORT int dlss5_import_shared(void *handle, unsigned long long buffer_bytes, dlss5_u32 generation) {
