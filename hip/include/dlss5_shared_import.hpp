@@ -15,10 +15,16 @@
 #pragma once
 #include <hip/hip_runtime.h>
 #include <dlfcn.h>
+#include <elf.h>
+#include <fcntl.h>
+#include <link.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -39,6 +45,96 @@ inline void note(std::string& why, const char* fmt, ...) {
     va_end(ap);
     if (!why.empty()) why += "; ";
     why += buf;
+}
+
+// A non-exported function of a loaded library, from its .symtab (absent if the file is stripped).
+// Every offset is checked against the file size before it is read.
+inline void* elf_local_sym(void* handle, const char* name) {
+    struct link_map* lm = nullptr;
+    if (!handle || dlinfo(handle, RTLD_DI_LINKMAP, &lm) != 0 || !lm || !lm->l_name || !lm->l_name[0]) return nullptr;
+    const int fd = open(lm->l_name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return nullptr;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(ElfW(Ehdr))) {
+        close(fd);
+        return nullptr;
+    }
+    const size_t size = size_t(st.st_size);
+    void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return nullptr;
+    const char* bytes = (const char*)map;
+    void* found = nullptr;
+    const ElfW(Ehdr)* eh = (const ElfW(Ehdr)*)map;
+    if (memcmp(eh->e_ident, ELFMAG, SELFMAG) == 0 && eh->e_shentsize == sizeof(ElfW(Shdr)) && eh->e_shoff <= size &&
+        size_t(eh->e_shnum) * sizeof(ElfW(Shdr)) <= size - eh->e_shoff) {
+        const ElfW(Shdr)* sh = (const ElfW(Shdr)*)(bytes + eh->e_shoff);
+        const ElfW(Shdr)* symtab = nullptr;
+        const ElfW(Shdr)* strtab = nullptr;
+        for (int i = 0; i < eh->e_shnum; ++i)
+            if (sh[i].sh_type == SHT_SYMTAB) {
+                symtab = &sh[i];
+                if (sh[i].sh_link < eh->e_shnum) strtab = &sh[sh[i].sh_link];
+                break;
+            }
+        if (symtab && strtab && symtab->sh_entsize == sizeof(ElfW(Sym)) && symtab->sh_offset <= size &&
+            symtab->sh_size <= size - symtab->sh_offset && strtab->sh_offset <= size &&
+            strtab->sh_size <= size - strtab->sh_offset) {
+            const ElfW(Sym)* sym = (const ElfW(Sym)*)(bytes + symtab->sh_offset); // byte offset, not index
+            const char* strs = bytes + strtab->sh_offset;
+            const size_t n = symtab->sh_size / sizeof(ElfW(Sym));
+            for (size_t i = 0; i < n; ++i) {
+                if (!sym[i].st_name || ELF64_ST_TYPE(sym[i].st_info) != STT_FUNC || !sym[i].st_value) continue;
+                if (sym[i].st_name >= strtab->sh_size) continue;
+                if (strnlen(strs + sym[i].st_name, strtab->sh_size - sym[i].st_name) == strtab->sh_size - sym[i].st_name)
+                    continue;
+                if (strcmp(strs + sym[i].st_name, name) == 0) {
+                    found = (char*)lm->l_addr + sym[i].st_value;
+                    break;
+                }
+            }
+        }
+    }
+    munmap(map, size);
+    return found;
+}
+
+// Wine 11 (GE-Proton 11): win32u's own route from a D3DKMT shared NT handle to the host fd.
+inline int d3dkmt_handle_to_fd(void* handle, std::string& why) {
+    typedef unsigned (*open_fn)(unsigned, void*, unsigned*, unsigned*);
+    typedef int (*get_fd_fn)(unsigned);
+    typedef int (*destroy_fn)(unsigned);
+    static std::once_flag once;
+    static open_fn open_res;
+    static get_fd_fn get_fd;
+    static destroy_fn destroy_res;
+    static bool have_win32u;
+    std::call_once(once, [] {
+        void* h = dlopen("win32u.so", RTLD_NOW | RTLD_NOLOAD);
+        have_win32u = h != nullptr;
+        if (!h) return;
+        open_res = (open_fn)elf_local_sym(h, "d3dkmt_open_resource");
+        get_fd = (get_fd_fn)elf_local_sym(h, "d3dkmt_object_get_fd");
+        destroy_res = (destroy_fn)elf_local_sym(h, "d3dkmt_destroy_resource");
+    });
+    if (!have_win32u) {
+        note(why, "win32u.so not loaded");
+        return -1;
+    }
+    if (!open_res || !get_fd) {
+        note(why, "win32u.so has no d3dkmt_open_resource/d3dkmt_object_get_fd in .symtab (stripped build?)");
+        return -1;
+    }
+    unsigned mutex = 0, sync = 0;
+    const unsigned local = open_res(0, handle, &mutex, &sync);
+    if (!local) {
+        note(why, "d3dkmt_open_resource failed");
+        return -1;
+    }
+    const int fd = get_fd(local);
+    if (destroy_res) destroy_res(local);
+    if (fd < 0) note(why, "d3dkmt_object_get_fd failed");
+    return fd;
 }
 
 inline void* ntdll_unix() {
@@ -94,7 +190,8 @@ inline int handle_to_fd(void* handle, std::string& why) {
         if (st == 0 && fd >= 0) return fd;
         if (a == accesses[0]) note(why, "handle_to_fd(FILE_READ_DATA) st=0x%x", (unsigned)st);
     }
-    return -1;
+    // 3. Wine 11 D3DKMT objects (GE-Proton 11): win32u's internal open + get_fd (hip-43).
+    return d3dkmt_handle_to_fd(handle, why);
 }
 
 struct Import {
