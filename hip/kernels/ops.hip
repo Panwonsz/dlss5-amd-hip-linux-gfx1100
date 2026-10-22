@@ -354,7 +354,8 @@ __global__ void k_ffn_f32(const float* input, const u8* weights, const float* sc
                     u8 q = e4m3_byte(acc.Get(i));
                     if constexpr (F8OUT)
                         output_f8[(first + t0 + rc.x) * C + sub * 16 + rc.y] = q;
-                    output[(first + t0 + rc.x) * C + sub * 16 + rc.y] = from_e4m3(q);
+                    if (output)  // hip-48: nullptr when no one reads the f32 copy
+                        output[(first + t0 + rc.x) * C + sub * 16 + rc.y] = from_e4m3(q);
                 }
             }
         }
@@ -598,7 +599,7 @@ __global__ void k_split_f32(const float* in,const u8* pre,const u8* expand,const
   if constexpr(F16ACT)acc.MultiplyAccumulate(AF::Load(hid,g*32*2,512),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
   else acc.MultiplyAccumulate(A8::Load(hid,g*32,256),B8::LoadRow(contract,group*16384+(wave*8+g)*512,16));
  }
-  for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens){u8 q=e4m3_byte(H(acc.Get(i)));if constexpr(F8OUT)out_f8[(first+rc.x)*512+group*64+wave*16+rc.y]=q;out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(q);}}
+  for(uint i=0;i<acc.Length();++i){uint2 rc=acc.GetCoordinate(i);if(first+rc.x<tokens){u8 q=e4m3_byte(H(acc.Get(i)));if constexpr(F8OUT)out_f8[(first+rc.x)*512+group*64+wave*16+rc.y]=q;if(out)out[(first+rc.x)*512+group*64+wave*16+rc.y]=from_e4m3(q);}}
 }
 
 __global__ void k_rgb_graph(const float* in,float* raster,float* tiles,uint w,uint h,uint ow,uint oh){

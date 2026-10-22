@@ -70,6 +70,8 @@ static int c32_biaspk_env(){static const int v=[]{const char* e=std::getenv("DLS
 // head), the prefix's unread f32 copy is not written, and each encoder group's last block writes
 // its skip buffer directly (no device-to-device copy). Bit-identical: see kernels/io16.hip.
 // Default ON since 2026-09-28 (trace IDENTICAL, mean unchanged, -1.1 ms). ONLY "0" turns it off.
+// hip-48: the FFN's f32 copy (s.d) is not read by anything in the window block; "1" writes it again.
+static bool ffn_f32out_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_FFN_F32OUT");return e&&std::string(e)=="1";}();return on;}
 static bool io16_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_IO16");return !(e&&std::string(e)=="0");}();return on;}
 // DLSS5_C32_F32OUT=1: the fused kernel writes the cropped f32 raster itself (no reframe launch).
 // Default ON since 2026-09-27 (trace IDENTICAL, -1.5 ms). ONLY the exact string "0" turns it off.
@@ -162,17 +164,17 @@ struct Block {
      }
     }
     if(c==512){
-     if(in_h)launch_split_f32_hin_f8(in_h,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
-     else if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
-     else launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),s.d.as<float>(),s.d8.as<u8>(),n);
+     if(in_h)launch_split_f32_hin_f8(in_h,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),ffn_f32out_on()?s.d.as<float>():nullptr,s.d8.as<u8>(),n);
+     else if(in_f8)launch_split_f32_f8in_f8(in_f8,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),ffn_f32out_on()?s.d.as<float>():nullptr,s.d8.as<u8>(),n);
+     else launch_split_f32_f8(in,fw.as<u8>(),ex.as<u8>(),ct.as<u8>(),ffn_f32out_on()?s.d.as<float>():nullptr,s.d8.as<u8>(),n);
     }
     else if(c==32){
     if(in_h)launch_ffn_f32_hin_hout(32,in_h,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
     else launch_ffn_f32_hout(32,in,fw.as<u8>(),fs.as<float>(),s.bh.as<__half>(),n,chain,true);
    }
-    else if(in_h)launch_ffn_f32_hin_f8out(c,in_h,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
-    else if(in_f8)launch_ffn_f32_f8in_f8out(c,in_f8,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
-    else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,s.d.as<float>(),s.d8.as<u8>(),n,chain,false);
+    else if(in_h)launch_ffn_f32_hin_f8out(c,in_h,fw.as<u8>(),nullptr,ffn_f32out_on()?s.d.as<float>():nullptr,s.d8.as<u8>(),n,chain,false);
+    else if(in_f8)launch_ffn_f32_f8in_f8out(c,in_f8,fw.as<u8>(),nullptr,ffn_f32out_on()?s.d.as<float>():nullptr,s.d8.as<u8>(),n,chain,false);
+    else launch_ffn_f32_f8(c,in,fw.as<u8>(),nullptr,ffn_f32out_on()?s.d.as<float>():nullptr,s.d8.as<u8>(),n,chain,false);
    // mapfeature FFN projection: H(scale product); direct store only C64..256.
    // Non-C32 activations are already on the E4M3 grid, so p0/QKV consume the bytes
    // directly while the f32 copy stays available for residuals.

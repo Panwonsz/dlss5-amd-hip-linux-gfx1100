@@ -218,7 +218,7 @@ void launch_ffn_f32_hin_hout(int c, const __half* in_h, const u8* w, const float
 
 void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales, float* out_f32,
                         u8* out_f8, uint tokens, bool chain_residual, bool precise_c32) {
-    if (!tokens || c == 32 || !out_f32 || !out_f8)
+    if (!tokens || c == 32 || !out_f8)  // out_f32 may be nullptr (hip-48)
         throw std::runtime_error("FFN f8 extent/alias");
     uint groups = (tokens + 15) / 16;
     if (dlss5_w16() && f16_act_on()) { DLSS5_FFN_F8(true, true) }
@@ -241,7 +241,7 @@ void launch_ffn_f32_f8(int c, const float* in, const u8* w, const float* scales,
 void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float* scales,
                                float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
                                bool precise_c32) {
-    if (!tokens || c == 32 || !in_f8 || !out_f32 || !out_f8)
+    if (!tokens || c == 32 || !in_f8 || !out_f8)  // out_f32 may be nullptr (hip-48)
         throw std::runtime_error("FFN f8in extent/alias");
     uint groups = (tokens + 15) / 16;
     if (dlss5_w16() && f16_act_on()) { DLSS5_FFN_F8IN(true, true) }
@@ -264,7 +264,7 @@ void launch_ffn_f32_f8in_f8out(int c, const u8* in_f8, const u8* w, const float*
 void launch_ffn_f32_hin_f8out(int c, const __half* in_h, const u8* w, const float* scales,
                               float* out_f32, u8* out_f8, uint tokens, bool chain_residual,
                               bool precise_c32) {
-    if (!tokens || c == 32 || c == 512 || !in_h || !out_f32 || !out_f8)
+    if (!tokens || c == 32 || c == 512 || !in_h || !out_f8)  // out_f32 may be nullptr (hip-48)
         throw std::runtime_error("FFN f16in extent/alias");
     uint groups = (tokens + 15) / 16;
     if (dlss5_w16() && f16_act_on()) { DLSS5_FFN_HIN_F8(true, true) }
