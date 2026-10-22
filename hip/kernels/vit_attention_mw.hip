@@ -22,6 +22,11 @@
 
 namespace dlss5 {
 
+// hip-51: V channel-major in the LDS chunk (vt[ch][key], stride 36 bytes), read with LoadCol.
+#ifndef DLSS5_VIT_ATTN_VT
+#define DLSS5_VIT_ATTN_VT 1
+#endif
+
 // F16ACT (DLSS5_F16_ACT): the probabilities as f16 (row stride 40 halves), no E4M3 rounding. NOT bit-exact.
 template <uint NW, bool F16ACT = false>
 __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, u8* out, uint tokens,
@@ -30,8 +35,11 @@ __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, 
     const uint wave = threadIdx.x / 32u, lane = threadIdx.x & 31u;
     const uint q0 = (blockIdx.x * NW + wave) * 16u, head = blockIdx.y;
     const uint stride = 3u * dim;
-    // kv[b]: 32 keys x 32 bytes of K, then 32 keys x 32 bytes of V.
-    __shared__ __attribute__((aligned(16))) u8 kv[2][2048];
+    // kv[b]: 32 keys x 32 bytes of K, then 32 keys x 32 bytes of V -- or, with DLSS5_VIT_ATTN_VT,
+    // V as 32 channels x 36 bytes (32 keys + 4 of padding).
+    constexpr uint VTS = 36u;
+    constexpr uint KVB = DLSS5_VIT_ATTN_VT ? 1024u + 32u * VTS + 128u : 2048u;  // 2304, 16-byte multiple
+    __shared__ __attribute__((aligned(16))) u8 kv[2][KVB];
     __shared__ __attribute__((aligned(16))) u8 qtile[NW][16 * 32];
     __shared__ __attribute__((aligned(16))) u8 prob[NW][F16ACT ? 16 * 40 * 2 : 16 * 32];
     __shared__ float ex[NW][16 * 33];
@@ -66,7 +74,19 @@ __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, 
         u8* buf = kv[c & 1u];
         for (uint j = 0; j < SEGS; ++j) {
             const uint seg = threadIdx.x + j * 32u * NW;
+#if DLSS5_VIT_ATTN_VT
+            if (seg < 64u) {
+                *reinterpret_cast<uint4*>(buf + seg * 16u) = pre[j];
+            } else if (seg < 128u) {
+                // V segment: key (seg-64)/2, channels ((seg-64)&1)*16 .. +15 -> vt[ch][key].
+                const uint sv = seg - 64u, key = sv / 2u, ch0 = (sv & 1u) * 16u;
+                const u8* b = reinterpret_cast<const u8*>(&pre[j]);
+#pragma unroll
+                for (uint t = 0; t < 16u; ++t) buf[1024u + (ch0 + t) * VTS + key] = b[t];
+            }
+#else
             if (seg < 128u) *reinterpret_cast<uint4*>(buf + seg * 16u) = pre[j];
+#endif
         }
         // Makes buf visible. Double buffering: every wave finished reading this buffer (chunk c-2)
         // before it arrived at the barrier of chunk c-1, so one barrier per chunk suffices.
@@ -102,7 +122,12 @@ __global__ void __launch_bounds__(32 * NW) k_vit_attention_mw(const u8* qkv_f8, 
         __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
         if (lane < 16)
             for (uint j = 0; j < 32; ++j) denom += ex[wave][lane * 33 + j];
+#if DLSS5_VIT_ATTN_VT
+        // B (key k, channel n) = vt[n * VTS + k]: the col-major fast path.
+        B8 v0 = B8::LoadCol(buf + 1024, 0, VTS), v1 = B8::LoadCol(buf + 1024 + 16u * VTS, 0, VTS);
+#else
         B8 v0 = B8::LoadRow(buf + 1024, 0, 32), v1 = B8::LoadRow(buf + 1024, 16, 32);
+#endif
         if constexpr (F16ACT) {
             using AF = typename HiddenA<true>::type;
             const AF p = AF::Load(prob[wave], 0, 80);
