@@ -25,6 +25,11 @@ __device__ inline float attn_norm_inverse(float x) {
 #endif
 }
 
+// hip-47: V transposed in LDS for PV (see k_window_attention). Bit-identical; A/B with =0.
+#ifndef DLSS5_ATTN_VT
+#define DLSS5_ATTN_VT 1
+#endif
+
 __device__ inline uint window_pixel(uint window, uint token, uint width) {
     return ((window / (width / 8)) * 8 + token / 8) * width + (window % (width / 8)) * 8 + token % 8;
 }
@@ -70,6 +75,14 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
     constexpr uint QSZ = QKV16 ? 2u : 1u;
     using QT = typename HiddenA<QKV16>::type;
     using KVT = typename WeightB<QKV16>::type;
+    // hip-47: this thread's 16 V bytes -- token tid/2, channels (tid&1)*16 .. +15 of this head -- loaded
+    // now (one 16-byte load; every offset is a multiple of 16) and written transposed after phase 2.
+    constexpr bool VT = DLSS5_ATTN_VT && !QKV16 && !F16ACT;
+    constexpr uint VTS = 68u;  // vt row stride (bytes), over the scores array once phase 2 is done
+    uint4 vpre = make_uint4(0u, 0u, 0u, 0u);
+    if constexpr (VT)
+        vpre = *reinterpret_cast<const uint4*>(qkv + (window * 64u + (threadIdx.x >> 1)) * uint(STRIDE) +
+                                               2u * uint(C) + head * 32u + (threadIdx.x & 1u) * 16u);
 
     QT q = QT::Load(qkv, ((window * 64u + qtok) * uint(STRIDE) + head * 32u) * QSZ,
                     uint(STRIDE) * QSZ);
@@ -153,14 +166,26 @@ __global__ void __launch_bounds__(128, 5) k_window_attention(const u8* qkv, cons
         }
     }
     __syncthreads();
+    u8* vt = reinterpret_cast<u8*>(scores);
+    static_assert(32u * VTS <= sizeof(scores), "vt fits over the scores");
+    if constexpr (VT) {
+        // Every row of scores has been read (phase 2, before the barrier above).
+        const uint tok = threadIdx.x >> 1u, ch0 = (threadIdx.x & 1u) * 16u;
+        const u8* b = reinterpret_cast<const u8*>(&vpre);
+#pragma unroll
+        for (uint j = 0; j < 16u; ++j) vt[(ch0 + j) * VTS + tok] = b[j];
+        __syncthreads();
+    }
 
     C32 av0 = C32::Splat(0.f);
     C32 av1 = C32::Splat(0.f);
     for (uint k0 = 0; k0 < 64; k0 += 32) {
         const uint vbase =
             ((window * 64u + k0) * uint(STRIDE) + 2u * uint(C) + head * 32u) * QSZ;
-        KVT v0 = KVT::LoadRow(qkv, vbase, uint(STRIDE) * QSZ);
-        KVT v1 = KVT::LoadRow(qkv, vbase + 16u * QSZ, uint(STRIDE) * QSZ);
+        // B (token k, channel n): global row-major qkv, or vt[n * VTS + k] (hip-47).
+        KVT v0 = VT ? KVT::LoadColFast(vt, k0, VTS) : KVT::LoadRow(qkv, vbase, uint(STRIDE) * QSZ);
+        KVT v1 = VT ? KVT::LoadColFast(vt + 16u * VTS, k0, VTS)
+                    : KVT::LoadRow(qkv, vbase + 16u * QSZ, uint(STRIDE) * QSZ);
         if constexpr (F16ACT) {
             using AF = typename HiddenA<true>::type;
             AF p = AF::Load(scores, (qtok * 72u + k0) * 2u, 144u);
