@@ -72,6 +72,9 @@ static int c32_biaspk_env(){static const int v=[]{const char* e=std::getenv("DLS
 // Default ON since 2026-09-28 (trace IDENTICAL, mean unchanged, -1.1 ms). ONLY "0" turns it off.
 // hip-48: the FFN's f32 copy (s.d) is not read by anything in the window block; "1" writes it again.
 static bool ffn_f32out_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_FFN_F32OUT");return e&&std::string(e)=="1";}();return on;}
+// hip-49: p1 of C>=64 blocks reads its residual from s.f8 (p0's bytes) instead of the f32 copy f; p0 then
+// skips f. "0" restores the f32 residual.
+static bool p1_f8res_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_P1_F8RES");return !(e&&std::string(e)=="0");}();return on;}
 static bool io16_on(){static const bool on=[]{const char* e=std::getenv("DLSS5_IO16");return !(e&&std::string(e)=="0");}();return on;}
 // DLSS5_C32_F32OUT=1: the fused kernel writes the cropped f32 raster itself (no reframe launch).
 // Default ON since 2026-09-27 (trace IDENTICAL, -1.5 ms). ONLY the exact string "0" turns it off.
@@ -178,10 +181,12 @@ struct Block {
    // mapfeature FFN projection: H(scale product); direct store only C64..256.
    // Non-C32 activations are already on the E4M3 grid, so p0/QKV consume the bytes
    // directly while the f32 copy stays available for residuals.
+     // hip-49: with emit_f8, p1 takes the residual from s.f8 and f is not needed.
+     float* const f0=(emit_f8&&p1_f8res_on())?nullptr:f;
      if(c!=32){
-      if(in_h)launch_linear_f32_f8in_f8out_hrid(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in_h,s0.as<float>(),c==512?1:5,0,false);
-      else if(in_f8)launch_linear_f32_f8in_f8out_f8res(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in_f8,s0.as<float>(),c==512?1:5,0,false);
-      else launch_linear_f32_f8in_f8out(s.d8.as<u8>(),p0.as<u8>(),f,s.f8.as<u8>(),n,c,c,in,s0.as<float>(),c==512?1:5,0);
+      if(in_h)launch_linear_f32_f8in_f8out_hrid(s.d8.as<u8>(),p0.as<u8>(),f0,s.f8.as<u8>(),n,c,c,in_h,s0.as<float>(),c==512?1:5,0,false);
+      else if(in_f8)launch_linear_f32_f8in_f8out_f8res(s.d8.as<u8>(),p0.as<u8>(),f0,s.f8.as<u8>(),n,c,c,in_f8,s0.as<float>(),c==512?1:5,0,false);
+      else launch_linear_f32_f8in_f8out(s.d8.as<u8>(),p0.as<u8>(),f0,s.f8.as<u8>(),n,c,c,in,s0.as<float>(),c==512?1:5,0);
      }
    // QKV GEMM + per-head scaling + E4M3 in one launch (no f32 round trip).
    // C32 keeps the FFN output in f16: H(acc) is exactly representable, so the
@@ -197,6 +202,7 @@ struct Block {
       if(emit_h)launch_linear_f32_f8in_hrid_hout_raster(s.att8.as<u8>(),p1.as<u8>(),s.ah.as<__half>(),s.out16.as<__half>(),n,c,c,s.bh.as<__half>(),s1.as<float>(),4,0,false,w,h,sw,px,py);
       else launch_linear_f32_f8in_hrid_hout(s.att8.as<u8>(),p1.as<u8>(),s.ah.as<__half>(),n,c,c,s.bh.as<__half>(),s1.as<float>(),4,0,false);
      }
+    else if(emit_f8&&p1_f8res_on())launch_linear_f32_f8in_f8out_raster_f8res(s.att8.as<u8>(),p1.as<u8>(),write_f32_out?out:nullptr,s.out8.as<u8>(),n,c,c,s.f8.as<u8>(),s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512,w,h,sw,px,py);
     else if(emit_f8)launch_linear_f32_f8in_f8out_raster(s.att8.as<u8>(),p1.as<u8>(),write_f32_out?out:nullptr,s.out8.as<u8>(),n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512,w,h,sw,px,py);
      else launch_linear_f32_f8in(s.att8.as<u8>(),p1.as<u8>(),out,n,c,c,f,s1.as<float>(),raw?0:c==512?1:5,0,c!=32&&c!=512);
   }

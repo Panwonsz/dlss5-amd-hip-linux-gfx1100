@@ -543,6 +543,22 @@ void launch_linear_f32_f8in_f8out_hrid(const u8* in, const u8* w, float* out, u8
                  nullptr, in, w, out, out_f8, m, n, k, reinterpret_cast<const float*>(residual_h),
                  scales, mode, ordered, matrix_residual, residual_h);
 }
+// hip-49: launch_linear_f32_f8in_f8out_raster with an E4M3 residual (k_linear_f32's F8RES path).
+void launch_linear_f32_f8in_f8out_raster_f8res(const u8* in, const u8* w, float* out, u8* out_f8_raster,
+                                                uint m, uint n, uint k, const u8* residual_f8,
+                                                const float* scales, int mode, int ordered,
+                                                bool matrix_residual, uint rw, uint rh, uint rsw,
+                                                uint rpx, uint rpy) {
+    if (!m || !n || !k || n % 16 || k % 32 || mode < 0 || mode > 5 || mode == 4 || !residual_f8 ||
+        !scales || ordered < 0 || ordered > 2 || (ordered == 2 && k % 128) ||
+        reinterpret_cast<const void*>(in) == reinterpret_cast<const void*>(out) || !out_f8_raster ||
+        rsw % 8 || rw + rpx > rsw || rh + rpy > rsw)
+        throw std::runtime_error("linear raster f8 f8res extent/alias");
+    DLSS5_LINEAR(true, false, false, false, true, true, false,
+                 nullptr, in, w, out, nullptr, m, n, k, reinterpret_cast<const float*>(residual_f8),
+                 scales, mode, ordered, matrix_residual, nullptr, nullptr, out_f8_raster, rw, rh, rsw,
+                 rpx, rpy, residual_f8);
+}
 void launch_linear_f32_f8in_f8out_raster(const u8* in, const u8* w, float* out, u8* out_f8_raster,
                                           uint m, uint n, uint k, const float* residual,
                                           const float* scales, int mode, int ordered,
